@@ -61,17 +61,13 @@ the account's own:
 
 - **Every plan but Go**: the Provider API's `/models` list. Each model's
   `supported_endpoints` picks the API it speaks.
-- **Go**: the CLI's table, since there is no list to ask for:
-  - GPT-6 Luna
-  - GPT-5.6 Luna
-  - DeepSeek V4 Pro
-  - DeepSeek V4 Flash
-  - Kimi K3
-  - GLM-5.3
-  - MiniMax M3
-  - Qwen 3.8 Max
-  - Qwen 3.8 Flash
-  - MiMo V2.6 Pro
+- **Go**: the same `/models` list, asked without the key (it answers
+  without one, and Go's key has no Provider API), less the models the
+  CLI's table (command-code 1.73.0) refuses Go: the premium ones (Claude,
+  GPT-6 Sol, GPT-5.6 Terra, …) and those it blocks for Go (GPT-5.6 Sol,
+  Claude Sonnet 5.5, Grok 4.6 and 4.7, …). That is 56 models as of
+  2026-10-01. When the list can't be had, the CLI's own Go table (57
+  models) stands in.
 
   The Go models carry their reasoning levels, and a requested level is
   fitted to the nearest one the model has.

@@ -47,20 +47,90 @@ const MODELS = [
 ]
 
 // The models the Go plan is let use, as the CLI's own table has it
-// (1.72.2); Command Code has no list to ask for them.
+// (1.73.0): every model its picker shows (less the hidden) but the
+// "premium" ones and those it blocks for Go (GO_REFUSED). They stand in
+// until Command Code's list is fetched (goModels), or when it can't be,
+// and give that list the reasoning levels and pictures it doesn't say —
+// magpie's cmdGoModels.
 const EFF5 = ["low", "medium", "high", "xhigh", "max"]
 const GO_MODELS = [
   { id: "gpt-6-luna", name: "GPT-6 Luna", context: 1_050_000, images: true, efforts: EFF5 },
   { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", context: 1_050_000, images: true, efforts: EFF5 },
   { id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro", context: 1_000_000, efforts: ["high", "max"] },
   { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash", context: 1_000_000, efforts: ["high", "max"] },
+  { id: "deepseek/deepseek-v4-flash-vision-exp", name: "DeepSeek V4 Flash Vision (exp)", context: 1_000_000, images: true, efforts: ["high", "max"] },
+  { id: "deepseek/deepseek-v4-flash-fast", name: "DeepSeek V4 Flash Fast", context: 1_000_000, efforts: ["low", "high", "max"] },
+  { id: "deepseek/deepseek-v4.1-flash", name: "DeepSeek V4.1 Flash", context: 1_000_000, images: true, efforts: ["low", "high", "max"] },
+  { id: "deepseek/deepseek-v4.1-flash-fast", name: "DeepSeek V4.1 Flash Fast", context: 1_000_000, images: true, efforts: ["low", "high", "max"] },
   { id: "moonshotai/Kimi-K3", name: "Kimi K3", context: 1_000_000, images: true, efforts: ["low", "high", "max"] },
+  { id: "moonshotai/Kimi-K2.7-Code", name: "Kimi K2.7 Code", context: 256_000, images: true },
+  { id: "moonshotai/Kimi-K2.7-Code-Highspeed", name: "Kimi K2.7 Code HighSpeed", context: 262_000, images: true },
+  { id: "moonshotai/Kimi-K2.6", name: "Kimi K2.6", context: 256_000, images: true },
+  { id: "moonshotai/Kimi-K2.5", name: "Kimi K2.5", context: 256_000, images: true },
+  { id: "z-ai/glm-5.3-flash", name: "GLM-5.3 Flash", context: 1_048_576, images: true, efforts: ["low", "high", "max"] },
+  { id: "z-ai/glm-5.3-flashx", name: "GLM-5.3 FlashX", context: 1_000_000, images: true, efforts: ["low", "high", "max"] },
   { id: "zai-org/GLM-5.3", name: "GLM-5.3", context: 1_000_000, efforts: ["low", "high", "max"] },
-  { id: "MiniMaxAI/MiniMax-M3", name: "MiniMax M3", context: 1_000_000 },
-  { id: "Qwen/Qwen3.8-Max", name: "Qwen 3.8 Max", context: 1_000_000, images: true, efforts: ["low", "medium", "xhigh"] },
-  { id: "Qwen/Qwen3.8-Flash", name: "Qwen 3.8 Flash", context: 1_000_000 },
+  { id: "zai-org/GLM-5.2", name: "GLM-5.2", context: 1_000_000, efforts: ["high", "max"] },
+  { id: "zai-org/GLM-5.2-Fast", name: "GLM-5.2 Fast", context: 1_000_000 },
+  { id: "zai-org/GLM-5.1", name: "GLM-5.1", context: 200_000 },
+  { id: "zai-org/GLM-5", name: "GLM-5", context: 200_000 },
+  { id: "MiniMaxAI/MiniMax-M3", name: "MiniMax M3", context: 1_000_000, images: true, efforts: ["low", "medium", "high"] },
+  { id: "MiniMaxAI/MiniMax-M2.7", name: "MiniMax M2.7", context: 200_000 },
+  { id: "MiniMaxAI/MiniMax-M2.5", name: "MiniMax M2.5", context: 200_000 },
   { id: "xiaomi/mimo-v2.6-pro", name: "MiMo V2.6 Pro", context: 1_048_576, images: true },
+  { id: "xiaomi/mimo-v2.6-flash", name: "MiMo V2.6 Flash", context: 1_048_576, images: true },
+  { id: "xiaomi/mimo-v2.5-pro", name: "MiMo V2.5 Pro", context: 1_000_000 },
+  { id: "xiaomi/mimo-v2.5", name: "MiMo V2.5", context: 1_000_000, images: true },
+  { id: "Qwen/Qwen3.8-Omni-Flash", name: "Qwen 3.8 Omni Flash", context: 1_000_000, images: true, efforts: ["low", "medium", "xhigh"] },
+  { id: "Qwen/Qwen3.8-Max-0902", name: "Qwen 3.8 Max 0902", context: 1_000_000, images: true, efforts: ["low", "medium", "xhigh"] },
+  { id: "Qwen/Qwen3.8-Max", name: "Qwen 3.8 Max", context: 1_000_000, images: true, efforts: ["low", "medium", "xhigh"] },
+  { id: "Qwen/Qwen3.8-27B", name: "Qwen 3.8 27B", context: 262_144, images: true, efforts: ["low", "medium", "xhigh"] },
+  { id: "Qwen/Qwen3.8-Flash", name: "Qwen 3.8 Flash", context: 1_000_000, images: true, efforts: ["low", "medium", "xhigh"] },
+  { id: "Qwen/Qwen3.7-Max", name: "Qwen 3.7 Max", context: 1_000_000 },
+  { id: "Qwen/Qwen3.7-Plus", name: "Qwen 3.7 Plus", context: 1_000_000, images: true },
+  { id: "Qwen/Qwen3.7-Flash", name: "Qwen 3.7 Flash", context: 1_000_000, images: true },
+  { id: "Qwen/Qwen3.6-Max-Preview", name: "Qwen 3.6 Max Preview", context: 200_000 },
+  { id: "Qwen/Qwen3.6-Plus", name: "Qwen 3.6 Plus", context: 200_000, images: true },
+  { id: "meituan/LongCat-2.0", name: "LongCat 2.0", context: 1_048_576 },
+  { id: "stepfun/Step-5-Preview", name: "Step 5 Preview", context: 1_000_000, images: true, efforts: ["low", "medium", "high"] },
+  { id: "stepfun/Step-3.7-Flash", name: "Step 3.7 Flash", context: 256_000, images: true },
+  { id: "stepfun/Step-3.5-Flash", name: "Step 3.5 Flash", context: 262_144 },
+  { id: "tencent/hy3-paid", name: "Tencent Hy3", context: 262_144 },
+  { id: "tencent/hy4-preview", name: "Tencent Hy4 Preview", context: 1_048_576, efforts: ["low", "medium", "high"] },
+  { id: "google/gemini-3.6-flash", name: "Gemini 3.6 Flash", context: 1_000_000, images: true, efforts: ["low", "medium", "high"] },
+  { id: "google/gemini-3.5-flash-lite", name: "Gemini 3.5 Flash Lite", context: 1_000_000, images: true, efforts: ["low", "medium", "high"] },
+  { id: "nvidia/nemotron-3-ultra-550b-a55b", name: "Nemotron 3 Ultra", context: 1_000_000 },
+  { id: "thinkingmachines/inkling", name: "Inkling", context: 256_000, images: true },
+  { id: "thinkingmachines/inkling-small", name: "Inkling Small", context: 1_000_000, images: true },
+  { id: "stealth/space-bunny-alpha", name: "Space Bunny Alpha", context: 1_000_000, images: true, efforts: ["low", "medium", "high"] },
+  { id: "stealth/pixel-canary", name: "Pixel Canary", context: 262_144, images: true, efforts: ["low", "medium", "xhigh"] },
+  { id: "poolside/laguna-s-2.1-free", name: "Laguna S 2.1", context: 256_000 },
+  { id: "inclusionai/ling-3.0-flash-free", name: "Ling 3.0 Flash", context: 256_000 },
+  { id: "inclusionai/ling-3.0-flash-sante:free", name: "Ling 3.0 Flash Sante", context: 262_144 },
+  { id: "inclusionai/ling-3.1-flash:free", name: "Ling 3.1 Flash", context: 262_144, efforts: ["low", "medium", "high"] },
+  { id: "meta/muse-spark-1.2-contributor", name: "Muse Spark 1.2 Contributor", context: 1_048_576, images: true, efforts: ["low", "medium", "high", "xhigh"] },
+  { id: "meta/muse-spark-1.3-contributor", name: "Muse Spark 1.3 Contributor", context: 1_048_576, images: true, efforts: ["low", "medium", "high", "xhigh"] },
+  { id: "xai/grok-4.5", name: "Grok 4.5", context: 500_000, images: true, efforts: ["low", "medium", "high"] },
 ]
+
+// The models of Command Code's list the Go plan is refused, as the CLI's
+// table has it (1.73.0): its "premium" ones, and those "individual-go"
+// blocks — magpie's cmdGoRefused. A model the table doesn't name the CLI
+// lets any plan pick; one the plan hasn't after all is refused with
+// MODEL_NOT_IN_PLAN.
+const GO_REFUSED = new Set([
+  // premium
+  "claude-sonnet-5", "claude-sonnet-4-6", "claude-fable-5-1", "claude-fable-5",
+  "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-opus-4-7",
+  "claude-haiku-4-5-20251001", "gpt-6-astra", "gpt-6.1-sol", "gpt-6-sol",
+  "gpt-5.6-terra", "gpt-5.5", "gpt-5.4", "gpt-5.3-codex", "gpt-5.4-mini",
+  "google/gemini-3.5-flash", "google/gemini-3.1-flash-lite", "sakana/fugu-ultra",
+  "meta/muse-spark-1.1",
+  // blocked for Go
+  "claude-sonnet-5-5", "gpt-5.6-sol", "xai/grok-4.6", "xai/grok-4.7",
+  "meta/muse-spark-1.2", "meta/muse-spark-1.3", "xiaomi/mimo-v2.6-pro-ultraspeed",
+  "google/gemini-3.7-flash", "google/gemini-3.8-flash",
+])
 const GO_EFFORTS = Object.fromEntries(GO_MODELS.map((m) => [m.id, m.efforts ?? []]))
 
 const isClaude = (id) => /^claude-/i.test(id) || id.startsWith("anthropic/")
@@ -137,6 +207,87 @@ async function liveModels(key) {
   }
   if (!out.length) throw new Error("models: an empty list")
   return out
+}
+
+// goModels is the Go plan's list, as magpie's cmdGoFetch has it: the
+// Provider API's list, which answers without a key (Go's key has no
+// Provider API) and is asked without it, less what Go is refused; each
+// model takes its name when the list gives none, its reasoning levels and,
+// when the list doesn't say, its pictures and window from GO_MODELS
+// (catalog.Decorate). Every Go model is asked on chat completions, which
+// the fetch sends on to /alpha/generate.
+async function goModels() {
+  const url = BASE + "/models"
+  const res = await fetch(url, { headers: { Accept: "application/json", "User-Agent": "magpie" }, signal: AbortSignal.timeout(8_000) })
+  const text = await res.text()
+  // catalog.FetchURL's errors
+  if (res.status !== 200) {
+    const status = `${res.status} ${statusText(res.status)}`.trimEnd()
+    const msg = listError(text)
+    throw new Error(msg ? `${url}: ${status} (${msg})` : `${url}: ${status}`)
+  }
+  let body
+  try {
+    body = JSON.parse(text)
+    if (body === null || typeof body !== "object" || Array.isArray(body)) throw 0
+  } catch {
+    throw new Error(`${url}: not a model list`)
+  }
+  let rows = Array.isArray(body.data) ? body.data : []
+  if (!rows.length) rows = Array.isArray(body.models) ? body.models : []
+  const known = Object.fromEntries(GO_MODELS.map((m) => [m.id, m]))
+  const listed = []
+  for (const r of rows) {
+    const id = (typeof r?.id === "string" && r.id) || (typeof r?.name === "string" && r.name) || ""
+    // a model that draws, or isn't for text (embeddings, speech), is
+    // left out, as catalog.Chat and fetchOne leave it
+    if (!id || drawsID(id) || !textID(id)) continue
+    const input = Array.isArray(r.modalities?.input) ? r.modalities.input.includes("image") : undefined
+    const ctx = typeof r.context_length === "number" && r.context_length > 0 ? Math.trunc(r.context_length) : 0
+    let m = { id, name: (typeof r.display_name === "string" && r.display_name) || id, context: ctx, images: input, npm: CHAT }
+    let k = known[id]
+    const i = id.lastIndexOf("/")
+    if (!k && i >= 0) k = known[id.slice(i + 1)]
+    if (k) {
+      m = {
+        ...m,
+        name: m.name === id ? k.name : m.name,
+        efforts: k.efforts,
+        images: input === undefined ? k.images : input,
+        context: m.context || k.context,
+      }
+    }
+    listed.push(m)
+  }
+  if (!listed.length) throw new Error(`${url}: no models listed`)
+  const out = listed.filter((m) => !GO_REFUSED.has(m.id))
+  if (!out.length) throw new Error("Command Code listed no models for the Go plan")
+  return out
+}
+
+// drawsID and textID are catalog.DrawsID and catalog.textModel on an id.
+const drawsID = (id) =>
+  ["image", "imagen", "imagine", "dall-e", "flux", "seedream", "cogview", "stable-diffusion", "sdxl", "wanx", "kolors", "hidream"].some((w) => id.toLowerCase().includes(w))
+const textID = (id) =>
+  !["embed", "-tts", "image", "audio", "-live", "robotics", "computer-use", "deep-research", "transcribe", "realtime", "moderation", "whisper", "dall-e", "sora"].some((w) => id.includes(w))
+
+// listError is a model list's error reply's message ({"error":{"message"}},
+// {"error":"…"}, {"message"}), cut at 160 characters, as catalog's
+// errorMessage reads it.
+function listError(text) {
+  let v
+  try {
+    v = JSON.parse(text)
+  } catch {
+    return ""
+  }
+  if (v === null || typeof v !== "object" || Array.isArray(v)) return ""
+  let msg = typeof v.message === "string" ? v.message : ""
+  if (typeof v.error?.message === "string" && v.error.message) msg = v.error.message
+  else if (typeof v.error === "string" && v.error) msg = v.error
+  msg = msg.trim()
+  const r = [...msg]
+  return r.length > 160 ? r.slice(0, 160).join("") + "…" : msg
 }
 
 // ---- the account --------------------------------------------------------------
@@ -886,7 +1037,7 @@ async function generate(key, chat, signal) {
 
 // ---- the plugin ---------------------------------------------------------------
 
-export const _internal = { subsSeen, waits, liveKey, failure }
+export const _internal = { subsSeen, waits, liveKey, failure, goModels, GO_MODELS, GO_REFUSED }
 
 export async function CommandCodePlugin({ client } = {}) {
   return {
@@ -960,14 +1111,21 @@ export async function CommandCodePlugin({ client } = {}) {
       }
     },
     // the plan's list: the Provider API's, with what each model is served
-    // on; Go's key has no Provider API, and its list is the CLI's
+    // on; Go's key has no Provider API: its list is the same one, asked
+    // without it, less what Go is refused, and the CLI's table when that
+    // can't be had
     provider: {
       id: ID,
       async models(provider, { auth } = {}) {
         if (auth?.type !== "api" || !auth.key) return provider.models
         const key = await liveKey(auth)
-        if ((await planNow(key, auth.metadata?.plan)) === "Go")
-          return Object.fromEntries(GO_MODELS.map((m) => [m.id, runtimeModel(m)]))
+        if ((await planNow(key, auth.metadata?.plan)) === "Go") {
+          let ms = GO_MODELS
+          try {
+            ms = await goModels()
+          } catch {}
+          return Object.fromEntries(ms.map((m) => [m.id, runtimeModel({ ...m, npm: CHAT })]))
+        }
         try {
           return Object.fromEntries((await liveModels(key)).map((m) => [m.id, runtimeModel(m)]))
         } catch {
