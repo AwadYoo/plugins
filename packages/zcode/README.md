@@ -20,6 +20,11 @@ over Anthropic's Messages API. Provider id: `zcode`.
     with ZCode's session token and ZCode's own headers.
   - The Start Plan's token can't be refreshed. When it runs out, sign in
     again.
+- **ZCode app's sign-in**
+  - Uses the account the ZCode app on this computer is signed in to. For
+    every request it reads ZCode's own credentials (`~/.zcode/v2`), so it
+    follows ZCode as it signs in again, renews its session or switches to a
+    team's plan.
 - **GLM Coding Plan API key**
   - Paste a key (`<id>.<secret>`) and say which site it is from.
 
@@ -33,7 +38,8 @@ In OpenCode's `auth.json` (magpie: `plugin-auth.json`), under `zcode`:
     token, the team project, the plan and a device id of this plugin's own.
 - **A pasted key** is kept as an `api` entry, with the site in `metadata`.
 
-The plugin never reads or writes ZCode's own credential store.
+The plugin never writes ZCode's own credential store. It reads it only for
+the ZCode app's sign-in (`refresh` then holds `"source": "zcode"`).
 
 ## How requests are routed
 
