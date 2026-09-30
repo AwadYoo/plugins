@@ -225,8 +225,20 @@ function rewrite(body) {
 
 // ---- models -------------------------------------------------------------------
 
+// the levels the built-in offered for grok-4.7 before Grok listed any (its
+// maker's, as models.dev has them): kept when the list can't be read, so
+// a move leaves an agent's reasoning level where it was
+const DEFAULT_EFFORTS = ["low", "medium", "high", "xhigh"]
+
 const DEFAULT_MODELS = {
-  "grok-4.7": { name: "Grok 4.7", attachment: true, reasoning: true, tool_call: true, modalities: { input: ["text", "image"], output: ["text"] } },
+  "grok-4.7": {
+    name: "Grok 4.7",
+    attachment: true,
+    reasoning: true,
+    tool_call: true,
+    modalities: { input: ["text", "image"], output: ["text"] },
+    variants: Object.fromEntries(DEFAULT_EFFORTS.map((e) => [e, { reasoningEffort: e }])),
+  },
 }
 
 // listModels is what the account can use, as the CLI's backend lists it:
