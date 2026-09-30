@@ -115,13 +115,16 @@ test("a run-out sign-in says so, and asks nothing", async () => {
 
 // magpie marks a plugin's account lapsed on any 401, so only a sign-in
 // that is gone says 401
+// the built-in's 401 for any "expired"; X-Magpie-Sign-In keeps the account
+// when what ran out was no sign-in
 test("an expired token is a lapsed sign-in; an expired trial is not", () => {
   const { failure } = _internal
   const says = (msg) => failure(400, JSON.stringify({ code: "failed_precondition", message: msg }))
-  expect(says("Your access token has expired").status).toBe(401)
-  expect(says("Session expired, please log in again").status).toBe(401)
-  expect(says("Your free trial has expired").status).toBe(502)
-  expect(says("This link has expired").status).toBe(502)
+  expect(says("Your access token has expired")).toMatchObject({ status: 401 })
+  expect(says("Your access token has expired")).not.toHaveProperty("signIn")
+  expect(says("Session expired, please log in again")).not.toHaveProperty("signIn")
+  expect(says("Your free trial has expired")).toMatchObject({ status: 401, signIn: "kept" })
+  expect(says("This link has expired")).toMatchObject({ status: 401, signIn: "kept" })
 })
 
 // the gateway names the provider before a plugin's error

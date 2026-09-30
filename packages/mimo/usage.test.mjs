@@ -139,12 +139,49 @@ test("a chat body in bytes has mimo-auto asked as mimo-pro, as a string one does
   expect(sent.map((b) => JSON.parse(b).model)).toEqual(["mimo-pro", "mimo-pro"])
 })
 
-test("a sign-in Xiaomi no longer takes is a 401 in the built-in's words, not a thrown fetch", async () => {
+test("a sign-in Xiaomi no longer takes is magpie's 502 in the built-in's words, marking the account, not a thrown fetch", async () => {
   const { fetch } = await loaderFetch(account(0), (path) => {
     if (path === "/api/user/xiaomi/me") return new Response("<html>sign in</html>", { status: 200 })
     return new Response("", { status: 401 })
   })
   const res = await fetch(BASE + "/route/chat/completions", { method: "POST", body: JSON.stringify({ model: "mimo-pro", messages: [] }) })
+  expect(res.status).toBe(502)
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("expired")
+  const b = await res.json()
+  expect(b.error.message).toBe("42: the Xiaomi MiMo sign-in has expired — sign in again")
+  expect(b.error.type).toBe("api_error")
+})
+
+test("the server's 401 goes through as the built-in's did: not signed on again, the account unmarked", async () => {
+  const asked = []
+  const { fetch } = await loaderFetch(account(), (path) => {
+    asked.push(path)
+    return path === "/api/user/xiaomi/me" ? json({ code: 0, data: { userId: "42" } }) : json({ error: { message: "stale" } }, 401)
+  })
+  const res = await fetch(BASE + "/route/chat/completions", { method: "POST", body: JSON.stringify({ model: "mimo-pro", messages: [] }) })
   expect(res.status).toBe(401)
-  expect((await res.json()).error.message).toBe("42: the Xiaomi MiMo sign-in has expired — sign in again")
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
+  expect((await res.json()).error.message).toBe("stale")
+  expect(asked).toEqual(["/api/route/chat/completions"])
+})
+
+test("a success takes the mark off only when the account was signed on again", async () => {
+  let p = await loaderFetch(account(), () => json({ ok: true }))
+  let res = await p.fetch(BASE + "/route/chat/completions", { method: "POST", body: "{}" })
+  expect(res.status).toBe(200)
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
+  p = await loaderFetch(account(0), (path) =>
+    path === "/api/user/xiaomi/me" ? new Response(JSON.stringify({ code: 0, data: { userId: "42" } }), { headers: { "set-cookie": "serviceToken=st-2; Path=/" } }) : json({ ok: true }),
+  )
+  res = await p.fetch(BASE + "/route/chat/completions", { method: "POST", body: "{}" })
+  expect(res.status).toBe(200)
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe(null)
+})
+
+test("a sign-on that can't reach the server is a thrown fetch (magpie's 502) in the built-in's words, the account unmarked", async () => {
+  const noSession = { ...account(0), access: "{}" }
+  const { fetch } = await loaderFetch(noSession, () => {
+    throw new Error("connection refused")
+  })
+  await expect(fetch(BASE + "/route/chat/completions", { method: "POST", body: "{}" })).rejects.toThrow(/^Xiaomi MiMo sign-in: connection refused$/)
 })

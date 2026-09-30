@@ -420,6 +420,15 @@ async function usage(key) {
   return { windows: out }
 }
 
+// kept is res saying magpie is to leave the account's sign-in be.
+function kept(res) {
+  const headers = new Headers(res.headers)
+  headers.delete("content-length")
+  headers.delete("content-encoding")
+  headers.set("X-Magpie-Sign-In", "kept")
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
+}
+
 // ---- the plugin ---------------------------------------------------------------
 
 export const GrokAuthPlugin = async ({ client }) => {
@@ -461,19 +470,17 @@ export const GrokAuthPlugin = async ({ client }) => {
                 parsed = JSON.parse(body) ?? {}
               } catch {}
             }
-            const send = async (expired) => {
-              const c = await token(home, expired)
-              await remember(auth, c)
-              const headers = new Headers(req.headers)
-              await sign(headers, c.key)
-              if (typeof parsed.model === "string" && parsed.model) headers.set("x-grok-model-override", parsed.model)
-              if (typeof parsed.prompt_cache_key === "string" && parsed.prompt_cache_key) headers.set("x-grok-conv-id", parsed.prompt_cache_key)
-              headers.delete("content-length")
-              return fetch(req.url, { ...init, method: req.method, headers, body })
-            }
-            const res = await send(false)
-            if (res.status !== 401) return res
-            return send(true)
+            const c = await token(home, false)
+            await remember(auth, c)
+            const headers = new Headers(req.headers)
+            await sign(headers, c.key)
+            if (typeof parsed.model === "string" && parsed.model) headers.set("x-grok-model-override", parsed.model)
+            if (typeof parsed.prompt_cache_key === "string" && parsed.prompt_cache_key) headers.set("x-grok-conv-id", parsed.prompt_cache_key)
+            headers.delete("content-length")
+            // sent once, as the built-in sent it: Grok's 401 goes on as it
+            // came, and the built-in never marked a Grok account lapsed
+            const res = await fetch(req.url, { ...init, method: req.method, headers, body })
+            return res.status === 401 ? kept(res) : res
           },
         }
       },

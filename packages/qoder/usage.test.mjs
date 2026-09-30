@@ -145,13 +145,69 @@ const LISTING = {
   ],
 }
 
-test("a refused chat is a 401 only when Qoder says 401; a 403 stays a 403", async () => {
+const ASK = { method: "POST", body: JSON.stringify({ model: "qmodel", messages: [{ role: "user", content: "hi" }] }) }
+
+test("a refused chat, 401 or 403, is the built-in's 401 and leaves the account unmarked", async () => {
   for (const status of [401, 403]) {
     const { fetch } = await chat(LISTING, () => new Response("nope", { status }))
-    const res = await fetch(API_CHAT, { method: "POST", body: JSON.stringify({ model: "qmodel", messages: [{ role: "user", content: "hi" }] }) })
-    expect(res.status).toBe(status)
+    const res = await fetch(API_CHAT, ASK)
+    expect(res.status).toBe(401)
+    expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
     expect((await res.json()).error.message).toBe("the sign-in lapsed — sign in again")
   }
+  // refused in the stream, before any answer: the same
+  const sse = (v) => new Response(`data: ${JSON.stringify(v)}\n\n`, { headers: { "Content-Type": "text/event-stream" } })
+  const { fetch } = await chat(LISTING, () => sse({ statusCodeValue: 403, body: "" }))
+  const res = await fetch(API_CHAT, ASK)
+  expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([401, "kept"])
+})
+
+test("other refusals keep their status and say nothing of the sign-in", async () => {
+  for (const [status, want] of [[500, 500], [429, 429], [402, 402]]) {
+    const { fetch } = await chat(LISTING, () => new Response("", { status }))
+    const res = await fetch(API_CHAT, ASK)
+    expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([want, null])
+  }
+  // an empty body is named as Go's http.StatusText names it; details may be an object
+  expect(_internal.failure(502, "")).toEqual({ status: 502, message: "Bad Gateway" })
+  expect(_internal.failure(400, JSON.stringify({ message: "bad", details: { error: { message: "effort" } } }))).toEqual({ status: 400, message: "bad: effort" })
+})
+
+test("a model list Qoder won't give is a 400, as the built-in's QoderModelOf answered, the account unmarked", async () => {
+  for (const status of [401, 403, 500]) {
+    const auth = { ...account(), machineId: "m1" }
+    globalThis.fetch = async () => new Response("no", { status })
+    const hooks = await QoderAuthPlugin({ client: { auth: { set: async () => {} } } })
+    const l = await hooks.auth.loader(async () => auth)
+    const res = await l.fetch(API_CHAT, ASK)
+    expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([400, null])
+    expect((await res.json()).error.message).toBe(`Qoder models: HTTP ${status}: no`)
+  }
+})
+
+// the loader's fetch for an account whose job token is due, the refresh answered by refresh()
+async function due(refresh, fields = {}) {
+  const auth = { ...account(), machineId: "m1", expires: 0, ...fields }
+  globalThis.fetch = async (url) => (new URL(String(url)).pathname === "/api/v1/jobToken/refresh" ? refresh() : new Response("", { status: 500 }))
+  const hooks = await QoderAuthPlugin({ client: { auth: { set: async () => {} } } })
+  const l = await hooks.auth.loader(async () => auth)
+  return l.fetch(API_CHAT, ASK)
+}
+
+test("a refresh Qoder refuses (401 or 403) marks the account lapsed, as qoderRefreshFailed did", async () => {
+  for (const status of [401, 403]) {
+    const res = await due(() => new Response("", { status }))
+    expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([401, "expired"])
+    expect((await res.json()).error.message).toBe(`one@x's Qoder sign-in has expired — sign in again (qoder job token refresh: status ${status})`)
+  }
+})
+
+test("no refresh token is a 401 the built-in didn't mark; a refresh that failed otherwise is a 502", async () => {
+  let res = await due(() => new Response("", { status: 401 }), { refresh: "" })
+  expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([401, "kept"])
+  res = await due(() => new Response("", { status: 500 }))
+  expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([502, null])
+  expect((await res.json()).error.message).toBe("Qoder job token refresh: status 500")
 })
 
 test("errors don't name Qoder, which magpie adds", async () => {
@@ -164,7 +220,7 @@ test("errors don't name Qoder, which magpie adds", async () => {
   const gone = await QoderAuthPlugin({ client: { auth: { set: async () => {} } } })
   const l = await gone.auth.loader(async () => ({ type: "oauth" }))
   res = await l.fetch(API_CHAT, { method: "POST", body: JSON.stringify({ model: "qmodel", messages: [] }) })
-  expect(res.status).toBe(401)
+  expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([401, "kept"])
   expect((await res.json()).error.message).toBe("not signed in")
 })
 

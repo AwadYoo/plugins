@@ -188,11 +188,14 @@ async function saveBack(c) {
 
 // ---- tokens --------------------------------------------------------------------
 
+// EXPIRED is the built-in's words for a sign-in Kiro refused, or one with
+// nothing to refresh it.
 const EXPIRED = "Kiro's sign-in has expired; sign in again"
+const EXPIRED_CLI = EXPIRED + " with `kiro-cli login` or the Kiro IDE"
 
 // gone is an error saying the sign-in itself is gone — refused, or never
-// there — which alone answers a request with the 401 magpie marks the
-// account lapsed on; a refresh that timed out or met a 5xx may pass.
+// there — which alone marks the account lapsed; a refresh that timed out
+// or met a 5xx fails the request as the built-in did, the account kept.
 const gone = (msg) => Object.assign(new Error(msg), { gone: true })
 const fresh = (c) => c.method === "apikey" || !c.expires || c.expires - Date.now() > 2 * 60 * 1000
 
@@ -206,8 +209,8 @@ async function post(url, contentType, body, headers = {}) {
   }
   const text = await res.text()
   if (!res.ok) {
-    if ([400, 401, 403].includes(res.status)) throw gone(EXPIRED)
-    throw new Error(`refreshing Kiro's sign-in: ${res.status}`)
+    if ([400, 401, 403].includes(res.status)) throw gone(EXPIRED_CLI)
+    throw new Error(`refreshing Kiro's sign-in: ${res.status} ${STATUS_TEXT[res.status] ?? ""}`.trimEnd()) // Go's res.Status
   }
   return JSON.parse(text)
 }
@@ -223,7 +226,7 @@ async function refresh(c) {
       if (n && n.dbKey === c.dbKey && n.access !== c.access && fresh(n)) return n
     }
   }
-  if (!c.refresh) throw gone(EXPIRED)
+  if (!c.refresh) throw gone(EXPIRED_CLI)
   let out
   switch (c.method) {
     case "social": {
@@ -246,9 +249,9 @@ async function refresh(c) {
       break
     }
     default:
-      throw gone(EXPIRED)
+      throw gone("Kiro's sign-in has expired")
   }
-  if (!out.access) throw gone(EXPIRED)
+  if (!out.access) throw gone(EXPIRED_CLI)
   const n = { ...c, access: out.access, expires: Date.now() + (out.expiresIn > 0 ? out.expiresIn : 3600) * 1000 }
   if (out.refresh) n.refresh = out.refresh
   await saveBack(n)
@@ -315,7 +318,7 @@ async function profileOf(c) {
       signal: AbortSignal.timeout(20_000),
     })
     if (!res.ok) {
-      const msg = `Kiro didn't take the API key: ${res.status}`
+      const msg = `Kiro didn't take the API key: ${res.status} ${STATUS_TEXT[res.status] ?? ""}`.trimEnd()
       throw res.status === 401 || res.status === 403 ? gone(msg) : new Error(msg)
     }
     const arn = (await res.json().catch(() => null))?.profile?.arn
@@ -431,7 +434,7 @@ function account(client) {
         if (stale && c && read.access !== c.access && fresh(read)) stale = false // the owner refreshed it already
         c = read
         if (!fresh(c) || stale) {
-          if (c.method === "apikey") throw gone("Kiro turned down the API key")
+          if (c.method === "apikey") throw gone("Kiro turned down the API key saved on the provider")
           c = await refresh(c)
           await save(auth, c)
         }
@@ -712,7 +715,7 @@ function failure(status, body) {
     const e = JSON.parse(body)
     if (e?.message) msg = e.message + (e.reason ? ` (${e.reason})` : "")
   } catch {}
-  msg ||= `HTTP ${status}`
+  msg ||= STATUS_TEXT[status] ?? ""
   if (msg.includes("CONTENT_LENGTH_EXCEEDS_THRESHOLD") || msg.toLowerCase().includes("input is too long"))
     return { status: 400, message: "input is too long for the model's context: " + msg }
   if (msg.includes("INSUFFICIENT_MODEL_CAPACITY")) return { status: 503, message: msg }
@@ -723,10 +726,12 @@ function failure(status, body) {
 const ERROR_TYPES = { 400: "invalid_request_error", 401: "authentication_error", 402: "billing_error", 403: "permission_error",
   404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 503: "overloaded_error", 529: "overloaded_error" }
 const errorType = (status) => ERROR_TYPES[status] ?? "api_error"
-const errorResponse = (status, message) =>
+// signIn, the X-Magpie-Sign-In header, says what the answer means for the
+// account whatever its status: "expired" marks it lapsed, "kept" leaves it.
+const errorResponse = (status, message, signIn) =>
   new Response(JSON.stringify({ type: "error", error: { type: errorType(status), message } }), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(signIn ? { "X-Magpie-Sign-In": signIn } : {}) },
   })
 
 // ---- the reply: an AWS event stream → Messages ---------------------------------------
@@ -1087,7 +1092,9 @@ async function reply(it, model, stream) {
 }
 
 // generate answers a Messages request through Kiro's API: once more,
-// refreshed, when Kiro turns the token down (403).
+// refreshed, when Kiro turns the token down (403). As the built-in: no
+// credentials is a 401, a failed refresh after the 403 a 502; only a
+// sign-in that is gone marks the account.
 async function generate(creds, auth, req, signal) {
   const model = String(req.model ?? "auto")
   const budget = thinking(req, model)
@@ -1095,7 +1102,7 @@ async function generate(creds, auth, req, signal) {
   try {
     a = await creds(auth)
   } catch (e) {
-    return errorResponse(e?.gone ? 401 : 502, e.message)
+    return errorResponse(401, e.message, e?.gone ? undefined : "kept")
   }
   let res
   try {
@@ -1109,7 +1116,7 @@ async function generate(creds, auth, req, signal) {
     try {
       a = await creds(auth, true)
     } catch (e) {
-      return errorResponse(e?.gone ? 401 : 502, e.message)
+      return errorResponse(502, e.message, e?.gone ? "expired" : undefined)
     }
     try {
       res = await sendKiro(a, buildKiro(req, model, a.profile, budget), signal)
@@ -1119,8 +1126,9 @@ async function generate(creds, auth, req, signal) {
     }
   }
   if (!res.ok) {
+    // Kiro's own 401 is passed on, as the built-in did, the sign-in kept
     const f = failure(res.status, (await res.text()).slice(0, 1 << 20))
-    return errorResponse(f.status, f.message)
+    return errorResponse(f.status, f.message, f.status === 401 ? "kept" : undefined)
   }
   return reply(events(res.body, model, budget), model, req.stream === true)
 }
@@ -1373,4 +1381,4 @@ export async function KiroAuthPlugin({ client } = {}) {
 }
 
 // for tests
-export const _internal = { usageOf, buildKiro, events, reply, failure, toolID, thinking, readCLI, readIDE, regionOf, planName, frames }
+export const _internal = { generate, refresh, usageOf, buildKiro, events, reply, failure, toolID, thinking, readCLI, readIDE, regionOf, planName, frames }

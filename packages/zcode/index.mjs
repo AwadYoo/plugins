@@ -120,7 +120,9 @@ const jwtExpired = (jwt) => {
   const t = jwtExpiry(jwt)
   return t > 0 && Date.now() > t
 }
-const EXPIRED = "ZCode's sign-in has expired; sign in again"
+// EXPIRED is the built-in's words (errZCodeExpired) for a Start Plan
+// sign-in past its end.
+const EXPIRED = "ZCode's sign-in has expired; sign in to ZCode again (or add the account again in magpie)"
 
 const num = (v) => {
   const n = typeof v === "string" ? parseFloat(v) : v
@@ -236,7 +238,7 @@ async function teamKey(s) {
     teamKeys.set(id, { key, at: Date.now() })
     return key
   } catch (e) {
-    const err = new Error(`ZCode's team plan: ${e.message} — sign in again`)
+    const err = new Error(`ZCode's team plan: ${e.message} — sign in to ZCode again`)
     teamKeys.set(id, { err, at: Date.now() })
     throw err
   }
@@ -1093,7 +1095,15 @@ export async function ZCodeAuthPlugin({ client }) {
             h.delete("authorization")
             h.set("x-api-key", key)
             h.set("Authorization", "Bearer " + key)
-            return fetch(url, { ...opts, headers: h })
+            const res = await fetch(url, { ...opts, headers: h })
+            // the plan's 401 goes on as it came: the built-in never
+            // marked a ZCode account lapsed
+            if (res.status !== 401) return res
+            const kept = new Headers(res.headers)
+            kept.delete("content-length")
+            kept.delete("content-encoding")
+            kept.set("X-Magpie-Sign-In", "kept")
+            return new Response(res.body, { status: res.status, statusText: res.statusText, headers: kept })
           },
         }
       },

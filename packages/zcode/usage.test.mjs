@@ -130,7 +130,7 @@ test("ZCode's Start Plan: its buckets, each for its models", async () => {
   expect((await usage(auth)).windows).toEqual([{ name: "GLM-5-Turbo", used: 25, display: "50 / 200", span: 7 * 86400, models: ["GLM-5-Turbo"] }])
 
   // its token run out
-  expect(await usage(oauth({ site: "zai", jwt: jwt(now - 60) }))).toEqual({ error: "ZCode's sign-in has expired; sign in again" })
+  expect(await usage(oauth({ site: "zai", jwt: jwt(now - 60) }))).toEqual({ error: "ZCode's sign-in has expired; sign in to ZCode again (or add the account again in magpie)" })
 })
 
 test("a team seat: the team plan's windows, name, end and resets, its key found and saved", async () => {

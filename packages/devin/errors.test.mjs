@@ -30,7 +30,7 @@ const ask = async (reply, stream = false) => {
     { key: "k", server: "https://devin.test", families: _internal.familiesOf(_internal.SNAPSHOT) },
     { model: "swe-2", stream, messages: [{ role: "user", content: "hi" }] },
   )
-  return { status: res.status, body: await res.text() }
+  return { status: res.status, body: await res.text(), signIn: res.headers.get("X-Magpie-Sign-In") }
 }
 const errOf = (r) => JSON.parse(r.body).error.message
 
@@ -52,10 +52,30 @@ test("a too-long conversation is the built-in's 400", async () => {
   expect(errOf(r)).toBe("input is too long for the model's context: prompt is too long")
 })
 
-test("a refused key is the 401 magpie marks the account lapsed on", async () => {
+// the built-in answered it 401 and left the account as it was
+test("a refused key is the built-in's 401, the account kept", async () => {
   const r = await ask(() => new Response(JSON.stringify({ code: "unauthenticated", message: "bad key" }), { status: 401 }))
   expect(r.status).toBe(401)
   expect(errOf(r)).toBe("bad key — sign in to Devin again")
+  expect(r.signIn).toBe("kept")
+})
+
+test("unauthenticated at the stream's end is a 401 that keeps the account too", async () => {
+  const r = await ask(() => new Response(end({ error: { code: "unauthenticated", message: "key revoked" } })))
+  expect(r.status).toBe(401)
+  expect(errOf(r)).toBe("key revoked — sign in to Devin again")
+  expect(r.signIn).toBe("kept")
+})
+
+test("no key to send is a 401 that keeps the account", async () => {
+  const { DevinAuthPlugin } = await import("./index.mjs")
+  const hooks = await DevinAuthPlugin()
+  let auth = { type: "api", key: "k", metadata: {} }
+  const opts = await hooks.auth.loader(async () => auth)
+  auth = null
+  const res = await opts.fetch("https://devin.test/v1/chat/completions", { method: "POST", body: "{}" })
+  expect(res.status).toBe(401)
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
 })
 
 test("an empty reply is the built-in's 502 of a broken-off one", async () => {

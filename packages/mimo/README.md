@@ -29,10 +29,11 @@ Chat completions go to `https://mimo-server-<region>.xiaomimimo.com/api/route/ch
 
 `mimo-auto`, the app's default model, is requested as `mimo-pro`.
 
-The session is renewed with the passToken a day after it was issued. It is
-also renewed once when the server turns a request away: a 401, or a Xiaomi
-sign-in page where an answer was expected. If the passToken no longer works,
-sign in again.
+The session is renewed with the passToken a day after it was issued. A model
+request the server turns away (a 401) is answered as the server answered it,
+as magpie's built-in MiMo account did; reading usage renews the session once
+when the server turns it away. If the passToken no longer works, sign in
+again.
 
 ## Where the sign-in is kept
 

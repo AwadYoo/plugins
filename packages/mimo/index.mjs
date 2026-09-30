@@ -117,7 +117,11 @@ async function session(creds, base) {
     const headers = appHeaders()
     const cookie = jar.header(url)
     if (cookie) headers.Cookie = cookie
-    res = await fetch(url, { headers, redirect: "manual", signal })
+    try {
+      res = await fetch(url, { headers, redirect: "manual", signal })
+    } catch (e) {
+      throw new Error("Xiaomi MiMo sign-in: " + (e?.message ?? e))
+    }
     jar.take(res, url)
     const loc = res.headers.get("location")
     if (res.status < 300 || res.status >= 400 || !loc) break
@@ -182,6 +186,15 @@ function fromAuth(auth) {
   } catch {
     return null
   }
+}
+
+// said is an answer with magpie's X-Magpie-Sign-In, which tells what it
+// means for the account's sign-in whatever its status: "expired" marks it
+// lapsed, "kept" leaves it be. magpie takes it off before the agent sees it.
+function said(res, v) {
+  const h = new Headers(res.headers)
+  h.set("X-Magpie-Sign-In", v)
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h })
 }
 
 // ---- the sign-in ------------------------------------------------------------
@@ -336,7 +349,8 @@ export const MimoAuthPlugin = async ({ client }) => {
 
   // fresh is the account with a live session, signed on again when it is
   // older than the app lets one get, or when force is set (the server
-  // turned the last one away)
+  // turned the last one away); renewed when it was signed on again, which
+  // took the built-in's lapse mark off
   const fresh = async (getAuth, force) => {
     const a = fromAuth(await getAuth())
     if (!a) throw new Error("Xiaomi MiMo: not signed in")
@@ -349,7 +363,7 @@ export const MimoAuthPlugin = async ({ client }) => {
           const s = await session(a.creds, a.creds.base)
           const issued = Date.now()
           await save(toAuth(a.creds, s.cookies, issued))
-          return { creds: a.creds, cookies: s.cookies, expires: issued + RENEW_AFTER }
+          return { creds: a.creds, cookies: s.cookies, expires: issued + RENEW_AFTER, renewed: true }
         } catch (e) {
           // a hiccup: the session in hand may still do
           if (!(e instanceof Lapsed) && !force && Object.keys(a.cookies).length) return a
@@ -467,31 +481,28 @@ export const MimoAuthPlugin = async ({ client }) => {
                 if (j?.model === "mimo-auto") body = JSON.stringify({ ...j, model: "mimo-pro" })
               } catch {}
             }
-            const send = async (force) => {
-              const s = await fresh(getAuth, force)
-              const headers = new Headers(init.headers ?? req?.headers)
-              headers.delete("authorization")
-              headers.set("Cookie", cookieHeader(s.cookies))
-              headers.set("X-Mimo-Source", SOURCE)
-              headers.set("User-Agent", UA)
-              headers.set("X-Client-Version", APP_VERSION)
-              return fetch(url, { ...init, method: init.method ?? req?.method ?? "POST", headers, body })
-            }
+            let s
             try {
-              const res = await send(false)
-              // a session gone stale, or a redirect to Xiaomi's sign-in page
-              const stale = res.status === 401 || (res.status === 200 && /text\/html/i.test(res.headers.get("content-type") ?? ""))
-              if (!stale || (body != null && typeof body !== "string")) return res
-              await res.arrayBuffer().catch(() => {})
-              return await send(true)
+              s = await fresh(getAuth, false)
             } catch (e) {
-              // the passToken no longer signs the account on: the account's
-              // own 401, in the built-in's words (mimoLapse)
+              // the passToken no longer signs the account on: the built-in
+              // failed the request (magpie's 502) in mimoLapse's words and
+              // marked the account lapsed
               if (!(e instanceof Lapsed)) throw e
               const who = fromAuth(await getAuth())?.creds.userId ?? a.creds.userId
               const message = `${who}: the Xiaomi MiMo sign-in has expired — sign in again`
-              return new Response(JSON.stringify({ error: { message, type: "authentication_error", code: null } }), { status: 401, headers: { "content-type": "application/json" } })
+              return said(new Response(JSON.stringify({ error: { message, type: "api_error", code: null } }), { status: 502, headers: { "content-type": "application/json" } }), "expired")
             }
+            const headers = new Headers(init.headers ?? req?.headers)
+            headers.delete("authorization")
+            headers.set("Cookie", cookieHeader(s.cookies))
+            headers.set("X-Mimo-Source", SOURCE)
+            headers.set("User-Agent", UA)
+            headers.set("X-Client-Version", APP_VERSION)
+            // the server's answer goes through as it is, a 401 too, as the
+            // built-in's did: it took the lapse off only when it signed on again
+            const res = await fetch(url, { ...init, method: init.method ?? req?.method ?? "POST", headers, body })
+            return s.renewed && res.status >= 200 && res.status < 300 ? res : said(res, "kept")
           },
         }
       },

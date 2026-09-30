@@ -719,11 +719,23 @@ function streamError(e) {
   return failure(status || 500, msg)
 }
 
+// errorResponse is a failure as the built-in answered it, the account
+// kept: the built-in never marked a Command Code account lapsed, a 401 of
+// Command Code's among them.
 const errorResponse = ({ status, message }) =>
   new Response(JSON.stringify({ error: { message, type: "commandcode_error", code: status } }), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "kept" },
   })
+
+// kept is a Provider API answer, as it came, saying the account is kept.
+function kept(res) {
+  const headers = new Headers(res.headers)
+  headers.delete("content-length")
+  headers.delete("content-encoding")
+  headers.set("X-Magpie-Sign-In", "kept")
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
+}
 
 // lines reads the reply a JSON object a line.
 async function* lines(body) {
@@ -907,7 +919,9 @@ export async function CommandCodePlugin({ client } = {}) {
               }
               return generate(key, chat, init.signal)
             }
-            return fetch(input, { ...init, headers })
+            // the Provider API's 401 went on as it came, the account kept
+            const res = await fetch(input, { ...init, headers })
+            return res.status === 401 ? kept(res) : res
           },
         }
       },

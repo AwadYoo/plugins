@@ -86,10 +86,11 @@ const api = (site) => site.endpoint + "/v2"
 // ---- WorkBuddy's API ------------------------------------------------------
 
 class WBError extends Error {
-  constructor(message, code, status) {
+  constructor(message, code, status, said) {
     super(message)
     this.code = code
     this.status = status
+    this.said = said // as magpie's built-in (wbCall) worded it
   }
 }
 
@@ -112,11 +113,13 @@ async function call(site, method, path, headers = {}, body) {
   try {
     env = JSON.parse(text)
   } catch {}
+  const code = Number.parseInt(env.code, 10) || 0
   if (!res.ok) {
     const why = env.msg || env.message || env.error?.message || text.slice(0, 200) || res.statusText
-    throw new WBError(`${site.name}: ${why} (HTTP ${res.status}${env.code ? ", code " + env.code : ""})`, env.code, res.status)
+    const said = code ? env.msg || `error ${code}` : env.msg || statusText(res.status)
+    throw new WBError(`${site.name}: ${why} (HTTP ${res.status}${env.code ? ", code " + env.code : ""})`, env.code, res.status, said)
   }
-  if (env.code) throw new WBError(`${site.name}: ${env.msg || "error"} (${env.code})`, env.code, res.status)
+  if (env.code) throw new WBError(`${site.name}: ${env.msg || "error"} (${env.code})`, env.code, res.status, env.msg || `error ${code}`)
   return env.data
 }
 
@@ -145,13 +148,14 @@ function stale(a) {
 
 // fresh is the sign-in with an access token that isn't about to end:
 // refreshed (and saved) when it is. A refresh that fails, or a refresh
-// token that has ended, leaves the access token there is.
+// token that has ended, leaves the access token there is. Its failures
+// are worded as the built-in's (wbFresh), "WorkBuddy" on both sites.
 async function fresh(site, client, a) {
   if (!stale(a)) return a
   const refreshable = a.refresh && !(a.refreshExpiresAt && Date.now() >= a.refreshExpiresAt)
   if (!refreshable) {
     if (a.access) return a
-    throw new Error(`this ${site.name} account is signed out; sign in again`)
+    throw new Error("this WorkBuddy account is signed out; sign in again")
   }
   try {
     const got = await call(site, "POST", "/v2/plugin/auth/token/refresh", {
@@ -159,13 +163,14 @@ async function fresh(site, client, a) {
       "X-Auth-Refresh-Source": "plugin",
       "X-Domain": domainOf(site, a),
     }, {})
-    if (!got?.accessToken) throw new Error(`${site.name} gave no refreshed token`)
+    if (!got?.accessToken) throw Object.assign(new Error("WorkBuddy gave no refreshed token"), { bare: true })
     const next = merge(a, got)
     await client?.auth?.set?.({ path: { id: site.id }, body: next })
     return next
   } catch (e) {
     if (a.access) return a
-    throw new Error(`${site.name} token refresh: ${e?.message ?? e}`)
+    if (e?.bare) throw e
+    throw new Error(`WorkBuddy token refresh: ${e?.said ?? e?.message ?? e}`)
   }
 }
 
@@ -612,12 +617,15 @@ const REFUSED_HINT =
 const REFUSED = /unapproved channel|illegal api invocation/i
 
 // explained is res with REFUSED_HINT added to that refusal's message.
+// Each refusal says the sign-in is kept: the built-in passed WorkBuddy's
+// 401 on and never marked a WorkBuddy account lapsed.
 async function explained(res) {
   const text = await res.text()
   const again = (b) => {
     const headers = new Headers(res.headers)
     headers.delete("content-length")
     headers.delete("content-encoding")
+    headers.set("X-Magpie-Sign-In", "kept")
     return new Response(b, { status: res.status, statusText: res.statusText, headers })
   }
   if (!REFUSED.test(text)) return again(text)
@@ -635,6 +643,7 @@ async function explained(res) {
   headers.set("content-type", "application/json")
   headers.delete("content-length")
   headers.delete("content-encoding")
+  headers.set("X-Magpie-Sign-In", "kept")
   return new Response(JSON.stringify({ error: { message: msg, type: "permission_error", code: null } }), { status: res.status, statusText: res.statusText, headers })
 }
 
@@ -642,4 +651,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { withSystem, usageOf, desktopHeld, explained, REFUSED_HINT, freeCredits }
+export const _internal = { withSystem, usageOf, desktopHeld, explained, REFUSED_HINT, freeCredits, fresh, SITES }

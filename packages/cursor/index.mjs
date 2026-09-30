@@ -158,9 +158,10 @@ async function cliTokenNow() {
     await cliRefresh
     tok = await cliToken()
   }
-  if (!tok) throw new AuthError("Cursor isn't signed in: run `cursor-agent login`, or sign in again")
+  // the built-in's words (provider.CursorToken)
+  if (!tok) throw new AuthError("Cursor isn't signed in; sign in from magpie's Providers page or run `cursor-agent login`")
   const e = expiry(tok)
-  if (e && e <= Date.now()) throw new AuthError("Cursor's sign-in has run out: run `cursor-agent login`, or sign in again")
+  if (e && e <= Date.now()) throw new AuthError("Cursor's sign-in has run out; sign in again from magpie's Providers page or run `cursor-agent login`")
   return tok
 }
 
@@ -847,21 +848,22 @@ function failure(status, text) {
   return statusOf(status, f.code ?? "", msg)
 }
 
-// signInExpired is a message of a token or session run out; a trial, a
-// plan or a link run out is no lapsed sign-in, and magpie marks the
-// account lapsed on a 401.
+// signInExpired is a message of a token or session run out. The built-in
+// answered any "expired" with a 401, but a trial, a plan or a link run out
+// is no lapsed sign-in: that 401 says "kept" (X-Magpie-Sign-In).
 const signInExpired = (low) => low.includes("expired") && /token|session|sign[- ]?in|log[- ]?in|auth|credential/.test(low)
 
 // statusOf is the status and words for Cursor's error of this code and
 // message. A region the team isn't served in says so, not to sign in.
 function statusOf(status, code, msg) {
-  msg ||= statusText(status) || `HTTP ${status}`
+  msg ||= statusText(status)
   const low = msg.toLowerCase()
   // magpie names the provider before the message itself
-  const out = (status, message) => ({ status, message })
+  const out = (status, message, signIn) => ({ status, message, ...(signIn ? { signIn } : {}) })
   if (regional(msg)) return out(403, msg + " — Cursor serves your team only in some regions and turned this request away; signing in again won't change that")
   if (code === "permission_denied") return out(403, msg)
-  if (code === "unauthenticated" || status === 401 || signInExpired(low)) return out(401, msg + " — sign in to Cursor again")
+  if (code === "unauthenticated" || status === 401 || low.includes("expired"))
+    return out(401, msg + " — sign in to Cursor again in magpie", code === "unauthenticated" || status === 401 || signInExpired(low) ? undefined : "kept")
   if (code === "resource_exhausted" || low.includes("quota") || low.includes("rate limit") || low.includes("usage limit"))
     return out(429, "usage limit reached: " + msg)
   if (low.includes("too long") || low.includes("context length") || low.includes("too many tokens"))
@@ -1357,10 +1359,12 @@ function exec(msg, tools, send, closeExec) {
 
 // ---- chat completions ------------------------------------------------------------------
 
-const errorResponse = ({ status, message }) =>
+// signIn, the X-Magpie-Sign-In header, says what the answer means for the
+// account whatever its status: "kept" leaves it unmarked.
+const errorResponse = ({ status, message, signIn }) =>
   new Response(JSON.stringify({ error: { message, type: "cursor_error", code: status } }), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...(signIn ? { "X-Magpie-Sign-In": signIn } : {}) },
   })
 
 // answer runs a chat completion on Cursor and answers it as one, streamed
@@ -1522,4 +1526,4 @@ export async function CursorAuthPlugin() {
 }
 
 // for tests
-export const _internal = { poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
+export const _internal = { errorResponse, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }

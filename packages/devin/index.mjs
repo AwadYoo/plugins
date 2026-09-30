@@ -1005,10 +1005,14 @@ async function* events(it) {
   }
 }
 
+// errorResponse is a failure as the built-in answered it. None marks the
+// account lapsed: the built-in's 401s (a key Devin turned away, none to
+// send) were answered without touching the account, so each says
+// X-Magpie-Sign-In: kept.
 const errorResponse = ({ status, message }) =>
   new Response(JSON.stringify({ error: { message, type: "devin_error", code: status } }), {
     status,
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "kept" },
   })
 
 // complete answers a chat completion through GetChatMessage.

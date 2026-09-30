@@ -80,6 +80,11 @@ class ZedStatus extends Error {
   }
 }
 
+// SignInExpired is Zed refusing the account's own sign-in (a 401 for its
+// model token): the one failure the built-in marked the account lapsed for
+// (zedLapse).
+class SignInExpired extends Error {}
+
 const parse = (s) => {
   try {
     return JSON.parse(s)
@@ -125,9 +130,9 @@ function failedStatus(code) {
 function refusal(status, body) {
   if (status === 402) return [402, "payment required — this account's plan doesn't include Zed's hosted models, or its allowance is used up (see zed.dev/account)"]
   // a model token refused right after it was minted: the account's own
-  // sign-in just worked, so this isn't the sign-in lapsing (a 401 would
-  // have magpie mark it so, which the built-in never did here)
-  if (status === 401) return [403, "the sign-in was refused — sign in again"]
+  // sign-in just worked, so the built-in answered 401 without marking it
+  // (errorResponse says kept)
+  if (status === 401) return [401, "the sign-in was refused — sign in again"]
   const j = parse(body) ?? {}
   let code = status
   const up = Number(j.upstream_status)
@@ -228,7 +233,7 @@ async function modelToken(s, renew) {
       return tok
     } catch (e) {
       tokens.delete(key)
-      if (e instanceof ZedStatus && e.status === 401) throw new Error(`${s.who || "the account"}'s Zed sign-in has expired — sign in again`)
+      if (e instanceof ZedStatus && e.status === 401) throw new SignInExpired(`${s.who || "the account"}: the Zed sign-in has expired — sign in again`)
       throw e
     }
   })()
@@ -557,8 +562,15 @@ function errorBody(wire, status, message) {
   }
 }
 
-const errorResponse = (wire, status, message) =>
-  new Response(JSON.stringify(errorBody(wire, status, message)), { status, headers: { "content-type": "application/json" } })
+// errorResponse is a failure as the caller's API gives it. signIn is what it
+// means for the account (magpie's X-Magpie-Sign-In): the built-in marked
+// the account lapsed only when Zed refused its sign-in, so any other 401
+// (a model token refused twice, a vendor's upstream_http_401) is kept.
+const errorResponse = (wire, status, message, signIn = status === 401 ? "kept" : undefined) =>
+  new Response(JSON.stringify(errorBody(wire, status, message)), {
+    status,
+    headers: { "content-type": "application/json", ...(signIn ? { "x-magpie-sign-in": signIn } : {}) },
+  })
 
 // said tells whether one of the provider's own events says anything —
 // text, reasoning, a call, a finish — rather than only framing the reply,
@@ -845,7 +857,8 @@ async function complete(s, url, init) {
     try {
       tok = await modelToken(s, t > 0)
     } catch (e) {
-      return errorResponse(w.wire, /sign in again/.test(e?.message ?? "") ? 401 : 502, String(e?.message ?? e).replace(/^Zed: /, ""))
+      if (e instanceof SignInExpired) return errorResponse(w.wire, 401, e.message, "expired")
+      return errorResponse(w.wire, 502, String(e?.message ?? e).replace(/^Zed: /, ""))
     }
     res = await fetch(CLOUD + "/completions", {
       method: "POST",

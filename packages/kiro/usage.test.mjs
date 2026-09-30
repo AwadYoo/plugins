@@ -79,23 +79,29 @@ test("no account, no usage", async () => {
   expect(calls).toEqual([])
 })
 
-// the loader's fetch answering a Messages request
+// the loader's fetch answering a Messages request, and what it says of the
+// sign-in (X-Magpie-Sign-In)
 async function ask(a) {
   const hooks = await plugin({ client: { auth: { set: async () => {} } } })
   const l = await hooks.auth.loader(async () => a)
   const res = await l.fetch("https://kiro.invalid/v1/messages", { method: "POST", body: JSON.stringify({ model: "auto", max_tokens: 10, messages: [{ role: "user", content: "hi" }] }) })
-  return { status: res.status, message: (await res.json()).error.message }
+  const out = { status: res.status, message: (await res.json()).error.message }
+  const said = res.headers.get("X-Magpie-Sign-In")
+  return said ? { ...out, signIn: said } : out
 }
 const stale = { ...auth, expires: Date.now() - 60_000 }
 
-test("a refresh that failed for a while is no lapsed sign-in (no 401); one Kiro refused is", async () => {
+// the built-in answered any credentials it couldn't get with a 401 and
+// marked nothing; only a refresh Kiro refused marks the account here
+test("a refresh that failed for a while is the built-in's 401, the account kept; one Kiro refused marks it", async () => {
   answer(500, "")
-  expect(await ask(stale)).toEqual({ status: 502, message: "refreshing Kiro's sign-in: 500" })
+  expect(await ask(stale)).toEqual({ status: 401, message: "refreshing Kiro's sign-in: 500 Internal Server Error", signIn: "kept" })
   globalThis.fetch = async () => { throw new Error("getaddrinfo ENOTFOUND") }
-  expect(await ask(stale)).toEqual({ status: 502, message: "refreshing Kiro's sign-in: getaddrinfo ENOTFOUND" })
+  expect(await ask(stale)).toEqual({ status: 401, message: "refreshing Kiro's sign-in: getaddrinfo ENOTFOUND", signIn: "kept" })
   answer(401, { error: "invalid_grant" })
-  expect(await ask(stale)).toEqual({ status: 401, message: "Kiro's sign-in has expired; sign in again" })
-  expect(await ask({ ...stale, refresh: "" })).toEqual({ status: 401, message: "Kiro's sign-in has expired; sign in again" })
+  const refused = "Kiro's sign-in has expired; sign in again with `kiro-cli login` or the Kiro IDE"
+  expect(await ask(stale)).toEqual({ status: 401, message: refused })
+  expect(await ask({ ...stale, refresh: "" })).toEqual({ status: 401, message: refused })
 })
 
 test("errors don't name Kiro, which magpie adds", async () => {

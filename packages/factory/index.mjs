@@ -123,15 +123,6 @@ function expiry(access) {
   return typeof exp === "number" && exp > 0 ? Math.floor(exp) * 1000 : 0
 }
 
-function apiError(text, fallback) {
-  try {
-    const j = JSON.parse(text)
-    const m = j?.error?.message ?? j?.error_description ?? j?.message ?? j?.detail ?? (typeof j?.error === "string" ? j.error : "")
-    if (m) return String(m)
-  } catch {}
-  return text.trim().slice(0, 300) || fallback
-}
-
 // workos posts a form to WorkOS: the answer and its status.
 async function workos(path, form, signal) {
   const res = await fetch(WORKOS + path, {
@@ -152,7 +143,7 @@ async function authenticate(form, signal) {
     t = JSON.parse(text) ?? {}
   } catch {}
   t.status = status
-  if (status !== 200 && !t.error) throw new FactoryStatus(status, "Factory sign-in: " + apiError(text, String(status)))
+  if (status !== 200 && !t.error) throw new FactoryStatus(status, "Factory sign-in: " + vendorError(text, STATUS_CODES[status] ?? ""))
   return t
 }
 
@@ -198,7 +189,7 @@ async function factoryGet(c, path) {
   factoryHeaders(h, c)
   const res = await fetch(base(c) + path, { headers: h, signal: AbortSignal.timeout(30_000) })
   const text = await res.text()
-  if (res.status !== 200) throw new FactoryStatus(res.status, "Factory: " + apiError(text, String(res.status)))
+  if (res.status !== 200) throw new FactoryStatus(res.status, "Factory: " + vendorError(text, statusLine(res.status)))
   return JSON.parse(text)
 }
 
@@ -217,7 +208,7 @@ async function whoami(c, signal) {
   if (c.activeOrganizationId) h["X-Factory-Org-Id"] = c.activeOrganizationId
   const res = await fetch(base(c) + "/api/cli/whoami", { headers: h, signal: signal ?? AbortSignal.timeout(10_000) })
   const text = await res.text()
-  if (res.status !== 200) throw new FactoryStatus(res.status, "Factory: " + apiError(text, String(res.status)))
+  if (res.status !== 200) throw new FactoryStatus(res.status, "Factory: " + vendorError(text, statusLine(res.status)))
   return JSON.parse(text) ?? {}
 }
 
@@ -266,6 +257,15 @@ function errorReply(url, status, type, message, headers = new Headers()) {
   const anthropic = new URL(url).pathname.includes("/llm/a/")
   const body = anthropic ? { type: "error", error: { type, message } } : { error: { message, type, code: null } }
   return new Response(JSON.stringify(body), { status, headers })
+}
+
+// said is an answer with magpie's X-Magpie-Sign-In, which tells what it
+// means for the account's sign-in whatever its status: "expired" marks it
+// lapsed, "kept" leaves it be. magpie takes it off before the agent sees it.
+function said(res, v) {
+  const h = new Headers(res.headers)
+  h.set("X-Magpie-Sign-In", v)
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h })
 }
 
 // ---- sign-in ----------------------------------------------------------------
@@ -319,7 +319,7 @@ async function signedInWith(t) {
 
 async function deviceSignIn() {
   const { text, status } = await workos("/authorize/device", { client_id: CLIENT_ID })
-  if (status !== 200) throw new FactoryStatus(status, "Factory sign-in: " + apiError(text, String(status)))
+  if (status !== 200) throw new FactoryStatus(status, "Factory sign-in: " + vendorError(text, STATUS_CODES[status] ?? ""))
   const dc = JSON.parse(text)
   if (!dc.device_code || !dc.user_code) throw new Error("Factory's sign-in gave no device code")
   let interval = Math.max(dc.interval ?? 0, 1) * 1000
@@ -502,8 +502,9 @@ export const FactoryAuthPlugin = async ({ client }) => {
       return c
     }
 
-    // fresh is a live token, renewed near its end.
-    const fresh = () =>
+    // fresh is a live token, renewed near its end; renewed is told when
+    // it was, the built-in's clearing of the account's lapse.
+    const fresh = (renewed) =>
       locked(async () => {
         const c = await current()
         if ((c.expires > 0 && Date.now() < c.expires - REFRESH_LEAD) || !c.refresh) return orgOf(c)
@@ -523,6 +524,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
         await reconcile(c)
         ask(c)
         await save(c)
+        renewed?.()
         return c
       })
 
@@ -530,8 +532,9 @@ export const FactoryAuthPlugin = async ({ client }) => {
     // can't reach is left off and whoami asked again without it; with
     // no header sent, the token is put in the first org /api/cli/org
     // lists. Any other 403 to an account that sent no org asks whoami
-    // for one. True when the request is worth sending again.
-    const mendOrg = (status, text) =>
+    // for one. True when the request is worth sending again; renewed is
+    // told when the token was.
+    const mendOrg = (status, text, renewed) =>
       locked(async () => {
         if (status !== 403) return false
         const isOrg = orgRefused(status, text)
@@ -570,6 +573,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
         c.orgId = org
         if (t.refresh_token) c.refresh = t.refresh_token
         await save(c)
+        renewed?.()
         return true
       })
 
@@ -634,8 +638,8 @@ export const FactoryAuthPlugin = async ({ client }) => {
 
         const { fresh, mendOrg } = account(getAuth)
 
-        const send = async (input, init, body) => {
-          const c = await fresh()
+        const send = async (input, init, body, renewed) => {
+          const c = await fresh(renewed)
           let url = input instanceof Request ? input.url : String(input)
           // an EU org is served from Factory's EU region, an on-prem one
           // from its own host: the request goes there
@@ -665,25 +669,32 @@ export const FactoryAuthPlugin = async ({ client }) => {
             if (body == null && input instanceof Request && input.body) body = new Uint8Array(await input.arrayBuffer())
             if (body instanceof ReadableStream) body = new Uint8Array(await new Response(body).arrayBuffer())
             const url = input instanceof Request ? input.url : String(input)
+            // the built-in takes an account's lapse off when it renews the
+            // token, and never for an answer: a 401 of Factory's leaves it
+            // be, and so does a success with no renewal on the way
+            let renewed = false
+            const onRenew = () => (renewed = true)
+            const answer = (res) => (renewed && res.status >= 200 && res.status < 300 ? res : said(res, "kept"))
             let res
             try {
-              res = await send(input, init, body)
+              res = await send(input, init, body, onRenew)
+              if (res.status !== 403) return answer(res)
+              let text = await res.text()
+              if (await mendOrg(res.status, text, onRenew).catch(() => false)) {
+                res = await send(input, init, body, onRenew)
+                if (res.status !== 403) return answer(res)
+                text = await res.text()
+              }
+              const why = explain(res.status, text)
+              // the refusal, then what to do about it, as provider.Explain joins them
+              const msg = `${vendorError(text, statusLine(res.status))} — ${why}`
+              return answer(errorReply(url, res.status, "permission_error", msg, new Headers(res.headers)))
             } catch (e) {
-              // Factory refused to renew the sign-in: the account's own 401
-              if (e?.lapsed) return errorReply(url, 401, "authentication_error", e.message)
+              // Factory refused to renew the sign-in: the built-in failed the
+              // request (magpie's 502) and marked the account lapsed
+              if (e?.lapsed) return said(errorReply(url, 502, "api_error", e.message), "expired")
               throw e
             }
-            if (res.status !== 403) return res
-            let text = await res.text()
-            if (await mendOrg(res.status, text).catch(() => false)) {
-              res = await send(input, init, body)
-              if (res.status !== 403) return res
-              text = await res.text()
-            }
-            const why = explain(res.status, text)
-            // the refusal, then what to do about it, as provider.Explain joins them
-            const msg = `${apiError(text, "403 Forbidden")} — ${why}`
-            return errorReply(url, res.status, "permission_error", msg, new Headers(res.headers))
           },
         }
       },

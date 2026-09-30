@@ -91,19 +91,42 @@ async function ask(replies) {
   return { res, body: await res.json(), seen }
 }
 
-test("a model token refused right after it was minted isn't a lapsed sign-in (no 401)", async () => {
+test("a model token refused right after it was minted is the built-in's 401, the account kept (not lapsed)", async () => {
   const tok = () => new Response(JSON.stringify({ token: "llm" }))
   const no = () => new Response("", { status: 401 })
   const { res, body, seen } = await ask([tok, no, tok, no])
   expect(seen).toEqual(["/client/llm_tokens", "/completions", "/client/llm_tokens", "/completions"])
-  expect(res.status).toBe(403)
+  expect(res.status).toBe(401)
+  expect(res.headers.get("x-magpie-sign-in")).toBe("kept")
   expect(body.error.message).toBe("the sign-in was refused — sign in again")
 })
 
-test("the account's own sign-in refused is a 401, worded as the built-in's", async () => {
-  const { res, body } = await ask([() => new Response("", { status: 401 })])
-  expect(res.status).toBe(401)
-  expect(body.error.message).toBe("octo's Zed sign-in has expired — sign in again")
+test("the account's own sign-in refused is a 401 that marks it lapsed, worded as the built-in's", async () => {
+  let r = await ask([() => new Response("", { status: 401 })])
+  expect(r.res.status).toBe(401)
+  expect(r.res.headers.get("x-magpie-sign-in")).toBe("expired")
+  expect(r.body.error.message).toBe("octo: the Zed sign-in has expired — sign in again")
+  // refused on the second mint, after a stale token: marked all the same
+  const tok = () => new Response(JSON.stringify({ token: "llm" }))
+  r = await ask([tok, () => new Response("", { status: 401 }), () => new Response("", { status: 401 })])
+  expect([r.res.status, r.res.headers.get("x-magpie-sign-in")]).toEqual([401, "expired"])
+})
+
+test("a mint that fails otherwise is a 502 that leaves the account be, whatever its body says", async () => {
+  const { res, body } = await ask([() => new Response(JSON.stringify({ message: "sign in again later" }), { status: 403 })])
+  expect(res.status).toBe(502)
+  expect(res.headers.get("x-magpie-sign-in")).toBeNull()
+  expect(body.error.message).toBe("sign in again later (403)")
+})
+
+test("a vendor's 401 Zed passes on (upstream_status) is a 401 the account keeps; other refusals say nothing of it", async () => {
+  const tok = () => new Response(JSON.stringify({ token: "llm" }))
+  let r = await ask([tok, () => new Response(JSON.stringify({ code: "upstream", message: "bad key", upstream_status: 401 }), { status: 500 })])
+  expect([r.res.status, r.res.headers.get("x-magpie-sign-in")]).toEqual([401, "kept"])
+  r = await ask([tok, () => new Response("", { status: 403 })])
+  expect([r.res.status, r.res.headers.get("x-magpie-sign-in")]).toEqual([403, null])
+  r = await ask([tok, () => new Response("", { status: 402 })])
+  expect([r.res.status, r.res.headers.get("x-magpie-sign-in")]).toEqual([402, null])
 })
 
 test("errors don't name Zed, which magpie adds", async () => {

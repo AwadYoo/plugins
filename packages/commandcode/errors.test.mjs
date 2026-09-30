@@ -28,6 +28,19 @@ async function ask(reply, stream = false) {
   return { status: res.status, message: (await res.json()).error?.message }
 }
 
+// asks as ask does, with every answer's X-Magpie-Sign-In
+async function signIn(reply, plan = "Go", path = "/alpha/generate") {
+  globalThis.fetch = async (url) => (new URL(String(url)).pathname === path ? reply() : new Response("", { status: 404 }))
+  const auth = { type: "api", key: "key", metadata: { plan } }
+  const hooks = await CommandCodePlugin()
+  const opts = await hooks.auth.loader(async () => auth)
+  const res = await opts.fetch("https://api.commandcode.ai/provider/v1/chat/completions", {
+    method: "POST",
+    body: JSON.stringify({ model: "deepseek/deepseek-v4-pro", messages: [{ role: "user", content: "hi" }] }),
+  })
+  return { status: res.status, signIn: res.headers.get("X-Magpie-Sign-In") }
+}
+
 test("an empty 429 reads as Go's http.StatusText says it, which quotaWords knows", async () => {
   expect(await ask(() => new Response("", { status: 429 }))).toEqual({ status: 429, message: "Too Many Requests" })
 })
@@ -45,4 +58,21 @@ test("credits out already in quotaWords' words are left as they are", async () =
 test("an error line before any content keeps its status", async () => {
   const line = JSON.stringify({ type: "error", error: { message: '429 {"error":{"message":"RATE_LIMITED: slow down"}}' } })
   expect(await ask(() => new Response(line + "\n"), true)).toEqual({ status: 429, message: "RATE_LIMITED: slow down" })
+})
+
+// the built-in never marked a Command Code account lapsed: a 401 of
+// /alpha/generate's (cmdFailure) or of the Provider API's goes on with it kept
+test("a Go key Command Code turns away is a 401, the account kept", async () => {
+  expect(await signIn(() => Response.json({ error: { message: "Invalid API key" } }, { status: 401 }))).toEqual({ status: 401, signIn: "kept" })
+})
+
+test("an error line saying 401 keeps the account too", async () => {
+  const line = JSON.stringify({ type: "error", error: { message: "Unauthorized", statusCode: 401 } })
+  expect(await signIn(() => new Response(line + "\n"))).toEqual({ status: 401, signIn: "kept" })
+})
+
+test("the Provider API's 401 goes on as it came, the account kept", async () => {
+  expect(await signIn(() => Response.json({ error: { message: "Invalid API key" } }, { status: 401 }), "Pro", "/provider/v1/chat/completions"))
+    .toEqual({ status: 401, signIn: "kept" })
+  expect(await signIn(() => Response.json({}), "Pro", "/provider/v1/chat/completions")).toEqual({ status: 200, signIn: null })
 })

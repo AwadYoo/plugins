@@ -16,6 +16,7 @@
 // from magpie's internal/qoder, which ported it from CLIProxyAPI's qoder
 // support (https://github.com/ufec/CLIProxyAPI, MIT).
 import { createCipheriv, createHash, publicEncrypt, randomBytes, randomUUID, constants } from "node:crypto"
+import { STATUS_CODES } from "node:http"
 
 const ID = "qoder"
 const CLIENT_ID = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa"
@@ -213,14 +214,24 @@ async function deviceSignIn() {
   }
 }
 
-class SignInGone extends Error {}
+// SignInGone is a sign-in that can't sign a request: a 401. Only Qoder
+// refusing the refresh token marks the account lapsed (expired), as the
+// built-in's qoderRefreshFailed did; no refresh token, or no account,
+// answered 401 there without marking one.
+class SignInGone extends Error {
+  constructor(message, expired = false) {
+    super(message)
+    this.expired = expired
+  }
+}
 
 // refreshJob trades the job token's refresh token for a new pair; the old
 // one is spent.
-async function refreshJob(refresh) {
+async function refreshJob(refresh, user) {
   if (!String(refresh ?? "").trim()) throw new SignInGone("Qoder: the sign-in lapsed; sign in again")
   const r = await openapi("/api/v1/jobToken/refresh", { method: "POST", body: { refresh_token: refresh } })
-  if (r.status === 401 || r.status === 403) throw new SignInGone("Qoder: the sign-in has expired — sign in again")
+  if (r.status === 401 || r.status === 403)
+    throw new SignInGone(`${user}'s Qoder sign-in has expired — sign in again (qoder job token refresh: status ${r.status})`, true)
   if (r.status !== 200) throw new Error(`Qoder job token refresh: status ${r.status}`)
   if (!String(r.json?.token ?? "").trim() || !String(r.json?.refresh_token ?? "").trim())
     throw new Error("Qoder job token refresh: incomplete token pair")
@@ -486,19 +497,26 @@ function failure(status, text) {
   try {
     const j = JSON.parse(text)
     if (j?.message) msg = j.message
-    const d = typeof j?.details === "string" ? JSON.parse(j.details) : null
+    // details is a JSON string, or the object itself (gjson reads either)
+    const d = typeof j?.details === "string" ? JSON.parse(j.details) : j?.details
     if (d?.error?.message) msg += ": " + d.error.message
   } catch {}
-  msg ||= `HTTP ${status}`
-  // only Qoder's 401 says the job token itself is refused; a 403 is kept as
-  // what it is, as magpie marks the account lapsed on a 401
-  if (status === 401 || status === 403) return { status, message: "the sign-in lapsed — sign in again" }
+  msg ||= STATUS_CODES[status] ?? `HTTP ${status}`
+  // a refused chat is the built-in's 401, which never marked the account
+  // lapsed: only a refused refresh did (errorResponse says kept)
+  if (status === 401 || status === 403) return { status: 401, message: "the sign-in lapsed — sign in again" }
   if (status === 429 || msg.toLowerCase().includes("quota")) return { status: 429, message: "usage limit reached: " + msg }
   return { status, message: msg }
 }
 
-const errorResponse = ({ status, message }) =>
-  new Response(JSON.stringify({ error: { message, type: "qoder_error", code: status } }), { status, headers: { "Content-Type": "application/json" } })
+// errorResponse is a failure as OpenAI's API gives it. signIn is what it
+// means for the account (magpie's X-Magpie-Sign-In): a 401 keeps it unless
+// told expired, since the built-in marked only a refused refresh.
+const errorResponse = ({ status, message, signIn = status === 401 ? "kept" : undefined }) =>
+  new Response(JSON.stringify({ error: { message, type: "qoder_error", code: status } }), {
+    status,
+    headers: { "Content-Type": "application/json", ...(signIn ? { "X-Magpie-Sign-In": signIn } : {}) },
+  })
 
 // ---- the reply ----------------------------------------------------------------
 
@@ -870,7 +888,7 @@ export async function QoderAuthPlugin({ client }) {
       const a = await getAuth()
       if (a?.type !== "oauth" || !a.access || !a.uid) throw new SignInGone("Qoder: not signed in")
       if (a.expires - Date.now() > REFRESH_LEAD) return a
-      const jt = await refreshJob(a.refresh)
+      const jt = await refreshJob(a.refresh, a.accountId || a.email || a.uid)
       const next = { ...a, access: jt.token, refresh: jt.refresh_token, expires: expiresAt(jt) }
       await client.auth.set({ path: { id: ID }, body: next })
       return next
@@ -914,7 +932,11 @@ export async function QoderAuthPlugin({ client }) {
   }
 
   const signedInError = (e) =>
-    errorResponse({ status: e instanceof SignInGone ? 401 : 502, message: String(e?.message ?? e).replace(/^Qoder: /, "") })
+    errorResponse({
+      status: e instanceof SignInGone ? 401 : 502,
+      message: String(e?.message ?? e).replace(/^Qoder: /, ""),
+      signIn: e?.expired ? "expired" : undefined,
+    })
 
   return {
     auth: {
@@ -946,7 +968,9 @@ export async function QoderAuthPlugin({ client }) {
             try {
               m = (await models(cred)).find((x) => x.key === chat.model) ?? (await models(cred, true)).find((x) => x.key === chat.model)
             } catch (e) {
-              return errorResponse({ status: 502, message: e.message })
+              // the built-in answered any failure to read the list 400
+              // (QoderModelOf), a refused one included, marking nothing
+              return errorResponse({ status: 400, message: e.message })
             }
             if (!m) return errorResponse({ status: 400, message: `unknown or disabled model "${chat.model}"` })
             const wire = encodeBody(JSON.stringify(qoderBody(chat, m)))

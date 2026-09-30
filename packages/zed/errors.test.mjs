@@ -35,7 +35,7 @@ async function ask(wire, lines, stream = true) {
     body: JSON.stringify({ model: MODEL[wire], stream, messages: [{ role: "user", content: "hi" }], max_tokens: 100 }),
   })
   const text = await res.text()
-  return { status: res.status, text }
+  return { status: res.status, text, signIn: res.headers.get("x-magpie-sign-in") }
 }
 
 const msgOf = (text) => {
@@ -55,6 +55,9 @@ test("a rate limit Zed reports after the reply's start is the 429 it stands for"
 test("a failure keeps the status its code names on every API: 401 on chat, 403 on Responses, 402 for billing", async () => {
   const chat = await ask("chat", [{ status: "started" }, { status: { failed: { code: "upstream_http_401", message: "bad key upstream" } } }])
   expect([chat.status, msgOf(chat.text)]).toEqual([401, "bad key upstream"])
+  // a vendor's 401 in the stream never lapsed the built-in's account
+  expect(chat.signIn).toBe("kept")
+  expect((await ask("anthropic", [start, { status: { failed: { code: "upstream_http_401", message: "x" } } }], false)).signIn).toBe("kept")
   const resp = await ask("responses", [{ event: { type: "response.created", response: { id: "r1" } } }, { status: { failed: { code: "http_403", message: "no" } } }])
   expect([resp.status, msgOf(resp.text)]).toEqual([403, "no"])
   const bill = await ask("anthropic", [start, { status: { failed: { code: "billing_limit", message: "" } } }])
