@@ -952,12 +952,35 @@ async function* events(body, model, budget) {
   yield { kind: "stop", reason, usage }
 }
 
+// finished is the message's blocks with each call's arguments read.
+function finished(content) {
+  for (const b of content)
+    if (b.type === "tool_use") {
+      try {
+        b.input = b.input ? JSON.parse(b.input) : {}
+      } catch {
+        b.input = {}
+      }
+    }
+  return content
+}
+
 const anthropicUsage = (u) => ({
   input_tokens: u.input,
   output_tokens: u.output,
   cache_read_input_tokens: u.cacheRead,
   cache_creation_input_tokens: u.cacheWrite,
 })
+
+// quotaWords are magpie's (internal/gateway/fallback.go): how a vendor says
+// "out of quota" or "slow down".
+const QUOTA_WORDS = /quota|insufficient|balance|credit|billing|exceeded|rate.?limit|usage.?limit|limit.?reached|hit your .*limit|limit.{0,24}resets|too many requests|overloaded|余额|额度|欠费|限流|频率|套餐|用量|上限/i
+
+// failedBefore is the reply to an error before any of the answer, as
+// magpie's built-in relay gives it: a status, not a stream, so another
+// account can take over — a 429 when it reads as a quota or rate limit,
+// else a 502.
+const failedBefore = (text) => errorResponse(QUOTA_WORDS.test(text) ? 429 : 502, text)
 
 // reply answers the Messages request from Kiro's events: a stream of
 // Messages' events, or one message.
@@ -982,22 +1005,23 @@ async function reply(it, model, stream) {
       } else if (e.kind === "toolStart") add({ type: "tool_use", id: e.id, name: e.name, input: "" })
       else if (e.kind === "toolArgs") {
         if (last?.type === "tool_use") last.input += e.text
-      } else if (e.kind === "error") return errorResponse(502, e.text)
-      else if (e.kind === "stop") {
-        for (const b of content)
-          if (b.type === "tool_use") {
-            try {
-              b.input = b.input ? JSON.parse(b.input) : {}
-            } catch {
-              b.input = {}
-            }
-          }
-        return Response.json({ id, type: "message", role: "assistant", model, content, stop_reason: e.reason, stop_sequence: null,
+      } else if (e.kind === "error") {
+        // with none of the answer said, a status; else what was said
+        if (!content.length) return failedBefore(e.text)
+        return Response.json({ id, type: "message", role: "assistant", model, content: finished(content), stop_reason: "end_turn",
+          stop_sequence: null, usage: anthropicUsage({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }) })
+      } else if (e.kind === "stop") {
+        return Response.json({ id, type: "message", role: "assistant", model, content: finished(content), stop_reason: e.reason, stop_sequence: null,
           usage: anthropicUsage(e.usage) })
       }
     }
     return errorResponse(502, "the reply ended before it was complete")
   }
+
+  // an error before any of the answer is a status, as the built-in's
+  const head = await it.next()
+  if (head.value?.kind === "error") return failedBefore(head.value.text)
+  let pending = head
 
   const enc = new TextEncoder()
   const sse = (type, data) => enc.encode(`event: ${type}\ndata: ${JSON.stringify({ type, ...data })}\n\n`)
@@ -1022,7 +1046,8 @@ async function reply(it, model, stream) {
         open = kind
         ctl.enqueue(sse("content_block_start", { index, content_block: block }))
       }
-      const r = await it.next()
+      const r = pending ?? (await it.next())
+      pending = null
       if (r.done) return ctl.close()
       const e = r.value
       switch (e.kind) {
