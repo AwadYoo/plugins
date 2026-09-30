@@ -12,7 +12,7 @@
 // is only taken where the CLI itself asks, POST /alpha/generate, in the
 // CLI's own format (command-code 1.72.2), which the fetch here writes from
 // the chat completion OpenCode sends and turns back into one.
-import { createServer } from "node:http"
+import { createServer, STATUS_CODES } from "node:http"
 import { randomBytes, randomUUID } from "node:crypto"
 import { readFile } from "node:fs/promises"
 import { homedir } from "node:os"
@@ -138,10 +138,10 @@ async function liveModels(key) {
 
 // ---- the account --------------------------------------------------------------
 
-async function accountJSON(path, key) {
+async function accountJSON(path, key, timeout = 15_000) {
   const res = await fetch(API + path, {
     headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
-    signal: AbortSignal.timeout(15_000),
+    signal: AbortSignal.timeout(timeout),
   })
   if (!res.ok) {
     const e = new Error(`${path}: ${res.status}`)
@@ -151,49 +151,191 @@ async function accountJSON(path, key) {
   return res.json()
 }
 
-// The plan names, by planId prefix, the longest first.
+// The plan names, by planId prefix, the longest first, with the dollars of
+// credits each gives a month (the CLI's getPlanInfo; "individual-pro-v1"
+// is the old Pro, $80 of them).
 const PLAN_NAMES = [
-  ["individual-provider", "Provider"],
-  ["individual-pro-v1", "Pro"],
-  ["individual-goat", "GOAT"],
-  ["individual-ultra", "Ultra"],
-  ["individual-max", "Max"],
-  ["individual-pro", "Pro"],
-  ["individual-go", "Go"],
-  ["teams-pro", "Teams Pro"],
+  ["individual-provider", "Provider", 15],
+  ["individual-pro-v1", "Pro", 80],
+  ["individual-goat", "GOAT", 70],
+  ["individual-ultra", "Ultra", 300],
+  ["individual-max", "Max", 150],
+  ["individual-pro", "Pro", 30],
+  ["individual-go", "Go", 10],
+  ["teams-pro", "Teams Pro", 40],
 ]
 const NO_PLAN = "No plan"
 
-function planName(id) {
-  const s = String(id).toLowerCase().replaceAll("_", "-")
-  return PLAN_NAMES.find(([p]) => s.startsWith(p))?.[1] ?? ""
+function planOf(id) {
+  const s = String(id ?? "").toLowerCase().replaceAll("_", "-")
+  return PLAN_NAMES.find(([p]) => s.startsWith(p)) ?? ["", "", 0]
 }
 
-// subscription is the account's plan as billing/subscriptions says;
-// undefined when it can't be read.
-async function subscription(key) {
+const planName = (id) => planOf(id)[1]
+
+// subscriptionOf is the account's plan as billing/subscriptions says: its
+// id and name, when its period ends and whether it renews then; NO_PLAN
+// when it has none, undefined when it can't be read.
+async function subscriptionOf(key, timeout) {
+  let d
   try {
-    const d = (await accountJSON("/alpha/billing/subscriptions", key))?.data
-    if (d?.planId && d.status !== "canceled" && d.status !== "incomplete_expired") return planName(d.planId) || d.planId
-    return NO_PLAN
+    const r = await accountJSON("/alpha/billing/subscriptions", key, timeout)
+    // a 200 with success false when Command Code couldn't tell
+    // ("write CONNECTION_CLOSED …"): unread, not no plan
+    if (r?.success === false) return undefined
+    d = r?.data
   } catch {
     return undefined
   }
+  if (d?.planId && d.status !== "canceled" && d.status !== "incomplete_expired") {
+    const renew = typeof d.cancelAtPeriodEnd === "boolean" ? (d.cancelAtPeriodEnd ? "off" : "auto") : ""
+    return { id: d.planId, plan: planName(d.planId) || d.planId, until: when(d.currentPeriodEnd), renew }
+  }
+  return { id: "", plan: NO_PLAN }
 }
 
-// Each key's plan as last read ("" when it couldn't be), and when: a plan
-// is kept 10 minutes, a failure to read it one.
-const plansSeen = new Map()
-const PLAN_KEEP = 10 * 60 * 1000
-const PLAN_RETRY = 60 * 1000
-
+// planNow is the account's plan, for the models and the endpoint Go takes:
+// the subscription read in the last ten minutes, else read now, with the
+// plan the sign-in saved going meanwhile when it takes more than a moment.
 async function planNow(key, saved) {
-  const seen = plansSeen.get(key)
-  if (seen && seen.plan && Date.now() - seen.at < PLAN_KEEP) return seen.plan
-  if (seen && !seen.plan && Date.now() - seen.at < PLAN_RETRY) return saved ?? ""
-  const plan = (await subscription(key)) ?? ""
-  plansSeen.set(key, { plan, at: Date.now() })
-  return plan || saved || ""
+  return (await subscriptionNow(key, saved ? 2_000 : waits.subWait))?.plan || saved || ""
+}
+
+// ---- the allowance ------------------------------------------------------------
+// As magpie's built-in Command Code account shows it
+// (internal/provider/commandcode_plan.go, cmdQuota).
+
+// statusText is a refused request's status as magpie says it (Go's
+// http.StatusText).
+const statusText = (s) =>
+  ({ 413: "Request Entity Too Large", 414: "Request URI Too Long", 416: "Requested Range Not Satisfiable", 418: "I'm a teapot", 509: "" })[s] ?? STATUS_CODES[s] ?? ""
+
+// number reads an amount given as a JSON number or as a string of one.
+function number(v) {
+  if (typeof v === "number") return v
+  if (typeof v !== "string" || !v.trim()) return undefined
+  const n = Number(v.trim())
+  return Number.isNaN(n) ? undefined : n
+}
+
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/
+
+// when reads a reset time: unix seconds or milliseconds, or RFC 3339; an
+// ISO time, undefined when there is none.
+function when(v) {
+  if (typeof v === "string" && RFC3339.test(v) && !Number.isNaN(Date.parse(v))) return new Date(v).toISOString()
+  let n = number(v)
+  if (n === undefined || !(n > 0)) return undefined
+  if (n < 1e12) n *= 1000
+  const d = new Date(Math.trunc(n))
+  return Number.isNaN(d.getTime()) ? undefined : d.toISOString()
+}
+
+// money is dollars to the cent, a half cent to the even one, as magpie
+// writes them.
+function money(v) {
+  const exact = Math.abs(v).toFixed(20)
+  const tie = /\.\d\d50*$/.test(exact)
+  const s = tie && Number(exact[exact.indexOf(".") + 2]) % 2 === 0 ? exact.slice(0, exact.indexOf(".") + 3) : Math.abs(v).toFixed(2)
+  return "$" + (v < 0 ? "-" : "") + s
+}
+
+// limits is the plan's 5-hour and weekly windows in a credits reply,
+// those it gives a cap.
+function limits(c) {
+  const out = []
+  const w = c?.windowLimits
+  if (!w) return out
+  for (const [name, span, x] of [["5 hours", 5 * 3600, w.fiveHour], ["Weekly", 7 * 24 * 3600, w.weekly]]) {
+    if (!x) continue
+    const used = number(x.used)
+    const cap = number(x.cap)
+    if (used === undefined || cap === undefined || !(cap > 0)) continue
+    const at = when(x.resetAt)
+    out.push({ name, used: Math.min(100, (100 * Math.max(0, used)) / cap), span, ...(at ? { resetsAt: at } : {}) })
+  }
+  return out
+}
+
+// allowanceOf makes a credits reply into the plan's windows: the 5-hour
+// and weekly limits, and the dollars as one more, used of the CLI's pool
+// (the plan's month of credits, or what is left of it if more, and the
+// bought and free ones) as its /usage bar is. A reply with neither windows
+// nor a plan tells a balance: a key's money, not an allowance.
+function allowanceOf(c) {
+  const out = { windows: limits(c) }
+  const [, name, planMonthly] = planOf(c?.credits?.planId)
+  if (name) out.plan = name
+  let monthly = 0
+  let left = 0
+  let known = false
+  for (const [i, v] of [c?.credits?.monthlyCredits, c?.credits?.purchasedCredits, c?.credits?.freeCredits].entries()) {
+    let n = number(v)
+    if (n === undefined) continue
+    n = Math.max(0, n)
+    if (i === 0) monthly = n
+    left += n
+    known = true
+  }
+  if (known && planMonthly > 0) {
+    const pool = Math.max(planMonthly, monthly) + left - monthly
+    out.windows.push({ name: "Credits", used: Math.min(100, (100 * (pool - left)) / pool), display: money(pool - left) + " / " + money(pool) })
+  } else if (known && !out.windows.length) out.balance = money(left)
+  return out
+}
+
+// Each key's subscription as last read, and the reading under way.
+// billing/subscriptions takes 15–20 seconds at times, longer than magpie
+// waits for a card (15): the allowance waits for it waits.subWait at most, then
+// goes with the one read before while the reading goes on for next time.
+const subsSeen = new Map()
+const SUB_KEEP = 10 * 60 * 1000
+const waits = { subWait: 9_000 }
+
+function subscriptionNow(key, wait = waits.subWait) {
+  const seen = subsSeen.get(key) ?? {}
+  if (seen.sub && Date.now() - seen.at < SUB_KEEP) return Promise.resolve(seen.sub)
+  if (!seen.reading) {
+    seen.reading = subscriptionOf(key, 60_000).then((sub) => {
+      const now = subsSeen.get(key) ?? {}
+      subsSeen.set(key, sub ? { sub, at: Date.now() } : { sub: now.sub, at: now.at })
+      return sub
+    })
+    subsSeen.set(key, seen)
+  }
+  let timer
+  const late = new Promise((r) => (timer = setTimeout(() => r(seen.sub), wait)))
+  return Promise.race([seen.reading.then((sub) => sub ?? seen.sub), late]).finally(() => clearTimeout(timer))
+}
+
+// usage is the account's allowance, and the subscription read for it. The
+// plan is said even while the credits can't be read (Command Code answers
+// 503, "Couldn't verify your credit balance just now", at times), and the
+// plan saved (saved: { id, plan }) stands for the subscription while it
+// can't be read, or is slow to: then it is waited for a moment only.
+async function usage(key, saved) {
+  const [read, credits] = await Promise.all([
+    subscriptionNow(key, saved ? 2_000 : waits.subWait),
+    accountJSON("/alpha/billing/credits", key, 12_000).then(
+      (c) => ({ c }),
+      (e) => ({ e }),
+    ),
+  ])
+  const sub = read ?? saved
+  let out = { windows: [] }
+  if (credits.e) out.error = credits.e.status ? statusText(credits.e.status) : credits.e.message
+  else {
+    // billing/credits leaves the plan out: the month of credits the pool
+    // is made of is the subscription's plan's
+    const c = credits.c ?? {}
+    out = allowanceOf({ ...c, credits: { ...(c.credits ?? {}), planId: c.credits?.planId || sub?.id || "" } })
+  }
+  if (sub) {
+    out.plan = sub.plan
+    if (sub.until) out.until = sub.until
+    if (sub.renew) out.renew = sub.renew
+  }
+  return { out, read }
 }
 
 // signedIn names a new key's account with whoami and reads its plan. Only
@@ -213,8 +355,9 @@ async function signedIn(a) {
     }
   }
   const who = me?.userName || a.userName || me?.email || me?.id || a.userId || "Command Code"
-  const plan = (await subscription(a.apiKey)) ?? ""
-  if (plan) plansSeen.set(a.apiKey, { plan, at: Date.now() })
+  const sub = await subscriptionOf(a.apiKey, 30_000)
+  if (sub) subsSeen.set(a.apiKey, { sub, at: Date.now() })
+  const plan = sub?.plan ?? ""
   return { who, plan, email: me?.email ?? "" }
 }
 
@@ -706,7 +849,9 @@ async function generate(key, chat, signal) {
 
 // ---- the plugin ---------------------------------------------------------------
 
-export async function CommandCodePlugin() {
+export const _internal = { subsSeen, waits }
+
+export async function CommandCodePlugin({ client } = {}) {
   return {
     auth: {
       provider: ID,
@@ -745,6 +890,21 @@ export async function CommandCodePlugin() {
         { type: "oauth", label: "Command Code CLI's sign-in", authorize: cliSignIn },
         { type: "api", label: "API key (commandcode.ai/settings/keys)" },
       ],
+      // magpie's: the plan and how much of it is used
+      async usage(getAuth) {
+        const auth = await getAuth()
+        if (auth?.type !== "api" || !auth.key) return { error: "not signed in" }
+        const md = auth.metadata ?? {}
+        const { out, read } = await usage(auth.key, md.plan ? { id: md.planId ?? "", plan: md.plan } : undefined)
+        // the plan read is saved with the key, so a start doesn't wait on
+        // billing/subscriptions again, for the models, Go's endpoint or this
+        if (read && (read.plan !== md.plan || read.id !== (md.planId ?? "")) && client?.auth?.set) {
+          try {
+            await client.auth.set({ path: { id: ID }, body: { ...auth, metadata: { ...md, plan: read.plan, planId: read.id } } })
+          } catch {}
+        }
+        return out
+      },
     },
     async config(config) {
       config.provider ??= {}
