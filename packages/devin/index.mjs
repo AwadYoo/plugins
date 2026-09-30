@@ -6,7 +6,7 @@
 // (internal/provider/devin*.go, internal/gateway/devin.go).
 
 import { createHash, randomBytes, randomUUID } from "node:crypto"
-import { createServer } from "node:http"
+import { createServer, STATUS_CODES } from "node:http"
 import { gunzipSync } from "node:zlib"
 import { spawn } from "node:child_process"
 import { existsSync, readFileSync, statSync } from "node:fs"
@@ -902,6 +902,11 @@ function encodeMsg(m) {
 
 // ---- the reply -----------------------------------------------------------------------
 
+// statusText is a status as magpie's built-in words an error that says
+// nothing (Go's http.StatusText).
+const statusText = (s) =>
+  ({ 413: "Request Entity Too Large", 414: "Request URI Too Long", 416: "Requested Range Not Satisfiable", 418: "I'm a teapot", 509: "" })[s] ?? STATUS_CODES[s] ?? ""
+
 // failure is the status and message for a Connect error: {"code",
 // "message"}, or at a stream's end {"error": {"code", "message"}}.
 function failure(status, text) {
@@ -913,7 +918,7 @@ function failure(status, text) {
     else if (e?.code) [code, msg] = [e.code, e.message ?? ""]
     msg ||= code
   } catch {}
-  msg ||= `HTTP ${status}`
+  msg ||= statusText(status) || `HTTP ${status}`
   const low = msg.toLowerCase()
   if (code === "unauthenticated") return { status: 401, message: msg + " — sign in to Devin again" }
   if (code === "resource_exhausted" || low.includes("quota") || low.includes("rate limit")) return { status: 429, message: "usage limit reached: " + msg }
@@ -941,7 +946,7 @@ async function* events(it) {
     try {
       r = await it.next()
     } catch (e) {
-      yield { error: { status: 502, message: "Devin: the reply broke off: " + e.message } }
+      yield { error: { status: 502, message: "the reply broke off: " + e.message } }
       return
     }
     if (r.done) break
@@ -949,7 +954,7 @@ async function* events(it) {
     if (f.end) {
       const e = failure(200, dec.decode(f.data))
       if (e.status >= 300) {
-        yield { error: { status: e.status, message: "Devin: " + e.message } }
+        yield { error: e }
         return
       }
       break
@@ -1018,11 +1023,11 @@ async function complete({ key, server, families }, chat, signal) {
       signal,
     })
   } catch (e) {
-    return errorResponse({ status: 502, message: "Devin: " + e.message })
+    return errorResponse({ status: 502, message: e.message })
   }
   if (!res.ok) {
     const e = failure(res.status, (await res.text()).slice(0, 1 << 20))
-    return errorResponse({ status: e.status, message: "Devin: " + e.message })
+    return errorResponse(e)
   }
   // an error comes as the stream's end, before anything else: read that
   // far so it is answered with its own status
@@ -1031,12 +1036,12 @@ async function complete({ key, server, families }, chat, signal) {
   try {
     first = await fr.next()
   } catch (e) {
-    return errorResponse({ status: 502, message: "Devin: the reply broke off: " + e.message })
+    return errorResponse({ status: 502, message: "the reply broke off: " + e.message })
   }
-  if (first.done) return errorResponse({ status: 502, message: "Devin: an empty reply" })
+  if (first.done) return errorResponse({ status: 502, message: "the reply broke off: EOF" })
   if (first.value.end) {
     const e = failure(200, dec.decode(first.value.data))
-    return errorResponse(e.status < 300 ? { status: 502, message: "Devin: an empty reply" } : { status: e.status, message: "Devin: " + e.message })
+    return errorResponse(e.status < 300 ? { status: 502, message: "an empty reply" } : e)
   }
   let replay = first
   const it = events({
@@ -1187,13 +1192,13 @@ export async function DevinAuthPlugin() {
             const now = await getAuth()
             if (now?.type !== "api" || !now.key) return errorResponse({ status: 401, message: "Devin isn't signed in" })
             const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
-            if (!/\/chat\/completions$/.test(new URL(url).pathname)) return errorResponse({ status: 404, message: "Devin: only chat completions are served" })
+            if (!/\/chat\/completions$/.test(new URL(url).pathname)) return errorResponse({ status: 404, message: "only chat completions are served" })
             let chat
             try {
               const b = init.body ?? (input instanceof Request ? await input.clone().text() : undefined)
               chat = JSON.parse(typeof b === "string" ? b : dec.decode(b))
             } catch {
-              return errorResponse({ status: 400, message: "Devin: a request that isn't JSON" })
+              return errorResponse({ status: 400, message: "a request that isn't JSON" })
             }
             const { key, server } = await live(now)
             const families = await familiesFor(key, server)
