@@ -29,6 +29,7 @@ const SIGN_IN_TIMEOUT = 10 * 60 * 1000
 
 const CHAT = "@ai-sdk/openai-compatible"
 const MESSAGES = "@ai-sdk/anthropic"
+const RESPONSES = "@ai-sdk/openai" // the Responses API, which magpie speaks to it on
 
 // ---- models -------------------------------------------------------------------
 
@@ -109,7 +110,7 @@ function runtimeModel(m) {
 
 // liveModels is the Provider API's list, with the APIs each model is
 // served on (its Claude models on /messages alone, the open ones on
-// /chat/completions and /responses); the default list's names and
+// /chat/completions and /responses, some on /responses alone); the default list's names and
 // windows fill in what it leaves out.
 async function liveModels(key) {
   const res = await fetch(BASE + "/models", { headers: { Authorization: `Bearer ${key}`, "x-api-key": key } })
@@ -122,7 +123,9 @@ async function liveModels(key) {
     const k = known[m.id]
     const eps = (m.supported_endpoints ?? []).map((e) => String(e).replace(/\/$/, "").replace(/^\/v1/, ""))
     let npm = isClaude(m.id) ? MESSAGES : CHAT
-    if (eps.length) npm = eps.includes("/chat/completions") ? CHAT : eps.includes("/messages") ? MESSAGES : CHAT
+    // the first of the APIs it is served on, in magpie's order (chat
+    // completions, Responses, Messages), as the built-in picks it
+    if (eps.length) npm = eps.includes("/chat/completions") ? CHAT : eps.includes("/responses") ? RESPONSES : eps.includes("/messages") ? MESSAGES : CHAT
     const ctx = Number(m.context_length)
     out.push({
       id: m.id,
@@ -688,7 +691,7 @@ function failure(status, text) {
     if (status < 400 || status === 500) status = 429
   }
   if (status < 400 || status > 599) status = 502
-  return { status, message: "Command Code: " + msg }
+  return { status, message: msg }
 }
 
 // streamError is an error line's status and message: a string, or
@@ -789,7 +792,7 @@ async function* events(body) {
         return
     }
   }
-  yield { error: { status: 502, message: "Command Code: the reply ended before it was complete" } }
+  yield { error: { status: 502, message: "the reply ended before it was complete" } }
 }
 
 // generate answers a chat completion through /alpha/generate.
@@ -864,7 +867,7 @@ async function generate(key, chat, signal) {
 
 // ---- the plugin ---------------------------------------------------------------
 
-export const _internal = { subsSeen, waits, liveKey }
+export const _internal = { subsSeen, waits, liveKey, failure }
 
 export async function CommandCodePlugin({ client } = {}) {
   return {
@@ -893,7 +896,7 @@ export async function CommandCodePlugin({ client } = {}) {
                 const b = init.body ?? (input instanceof Request ? await input.clone().text() : undefined)
                 chat = JSON.parse(typeof b === "string" ? b : new TextDecoder().decode(b))
               } catch {
-                return errorResponse({ status: 400, message: "Command Code: a request that isn't JSON" })
+                return errorResponse({ status: 400, message: "a request that isn't JSON" })
               }
               return generate(key, chat, init.signal)
             }

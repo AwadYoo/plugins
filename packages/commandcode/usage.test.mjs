@@ -161,3 +161,40 @@ test("a subscription Command Code couldn't read is unread, not No plan", async (
   const hooks = await CommandCodePlugin()
   expect((await hooks.auth.usage(async () => ({ ...api, metadata: { plan: "GOAT" } }))).plan).toBe("GOAT")
 })
+
+test("a model served on Responses and not chat completions is asked on Responses, relayed as it is", async () => {
+  const sent = []
+  globalThis.fetch = async (url, init = {}) => {
+    const path = new URL(String(url)).pathname
+    if (path === "/provider/v1/models")
+      return Response.json({ data: [
+        { id: "gpt-6-sol", supported_endpoints: ["/v1/responses"] },
+        { id: "moonshotai/Kimi-K3", supported_endpoints: ["/v1/chat/completions", "/v1/responses"] },
+        { id: "claude-sonnet-5", supported_endpoints: ["/v1/messages"] },
+        { id: "both", supported_endpoints: ["/v1/responses", "/v1/messages"] },
+      ] })
+    if (path === "/provider/v1/responses") {
+      sent.push({ path, key: new Headers(init.headers).get("x-api-key"), body: init.body })
+      return Response.json({ id: "resp_1" })
+    }
+    return new Response("", { status: 404 })
+  }
+  const a = { ...api, metadata: { plan: "Max" } }
+  const hooks = await CommandCodePlugin()
+  const ms = await hooks.provider.models({ models: {} }, { auth: a })
+  expect(Object.fromEntries(Object.entries(ms).map(([k, m]) => [k, m.api.npm]))).toEqual({
+    "gpt-6-sol": "@ai-sdk/openai",
+    "moonshotai/Kimi-K3": "@ai-sdk/openai-compatible",
+    "claude-sonnet-5": "@ai-sdk/anthropic",
+    both: "@ai-sdk/openai",
+  })
+  const l = await hooks.auth.loader(async () => a)
+  const res = await l.fetch("https://api.commandcode.ai/provider/v1/responses", { method: "POST", body: '{"model":"gpt-6-sol"}' })
+  expect(await res.json()).toEqual({ id: "resp_1" })
+  expect(sent).toEqual([{ path: "/provider/v1/responses", key: "own-key", body: '{"model":"gpt-6-sol"}' }])
+})
+
+test("errors don't name Command Code, which magpie adds", () => {
+  expect(_internal.failure(500, JSON.stringify({ error: { message: "boom" } }))).toEqual({ status: 500, message: "boom" })
+  expect(_internal.failure(403, "MODEL_NOT_IN_PLAN: gpt-6-sol")).toEqual({ status: 403, message: "Model not in plan: gpt-6-sol" })
+})
