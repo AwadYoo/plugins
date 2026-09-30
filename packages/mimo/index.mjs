@@ -4,6 +4,7 @@
 // MiMo server, which answers with session cookies. Model requests are
 // chat completions at the server's /route, carrying those cookies.
 import { randomBytes } from "node:crypto"
+import { STATUS_CODES } from "node:http"
 
 const ID = "mimo-app"
 const HOSTS = {
@@ -266,6 +267,60 @@ async function signedInWith(p, device) {
   return { creds: { ...creds, userId: String(s.me?.userId ?? "") || creds.userId }, cookies: s.cookies }
 }
 
+// ---- usage ------------------------------------------------------------------
+//
+// What the account says of its allowance, as magpie's built-in MiMo
+// account shows it (internal/provider/mimo_usage.go), from the pages the
+// app's "Usage & billing" reads: /user/usage, how much of the week's
+// allowance is left (percent remaining, and the day it resets; no reset
+// date is no plan), and /user/xiaomi/subscription/self, the plan in force
+// and when it ends. An account with no plan is on MiMo's free offer.
+
+// the app's names for its plans' tiers
+const TIERS = { 1: "Starter", 2: "Plus", 3: "Pro", 4: "Ultra" }
+
+// SignInGone is an account Xiaomi no longer signs in: it must be signed in
+// again.
+class SignInGone extends Error {}
+
+// statusLine is a status as Go's HTTP client names it, "502 Bad Gateway".
+const statusLine = (status) => `${status} ${STATUS_CODES[status] ?? ""}`.trim()
+
+// vendorError is the message in an error body as magpie reads it: its
+// {error: {message}} or {error}, {message}, {msg}, {detail}, else the body
+// cut short after the status.
+function vendorError(text, fallback) {
+  let v
+  try {
+    v = JSON.parse(text)
+  } catch {}
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    const err = v.detail !== undefined && v.detail !== null ? v.detail : v.error
+    if (Array.isArray(v.errors) && typeof v.errors[0]?.message === "string" && v.errors[0].message) return v.errors[0].message
+    if (err && typeof err === "object" && typeof err.message === "string" && err.message) return err.message
+    if (typeof err === "string" && err) return err
+    const m = (typeof v.message === "string" && v.message) || (typeof v.msg === "string" && v.msg)
+    if (m) return m
+  }
+  const s = String(text ?? "").split(/\s+/).filter(Boolean).join(" ")
+  if (!s || s.startsWith("<")) return fallback
+  const r = [...s]
+  return fallback + ": " + (r.length > 300 ? r.slice(0, 300).join("") + "…" : s)
+}
+
+// serverTime reads one of the server's times: "2026-10-01T00:00:00", or a
+// day alone. They carry no zone, and the app shows them as they come,
+// which is Beijing's (and Singapore's) time.
+function serverTime(v) {
+  const s = String(v ?? "").trim()
+  let iso = ""
+  if (/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$/i.test(s)) iso = s
+  else if (/^\d{4}-\d\d-\d\d[T ]\d\d:\d\d:\d\d(\.\d+)?$/.test(s)) iso = s.replace(" ", "T") + "+08:00"
+  else if (/^\d{4}-\d\d-\d\d$/.test(s)) iso = s + "T00:00:00+08:00"
+  const t = iso ? Date.parse(iso) : NaN
+  return isNaN(t) ? undefined : new Date(t).toISOString()
+}
+
 // ---- the plugin -------------------------------------------------------------
 
 export const MimoAuthPlugin = async ({ client }) => {
@@ -303,6 +358,75 @@ export const MimoAuthPlugin = async ({ client }) => {
     return renewing
   }
 
+  // page asks the MiMo server for one of the account's pages, signing on
+  // again once when it is turned away, and gives its data.
+  const page = async (getAuth, path) => {
+    for (let t = 0; ; t++) {
+      let s
+      try {
+        s = await fresh(getAuth, t > 0)
+      } catch (e) {
+        if (e instanceof Lapsed) throw new SignInGone(`${fromAuth(await getAuth())?.creds.userId}: the Xiaomi MiMo sign-in has expired — sign in again`)
+        throw e
+      }
+      const res = await fetch(s.creds.base.replace(/\/+$/, "") + path, {
+        headers: { Cookie: cookieHeader(s.cookies), ...appHeaders() },
+        signal: AbortSignal.timeout(20_000),
+      })
+      const text = await res.text()
+      let env
+      try {
+        env = JSON.parse(text)
+      } catch {}
+      const bad = !env || typeof env !== "object" || Array.isArray(env) || (env.code != null && !Number.isInteger(env.code)) || (env.msg != null && typeof env.msg !== "string")
+      if (res.status === 401 || (res.status === 200 && bad)) {
+        // a session gone stale, or a redirect to Xiaomi's sign-in
+        if (t === 0) continue
+        throw new SignInGone(`${s.creds.userId}: the Xiaomi MiMo sign-in has expired — sign in again`)
+      }
+      if (res.status !== 200 || bad) throw new Error(`Xiaomi MiMo ${path}: ${vendorError(text, statusLine(res.status))}`)
+      if ((env.code ?? 0) !== 0) throw new Error(`Xiaomi MiMo ${path}: code ${env.code} ${env.msg ?? ""}`)
+      return env.data
+    }
+  }
+
+  // usage is the plan and the week's allowance, magpie's own hook
+  const usage = async (getAuth) => {
+    let self
+    try {
+      self = await page(getAuth, "/user/xiaomi/subscription/self")
+    } catch (e) {
+      return { error: e?.message ?? String(e) }
+    }
+    const c = self?.current
+    const out = { plan: "Free" }
+    if (c && typeof c === "object") {
+      const text = (v) => (typeof v === "string" ? v.trim() : "")
+      out.plan = text(c.title) || TIERS[c.planTier] || text(c.planCode) || "MiMo"
+      const until = serverTime(c.endTime)
+      if (until) out.until = until
+      if (c.renewalMode === "MONTHLY" || c.renewalMode === "YEARLY") out.renew = "auto"
+      else if (c.renewalMode === "ONE_TIME") out.renew = "off"
+    }
+    let use
+    try {
+      use = await page(getAuth, "/user/usage")
+    } catch (e) {
+      if (e instanceof SignInGone) out.error = e.message
+      // the plan alone, when the week's allowance can't be read
+      return out
+    }
+    const percent = use?.percent
+    const reset = use?.resetDate
+    // no plan: the free offer shows no allowance
+    if (typeof percent !== "number" || typeof reset !== "string") return out
+    const w = { name: "7 days", used: Math.max(0, Math.min(100, 100 - percent)), span: 7 * 24 * 3600 }
+    const at = serverTime(reset)
+    if (at) w.resetsAt = at
+    out.windows = [w]
+    return out
+  }
+
   return {
     config: async (config) => {
       config.provider ??= {}
@@ -317,6 +441,7 @@ export const MimoAuthPlugin = async ({ client }) => {
     },
     auth: {
       provider: ID,
+      usage,
       loader: async (getAuth) => {
         const a = fromAuth(await getAuth())
         if (!a) return {}
@@ -379,3 +504,6 @@ export const MimoAuthPlugin = async ({ client }) => {
     },
   }
 }
+
+// for tests
+export const _internal = { serverTime, vendorError }
