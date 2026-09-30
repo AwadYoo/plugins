@@ -232,9 +232,9 @@ async function refreshJob(refresh, user) {
   const r = await openapi("/api/v1/jobToken/refresh", { method: "POST", body: { refresh_token: refresh } })
   if (r.status === 401 || r.status === 403)
     throw new SignInGone(`${user}'s Qoder sign-in has expired — sign in again (qoder job token refresh: status ${r.status})`, true)
-  if (r.status !== 200) throw new Error(`Qoder job token refresh: status ${r.status}`)
+  if (r.status !== 200) throw new Error(`qoder job token refresh: status ${r.status}`)
   if (!String(r.json?.token ?? "").trim() || !String(r.json?.refresh_token ?? "").trim())
-    throw new Error("Qoder job token refresh: incomplete token pair")
+    throw new Error("qoder job token refresh: incomplete token pair")
   return r.json
 }
 
@@ -894,6 +894,14 @@ export async function QoderAuthPlugin({ client }) {
   // the accounts fresh renewed: the built-in took the lapse mark off on a
   // renewed job token (qoderPersist), whatever the request then met
   const renewals = new WeakSet()
+  // the accounts the models hook renewed: that hook has no way to say so
+  // and still answer the list, so the account's next usage read or answer
+  // says "renewed" for it
+  const unsaid = new Set()
+  const renewed = (cred) => {
+    const was = unsaid.delete(cred.uid)
+    return renewals.has(cred) || was
+  }
 
   // fresh is the account with a live job token, refreshed and saved near
   // its end.
@@ -937,7 +945,7 @@ export async function QoderAuthPlugin({ client }) {
     let signIn = "kept"
     try {
       const cred = await fresh(getAuth)
-      if (renewals.has(cred)) signIn = "renewed"
+      if (renewed(cred)) signIn = "renewed"
       let env
       try {
         env = await fetchUsage(cred.deviceToken)
@@ -1013,7 +1021,7 @@ export async function QoderAuthPlugin({ client }) {
             } catch (e) {
               return signedInError(e)
             }
-            return signed(await ask(chat, cred, init), renewals.has(cred))
+            return signed(await ask(chat, cred, init), renewed(cred))
           },
         }
       },
@@ -1036,8 +1044,17 @@ export async function QoderAuthPlugin({ client }) {
       id: ID,
       async models(provider, { auth } = {}) {
         if (auth?.type !== "oauth") return provider.models
+        let cred
         try {
-          const cred = await fresh(async () => auth)
+          cred = await fresh(async () => auth)
+        } catch (e) {
+          // the built-in listed through QoderCredentialOf: a refused job
+          // refresh marked the account there; anything else marked nothing
+          if (e?.expired) throw Object.assign(new Error(e.message), { signIn: "expired" })
+          return provider.models
+        }
+        if (renewals.has(cred)) unsaid.add(cred.uid)
+        try {
           const ms = await models(cred, true)
           if (!ms.length) return provider.models
           return Object.fromEntries(

@@ -209,7 +209,7 @@ test("no refresh token is a 401 the built-in didn't mark; a refresh that failed 
   expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([401, "kept"])
   res = await due(() => new Response("", { status: 500 }))
   expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([502, null])
-  expect((await res.json()).error.message).toBe("Qoder job token refresh: status 500")
+  expect((await res.json()).error.message).toBe("qoder job token refresh: status 500")
 })
 
 test("errors don't name Qoder, which magpie adds", async () => {
@@ -289,4 +289,61 @@ test("an answer that went through keeps the mark, as the built-in's did; after a
     res = await renewedChat(reply)
     expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([status, "renewed"])
   }
+})
+
+// the models hook, as the built-in's listing (qoderFetchModels through
+// QoderCredentialOf) treated the sign-in: a refused job refresh marks it
+// (thrown with signIn "expired"), a renewal clears it (said by the account's
+// next usage read or answer), and nothing else marks it
+async function dueModels(refresh, listing = () => json(LISTING)) {
+  let auth = { ...account(), expires: 0, machineId: "m1", name: "One" }
+  globalThis.fetch = async (url) => {
+    const path = new URL(String(url)).pathname
+    if (path === "/api/v1/jobToken/refresh") return refresh()
+    if (path.endsWith("/model/list")) return listing()
+    if (path === "/sash/api/v2/me/usage") return json(USAGE)
+    return new Response("", { status: 404 })
+  }
+  const hooks = await QoderAuthPlugin({ client: { auth: { set: async ({ body }) => (auth = { ...body }) /* saved, then read back, as magpie does */ } } })
+  const fallback = { models: { stat: { id: "stat" } } }
+  return { hooks, fallback, list: () => hooks.provider.models(fallback, { auth }), usage: () => hooks.auth.usage(async () => auth) }
+}
+
+for (const status of [401, 403]) {
+  test(`a job refresh refused ${status} while listing models throws signIn "expired"`, async () => {
+    const m = await dueModels(() => new Response("", { status }))
+    const err = await m.list().catch((e) => e)
+    expect(err).toBeInstanceOf(Error)
+    expect(err.signIn).toBe("expired")
+    expect(err.message).toContain("sign-in has expired")
+  })
+}
+
+test("a listing whose refresh fails otherwise, or has no refresh token, marks nothing", async () => {
+  let m = await dueModels(() => new Response("", { status: 500 }))
+  expect(await m.list()).toBe(m.fallback.models)
+  m = await dueModels(RENEWED, () => new Response("", { status: 401 }))
+  // the refresh went through: the refused listing marks nothing
+  expect(await m.list()).toBe(m.fallback.models)
+  const hooks = await QoderAuthPlugin({ client: { auth: { set: async () => {} } } })
+  const fb = { models: {} }
+  expect(await hooks.provider.models(fb, { auth: { ...account(), refresh: "", expires: 0 } })).toBe(fb.models)
+})
+
+test("a job token the models hook renewed is said renewed by the next usage read, once", async () => {
+  const m = await dueModels(RENEWED)
+  const ms = await m.list()
+  expect(Object.keys(ms)).toEqual(["qmodel", "fmodel", "pmodel", "cmodel"])
+  expect((await m.usage()).signIn).toBe("renewed")
+  expect((await m.usage()).signIn).toBe("kept")
+})
+
+test("a job token the models hook renewed is said renewed by the next answer", async () => {
+  const m = await dueModels(RENEWED)
+  await m.list()
+  const l = await m.hooks.auth.loader(async () => ({ ...account(), machineId: "m1" }))
+  const res = await l.fetch(API_CHAT, { method: "POST", body: JSON.stringify({ model: "nomodel", messages: [] }) })
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("renewed")
+  const again = await l.fetch(API_CHAT, { method: "POST", body: JSON.stringify({ model: "nomodel", messages: [] }) })
+  expect(again.headers.get("X-Magpie-Sign-In")).toBe(null)
 })
