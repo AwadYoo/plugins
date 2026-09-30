@@ -1059,6 +1059,50 @@ async function complete({ key, server, families }, chat, signal) {
 
 // serverOf is the API server an account's requests go to:
 // WINDSURF_API_SERVER_URL moves it, as it does the CLI's.
+// ---- usage -----------------------------------------------------------------
+
+// usage is the account's plan and how much of its quota is gone, as
+// GetUserStatus (what the CLI's /usage reads) tells them: the plan's name
+// and end, the daily and weekly quotas a quota-billed plan has (the share
+// left of each, and when it comes back), the ACUs a plan with a limit has
+// used this cycle, and the extra usage balance. JSON leaves out what is
+// zero, so a quota with a reset and no share left is used up. magpie's
+// built-in Devin account showed none of this.
+async function usage(key, server) {
+  const res = await fetch(server + "/exa.seat_management_pb.SeatManagementService/GetUserStatus", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
+    body: JSON.stringify({
+      metadata: { ideName: "devin-cli", ideVersion: CLI_VERSION, extensionName: "devin-cli", extensionVersion: CLI_VERSION, apiKey: key, locale: "en", os: osName() },
+    }),
+    signal: AbortSignal.timeout(15_000),
+  })
+  const text = await res.text()
+  if (!res.ok) return { error: failure(res.status, text).message, windows: [] }
+  const st = JSON.parse(text || "{}")?.userStatus?.planStatus ?? {}
+  const info = st.planInfo ?? {}
+  const num = (v) => (typeof v === "number" ? v : typeof v === "string" && v.trim() && !isNaN(Number(v)) ? Number(v) : 0)
+  const out = { windows: [] }
+  if (info.planName) out.plan = String(info.planName)
+  if (st.planEnd) out.until = st.planEnd
+  for (const [name, span, left, reset, hide] of [
+    ["Daily", 24 * 3600, st.dailyQuotaRemainingPercent, st.dailyQuotaResetAtUnix, info.hideDailyQuota],
+    ["Weekly", 7 * 24 * 3600, st.weeklyQuotaRemainingPercent, st.weeklyQuotaResetAtUnix, info.hideWeeklyQuota],
+  ]) {
+    if (hide || (left === undefined && !num(reset))) continue
+    const at = num(reset)
+    out.windows.push({ name, used: Math.min(100, Math.max(0, 100 - num(left))), span, ...(at > 0 ? { resetsAt: at } : {}) })
+  }
+  const limit = num(st.acuLimit)
+  if (limit > 0) {
+    const used = num(st.acuConsumed)
+    out.windows.push({ name: "ACUs", used: Math.min(100, (100 * used) / limit), display: `${+used.toFixed(2)} / ${+limit.toFixed(2)} ACUs`, ...(st.planEnd ? { resetsAt: st.planEnd } : {}), aside: true })
+  }
+  const extra = num(st.overageBalanceMicros)
+  if (extra > 0) out.balance = "$" + (extra / 1e6).toFixed(2)
+  return out
+}
+
 const serverOf = (auth) => (process.env.WINDSURF_API_SERVER_URL || auth?.metadata?.server || SERVER).replace(/\/+$/, "")
 
 export async function DevinAuthPlugin() {
@@ -1093,6 +1137,12 @@ export async function DevinAuthPlugin() {
         { type: "oauth", label: "Devin (browser)", authorize: browserSignIn },
         { type: "oauth", label: "Devin CLI's sign-in", authorize: cliSignIn },
       ],
+      // magpie's: the plan and how much of its quota is gone
+      async usage(getAuth) {
+        const auth = await getAuth()
+        if (auth?.type !== "api" || !auth.key) return { error: "Devin isn't signed in" }
+        return usage(auth.key, serverOf(auth))
+      },
     },
     async config(config) {
       config.provider ??= {}
