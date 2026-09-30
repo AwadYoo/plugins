@@ -3,6 +3,8 @@
 // sent to Factory's API with the headers droid sends. Ported from magpie's
 // built-in Factory account (internal/provider/factory*.go).
 
+import { STATUS_CODES } from "node:http"
+
 const PROVIDER = "factory"
 
 const WORKOS = "https://api.workos.com/user_management"
@@ -93,9 +95,10 @@ function configModels() {
 // ---- tokens -----------------------------------------------------------------
 
 class FactoryStatus extends Error {
-  constructor(code, message) {
+  constructor(code, message, body) {
     super(message)
     this.code = code
+    this.body = body
   }
 }
 
@@ -345,6 +348,97 @@ async function deviceSignIn() {
   }
 }
 
+// ---- usage ------------------------------------------------------------------
+//
+// How much of the plan the account has used, as magpie's built-in Factory
+// account shows it (internal/provider/factory_usage.go) and droid's /status
+// asks it: GET /api/billing/limits. Standard usage runs in rolling 5-hour,
+// weekly and monthly windows, each a percent used and when it ends; Droid
+// Core, the open models Factory hosts, has windows of its own; extra usage
+// is a balance in cents.
+
+// CORE are the models Droid Core's windows count: those of a vendor other
+// than Anthropic, OpenAI and xAI. Standard's count every other model.
+const CORE = MODELS.filter((m) => !["anthropic", "openai", "xai"].includes(m.upstream)).map((m) => m.id)
+
+// statusLine is a status as Go's HTTP client names it, "403 Forbidden".
+const statusLine = (status) => `${status} ${STATUS_CODES[status] ?? ""}`.trim()
+
+// vendorError is the message in an error body as magpie reads it: Factory's
+// {error: {message}} or {error}, {message}, {detail}, else the body cut
+// short after the status.
+function vendorError(text, fallback) {
+  let v
+  try {
+    v = JSON.parse(text)
+  } catch {}
+  if (v && typeof v === "object" && !Array.isArray(v)) {
+    const err = v.detail !== undefined && v.detail !== null ? v.detail : v.error
+    if (Array.isArray(v.errors) && typeof v.errors[0]?.message === "string" && v.errors[0].message) return v.errors[0].message
+    if (err && typeof err === "object" && typeof err.message === "string" && err.message) return err.message
+    if (typeof err === "string" && err) return err
+    const m = (typeof v.message === "string" && v.message) || (typeof v.msg === "string" && v.msg)
+    if (m) return m
+  }
+  const s = String(text ?? "").split(/\s+/).filter(Boolean).join(" ")
+  if (!s || s.startsWith("<")) return fallback
+  const r = [...s]
+  return fallback + ": " + (r.length > 300 ? r.slice(0, 300).join("") + "…" : s)
+}
+
+// windowEnd reads a window's end: an ISO time or epoch milliseconds, as
+// droid hands either to new Date.
+function windowEnd(v) {
+  if (typeof v === "string" && v) {
+    if (/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$/i.test(v) && !isNaN(Date.parse(v))) return new Date(v).toISOString()
+    if (/^[+-]?\d+$/.test(v) && Number(v) > 0) return new Date(Number(v)).toISOString()
+    return undefined
+  }
+  if (typeof v === "number" && v > 0) return new Date(Math.trunc(v)).toISOString()
+  return undefined
+}
+
+// dollars is cents as Go's $%.2f writes them: a half cent rounds to even.
+function dollars(cents) {
+  const x = cents / 100
+  const tie = Number.isInteger(x * 8) && !Number.isInteger(x * 4) // .125, .375, .625, .875 exactly
+  if (!tie) return "$" + x.toFixed(2)
+  const lo = Math.floor(x * 100)
+  return "$" + ((lo % 2 === 0 ? lo : lo + 1) / 100).toFixed(2)
+}
+
+// limitWindows turns the limits into windows: standard's by their span,
+// then Droid Core's, then the extra usage left. For routing, standard counts
+// the vendors' models and Core the open ones Factory hosts; with extra usage
+// to spend, a window used up stops neither.
+function limitWindows(l) {
+  const out = []
+  const cents = typeof l.extraUsageBalanceCents === "number" ? l.extraUsageBalanceCents : null
+  const extra = l.extraUsageAllowed === true && cents !== null && cents > 0
+  const add = (p, prefix, core) => {
+    if (!p || typeof p !== "object") return
+    for (const [w, name, span] of [
+      [p.fiveHour, "5 hours", 5 * 3600],
+      [p.weekly, "7 days", 7 * 24 * 3600],
+      [p.monthly, "30 days", 30 * 24 * 3600],
+    ]) {
+      if (!w || typeof w !== "object") continue
+      const used = typeof w.usedPercent === "number" ? w.usedPercent : 0
+      const win = { name: prefix + name, used: Math.min(Math.max(used, 0), 100), span }
+      const end = windowEnd(w.windowEnd)
+      if (end) win.resetsAt = end
+      if (extra) win.aside = true
+      if (core) win.models = CORE
+      else win.notModels = CORE
+      out.push(win)
+    }
+  }
+  add(l.limits?.standard, "", false)
+  add(l.limits?.core, "Droid Core · ", true)
+  if (cents !== null && cents > 0) out.push({ name: "Extra usage", used: 0, display: dollars(cents), aside: true })
+  return out
+}
+
 // ---- the plugin ---------------------------------------------------------------
 
 function bodyModel(body) {
@@ -372,6 +466,130 @@ export const FactoryAuthPlugin = async ({ client }) => {
   // answer doesn't ask before every request
   let asked = 0
 
+  // account is the account getAuth reads, with what keeps its token live
+  // and its org right.
+  const account = (getAuth) => {
+    const save = async (c) => {
+      const { type: _t, ...rest } = c
+      await client.auth.set({ path: { id: PROVIDER }, body: { ...rest, type: "oauth" } })
+    }
+    const current = async () => {
+      const a = await getAuth()
+      if (a?.type !== "oauth" || !a.access) throw new Error("Factory: not signed in")
+      return { ...a }
+    }
+
+    // orgOf fills in the active org when there is none: droid asks
+    // whoami as soon as it holds a token and sends the orgId it answers
+    // as X-Factory-Org-Id on every request after.
+    const orgOf = async (c) => {
+      if (c.activeOrganizationId || Date.now() - asked < ASK_AGAIN) return c
+      asked = Date.now()
+      if (await reconcile(c)) await save(c)
+      return c
+    }
+
+    // fresh is a live token, renewed near its end.
+    const fresh = () =>
+      locked(async () => {
+        const c = await current()
+        if ((c.expires > 0 && Date.now() < c.expires - REFRESH_LEAD) || !c.refresh) return orgOf(c)
+        let t
+        try {
+          t = await renew(c.refresh, "")
+        } catch (e) {
+          // a hiccup while the token still runs: go on with it
+          if (!refused(e) && c.expires > 0 && Date.now() < c.expires) return orgOf(c)
+          if (refused(e)) throw new Error(`${c.accountId || "the account"}'s Factory sign-in has expired — sign in again (${e.message})`)
+          throw e
+        }
+        c.access = t.access_token
+        c.expires = expiry(t.access_token)
+        if (t.refresh_token) c.refresh = t.refresh_token
+        // droid asks whoami again for each new token, keeping the org it names
+        await reconcile(c)
+        asked = Date.now()
+        await save(c)
+        return c
+      })
+
+    // mendOrg answers Factory refusing a request: an active org it
+    // can't reach is left off and whoami asked again without it; with
+    // no header sent, the token is put in the first org /api/cli/org
+    // lists. Any other 403 to an account that sent no org asks whoami
+    // for one. True when the request is worth sending again.
+    const mendOrg = (status, text) =>
+      locked(async () => {
+        if (status !== 403) return false
+        const isOrg = orgRefused(status, text)
+        const c = await current()
+        if (c.activeOrganizationId) {
+          if (!isOrg) return false // the org was sent: the refusal is about something else
+          const was = c.activeOrganizationId
+          c.activeOrganizationId = ""
+          if ((await reconcile(c)) && c.activeOrganizationId === was) c.activeOrganizationId = "" // whoami names the org refused: send none
+          asked = Date.now()
+          await save(c)
+          return true
+        }
+        if (!isOrg) {
+          asked = Date.now()
+          if ((await reconcile(c)) && c.activeOrganizationId) {
+            await save(c)
+            return true
+          }
+          return false
+        }
+        if (!c.refresh) return false
+        let org = ""
+        try {
+          org = await firstOrg(c)
+        } catch {}
+        if (!org) return false
+        let t
+        try {
+          t = await renew(c.refresh, org)
+        } catch {
+          return false
+        }
+        c.access = t.access_token
+        c.expires = expiry(t.access_token)
+        c.orgId = org
+        if (t.refresh_token) c.refresh = t.refresh_token
+        await save(c)
+        return true
+      })
+
+    // usage is the account's limits, asked once more when Factory refused
+    // an org that was put right
+    const usage = async () => {
+      const limits = async () => {
+        const c = await fresh()
+        const h = new Headers({ Accept: "application/json" })
+        factoryHeaders(h, c)
+        const res = await fetch(base(c) + "/api/billing/limits", { headers: h, signal: AbortSignal.timeout(15_000) })
+        const text = await res.text()
+        if (res.status !== 200) throw new FactoryStatus(res.status, "Factory: " + vendorError(text, statusLine(res.status)), text)
+        return JSON.parse(text)
+      }
+      try {
+        let l
+        try {
+          l = await limits()
+        } catch (e) {
+          if (!(e instanceof FactoryStatus && e.body !== undefined && (await mendOrg(e.code, e.body).catch(() => false)))) throw e
+          l = await limits()
+        }
+        if (!l?.limits?.standard) return { error: "Factory: the account reported no limits" }
+        return { windows: limitWindows(l) }
+      } catch (e) {
+        return { error: e?.message ?? String(e) }
+      }
+    }
+
+    return { fresh, mendOrg, usage }
+  }
+
   return {
     config: async (config) => {
       config.provider ??= {}
@@ -393,100 +611,15 @@ export const FactoryAuthPlugin = async ({ client }) => {
           authorize: deviceSignIn,
         },
       ],
+      // magpie's own hook: the account's limits
+      async usage(getAuth) {
+        return account(getAuth).usage()
+      },
       async loader(getAuth) {
         const first = await getAuth()
         if (first?.type !== "oauth") return {}
 
-        const save = async (c) => {
-          const { type: _t, ...rest } = c
-          await client.auth.set({ path: { id: PROVIDER }, body: { ...rest, type: "oauth" } })
-        }
-        const current = async () => {
-          const a = await getAuth()
-          if (a?.type !== "oauth" || !a.access) throw new Error("Factory: not signed in")
-          return { ...a }
-        }
-
-        // orgOf fills in the active org when there is none: droid asks
-        // whoami as soon as it holds a token and sends the orgId it answers
-        // as X-Factory-Org-Id on every request after.
-        const orgOf = async (c) => {
-          if (c.activeOrganizationId || Date.now() - asked < ASK_AGAIN) return c
-          asked = Date.now()
-          if (await reconcile(c)) await save(c)
-          return c
-        }
-
-        // fresh is a live token, renewed near its end.
-        const fresh = () =>
-          locked(async () => {
-            const c = await current()
-            if ((c.expires > 0 && Date.now() < c.expires - REFRESH_LEAD) || !c.refresh) return orgOf(c)
-            let t
-            try {
-              t = await renew(c.refresh, "")
-            } catch (e) {
-              // a hiccup while the token still runs: go on with it
-              if (!refused(e) && c.expires > 0 && Date.now() < c.expires) return orgOf(c)
-              if (refused(e)) throw new Error(`${c.accountId || "the account"}'s Factory sign-in has expired — sign in again (${e.message})`)
-              throw e
-            }
-            c.access = t.access_token
-            c.expires = expiry(t.access_token)
-            if (t.refresh_token) c.refresh = t.refresh_token
-            // droid asks whoami again for each new token, keeping the org it names
-            await reconcile(c)
-            asked = Date.now()
-            await save(c)
-            return c
-          })
-
-        // mendOrg answers Factory refusing a request: an active org it
-        // can't reach is left off and whoami asked again without it; with
-        // no header sent, the token is put in the first org /api/cli/org
-        // lists. Any other 403 to an account that sent no org asks whoami
-        // for one. True when the request is worth sending again.
-        const mendOrg = (status, text) =>
-          locked(async () => {
-            if (status !== 403) return false
-            const isOrg = orgRefused(status, text)
-            const c = await current()
-            if (c.activeOrganizationId) {
-              if (!isOrg) return false // the org was sent: the refusal is about something else
-              const was = c.activeOrganizationId
-              c.activeOrganizationId = ""
-              if ((await reconcile(c)) && c.activeOrganizationId === was) c.activeOrganizationId = "" // whoami names the org refused: send none
-              asked = Date.now()
-              await save(c)
-              return true
-            }
-            if (!isOrg) {
-              asked = Date.now()
-              if ((await reconcile(c)) && c.activeOrganizationId) {
-                await save(c)
-                return true
-              }
-              return false
-            }
-            if (!c.refresh) return false
-            let org = ""
-            try {
-              org = await firstOrg(c)
-            } catch {}
-            if (!org) return false
-            let t
-            try {
-              t = await renew(c.refresh, org)
-            } catch {
-              return false
-            }
-            c.access = t.access_token
-            c.expires = expiry(t.access_token)
-            c.orgId = org
-            if (t.refresh_token) c.refresh = t.refresh_token
-            await save(c)
-            return true
-          })
+        const { fresh, mendOrg } = account(getAuth)
 
         const send = async (input, init, body) => {
           const c = await fresh()
@@ -543,3 +676,6 @@ export const FactoryAuthPlugin = async ({ client }) => {
     },
   }
 }
+
+// for tests
+export const _internal = { limitWindows, windowEnd, dollars, vendorError, CORE }
