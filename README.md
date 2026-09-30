@@ -89,3 +89,13 @@ magpie, agents and sign-ins are left alone.
 ## License
 
 MIT
+
+## The market
+
+`registry.json` is the list magpie's Plugins tab shows. The packages here
+come first, then other OpenCode provider plugins worth knowing. magpie
+fetches it every few hours and keeps a copy built into the app for when
+it can't. To list a plugin, add an entry with its npm `package`, a
+`name`, `providers` (the provider ids it signs in to), an `icon` and a
+`summary` in English and Chinese (`{"en": …, "zh": …}`), and open a pull
+request.
