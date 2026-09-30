@@ -1,0 +1,25 @@
+// WorkBuddy's refusal of Codex's and Claude Code's system prompt carries
+// the hint magpie's built-in added (provider.WBRefusedHint), at the end of
+// the message, where magpie's routing page looks for it.
+import { expect, test } from "bun:test"
+import { _internal } from "./index.mjs"
+
+const { explained, REFUSED_HINT } = _internal
+
+test("the refusal ends in the hint", async () => {
+  const res = await explained(new Response(JSON.stringify({ error: { message: "Illegal API invocation from an unapproved channel", code: 11004 } }), { status: 403 }))
+  expect(res.status).toBe(403)
+  expect((await res.json()).error.message).toBe("Illegal API invocation from an unapproved channel — " + REFUSED_HINT)
+})
+
+test("other errors pass as they came", async () => {
+  const res = await explained(new Response('{"error":{"message":"rate limited"}}', { status: 429 }))
+  expect(res.status).toBe(429)
+  expect(await res.text()).toBe('{"error":{"message":"rate limited"}}')
+})
+
+test("a model of no credits is free, as magpie's built-in read them", () => {
+  const { freeCredits } = _internal
+  for (const c of ["x0.00", "0", 0, " X0 "]) expect(freeCredits(c)).toBe(true)
+  for (const c of ["x0.03", "", null, undefined, "free", 1]) expect(freeCredits(c)).toBe(false)
+})

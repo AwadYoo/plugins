@@ -439,12 +439,22 @@ function modelOf(site, provider, m) {
     },
     release_date: "",
     variants: variants(m.efforts),
+    // magpie's own: served at no cost to the plan's credits
+    free: !!m.free,
   }
 }
 
 // liveModels asks WorkBuddy's product config for the plan's models: the
 // "cli" agent's list, each with its details. The CLI User-Agent picks
 // WorkBuddy's config (a bare WorkBuddy/<v> gets CodeBuddy IDE's, no cli).
+// freeCredits says whether a model's credits are none: "x0.00", "0" or 0.
+// A rate it can't read is not free.
+function freeCredits(c) {
+  if (c == null || c === "") return false
+  const s = String(c).trim().toLowerCase().replace(/^x/, "")
+  return s !== "" && Number.isFinite(Number(s)) && Number(s) === 0
+}
+
 async function liveModels(site, a) {
   const headers = new Headers()
   sign(site, a, headers)
@@ -466,6 +476,7 @@ async function liveModels(site, a) {
         m.context = d.maxInputTokens
         m.output = d.maxOutputTokens
         m.images = d.supportsImages === true
+        m.free = freeCredits(d.credits)
         const es = d.reasoning?.supportedEfforts ?? []
         if (es.length) {
           const canOff = d.reasoning?.canDisableThinking
@@ -539,7 +550,8 @@ function makePlugin(site) {
             sign(site, a, headers)
             let body = init?.body
             if (body === undefined && req) body = await req.clone().text()
-            return fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: withSystem(body) })
+            const res = await fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: withSystem(body) })
+            return res.status >= 400 ? explained(res) : res
           },
         }
       },
@@ -571,8 +583,43 @@ function makePlugin(site) {
   })
 }
 
+// REFUSED_HINT is what the user can do about WorkBuddy's "Illegal API
+// invocation from an unapproved channel": both builds answer it to a chat
+// whose system prompt is Codex's or Claude Code's own (magpie #182),
+// whatever the headers. It ends the error's message, as magpie's built-in
+// put it (provider.WBRefusedHint), so magpie's routing page says it apart.
+const REFUSED_HINT =
+  "WorkBuddy refuses chats from Codex and Claude Code (their system prompt); use it from Hermes, OpenCode or Pi, or add another provider to this group"
+const REFUSED = /unapproved channel|illegal api invocation/i
+
+// explained is res with REFUSED_HINT added to that refusal's message.
+async function explained(res) {
+  const text = await res.text()
+  const again = (b) => {
+    const headers = new Headers(res.headers)
+    headers.delete("content-length")
+    headers.delete("content-encoding")
+    return new Response(b, { status: res.status, statusText: res.statusText, headers })
+  }
+  if (!REFUSED.test(text)) return again(text)
+  let msg = text.trim()
+  let v
+  try {
+    v = JSON.parse(text)
+  } catch {}
+  const at = v?.error && typeof v.error === "object" ? v.error : v && typeof v === "object" ? v : null
+  if (at && typeof at.message === "string") msg = at.message
+  else if (typeof v?.error === "string") msg = v.error
+  msg = `${msg} — ${REFUSED_HINT}`
+  const headers = new Headers(res.headers)
+  headers.set("content-type", "application/json")
+  headers.delete("content-length")
+  headers.delete("content-encoding")
+  return new Response(JSON.stringify({ error: { message: msg, type: "permission_error", code: null } }), { status: res.status, statusText: res.statusText, headers })
+}
+
 export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { usageOf, desktopHeld }
+export const _internal = { usageOf, desktopHeld, explained, REFUSED_HINT, freeCredits }

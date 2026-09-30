@@ -16,8 +16,9 @@
 // `refresh` the rest of it as JSON (site, base, key, jwt, team project,
 // plan, device id), `accountId` the account's email.
 
+import { createDecipheriv, createHash } from "node:crypto"
 import { existsSync, readFileSync, readdirSync } from "node:fs"
-import { homedir } from "node:os"
+import { homedir, userInfo } from "node:os"
 import { join } from "node:path"
 
 const PROVIDER = "zcode"
@@ -696,6 +697,136 @@ async function authorize(site, log) {
   }
 }
 
+// ---- ZCode's own sign-in ------------------------------------------------------------
+// ZCode keeps its sign-in in ~/.zcode/v2/credentials.json, each value
+// encrypted (AES-256-GCM, "enc:v1:<iv>.<tag>.<data>") with a key made from
+// the machine's user; ~/.zcode/v2/setting.json says whether it is on a
+// team's plan. An account signed in "as ZCode" reads them for every
+// request, so it follows ZCode's own sign-in, its renewed session and its
+// switches between plans, as magpie's built-in did (zcode.go zcodeOwn).
+
+const zcodeDir = () => join(homedir(), ".zcode", "v2")
+
+// secret is the key ZCode encrypts its credentials with.
+function secret() {
+  let seed = process.env.ZCODE_CREDENTIAL_SECRET
+  if (!seed) {
+    let name = ""
+    try {
+      name = userInfo().username
+    } catch {}
+    name = name.slice(name.lastIndexOf("\\") + 1) // DOMAIN\user
+    seed = `zcode-credential-fallback:${process.platform}:${homedir()}:${name}`
+  }
+  return createHash("sha256").update(seed).digest()
+}
+
+function decrypt(key, v) {
+  if (typeof v !== "string" || !v.startsWith("enc:v1:")) return null
+  const parts = v.slice(7).split(".")
+  if (parts.length !== 3) return null
+  try {
+    const [iv, tag, data] = parts.map((p) => Buffer.from(p.replace(/=+$/, ""), "base64url"))
+    const d = createDecipheriv("aes-256-gcm", key, iv)
+    d.setAuthTag(tag)
+    return Buffer.concat([d.update(data), d.final()]).toString("utf8")
+  } catch {
+    return null
+  }
+}
+
+function readJSON(path) {
+  try {
+    return JSON.parse(readFileSync(path, "utf8"))
+  } catch {
+    return null
+  }
+}
+
+// ownTeam is the team plan ZCode switched to, when it did.
+function ownTeam(store, key) {
+  const set = readJSON(join(zcodeDir(), "setting.json"))
+  if (!set) return null
+  const families = set.providerFamilyDomain === "zai" || set.providerFamilyDomain === "bigmodel" ? [set.providerFamilyDomain] : ["zai", "bigmodel"]
+  for (const fam of families) {
+    let org = ""
+    let project = ""
+    const sel = set.providerFamilyConnectionSelections?.[fam]
+    if (sel) {
+      if (sel.kind === "team-coding-plan") [org, project] = [first(sel.organizationId), first(sel.projectId)]
+    } else {
+      // before providerFamilyConnectionSelections
+      const legacy = first(set.modelProviderFamilySelectedKeys?.[fam])
+      const pre = `team-plan:builtin:${fam}-coding-plan:`
+      if (legacy.startsWith(pre)) {
+        const ps = legacy.slice(pre.length).split(":")
+        if (ps.length === 3) {
+          try {
+            ;[org, project] = [decodeURIComponent(ps[1]), decodeURIComponent(ps[2])]
+          } catch {}
+        }
+      }
+    }
+    if (!org || !project) continue
+    const tok = first(decrypt(key, store[`oauth:${fam}:access_token`]))
+    if (!tok) continue
+    // a stale token ZCode won't use either
+    if (fam === "bigmodel" && first(decrypt(key, store.zcodejwttoken)) === tok) continue
+    return { site: fam, base: SITES[fam].base, key: "", token: tok, org, project }
+  }
+  return null
+}
+
+// ownSignIn is what ZCode is signed in to now: the account, its coding
+// plan key, ZCode's session token (the Start Plan's key) and the team plan
+// it is switched to; null when it has none of them.
+function ownSignIn() {
+  const store = readJSON(join(zcodeDir(), "credentials.json"))
+  if (!store || typeof store !== "object") return null
+  const key = secret()
+  let s = { key: "", base: "" }
+  for (const [name, v] of Object.entries(store)) {
+    // account-provider:coding-plan:account:zai-individual-coding-plan:account:<uuid>:api-key
+    if (!name.includes(":coding-plan:") || !name.endsWith(":api-key")) continue
+    const k = decrypt(key, v)
+    if (!k || !k.includes(".")) continue
+    const base = name.includes(":bigmodel-") ? BIGMODEL_BASE : ZAI_BASE
+    // Z.ai's first, as ZCode lists it
+    if (!s.key || (base === ZAI_BASE && s.base !== ZAI_BASE)) s = { key: k, base }
+  }
+  const jwt = first(first(decrypt(key, store.zcodejwttoken)).replace(/^Bearer /, ""))
+  const team = ownTeam(store, key)
+  if (team) s = { ...team, jwt }
+  else s = { ...s, jwt, base: s.base || ZAI_BASE, site: s.base === BIGMODEL_BASE ? "bigmodel" : "zai" }
+  if (!s.key && !s.jwt && !isTeam(s)) return null
+  let info = {}
+  for (const name of ["oauth:zai:user_info", "oauth:bigmodel:user_info"]) {
+    const v = decrypt(key, store[name])
+    if (v && !first(info.email, info.name, info.user_id)) {
+      try {
+        info = JSON.parse(v)
+      } catch {}
+    }
+  }
+  return { ...s, user: who(info) }
+}
+
+// asZCode is the sign-in "as ZCode": what it reads is ZCode's own.
+function asZCode() {
+  return {
+    url: "",
+    instructions: "Uses the account the ZCode app is signed in to, and follows it.",
+    method: "auto",
+    async callback() {
+      const own = ownSignIn()
+      if (!own) return { type: "failed", error: "ZCode isn't signed in on this computer; sign in to ZCode, or sign in to Z.ai or BigModel here" }
+      const { user, ...s } = own
+      const state = { source: "zcode", device: anyDevice, ...s }
+      return { type: "success", refresh: JSON.stringify(state), access: s.key || s.jwt || "", expires: 0, accountId: user }
+    },
+  }
+}
+
 // stateOf is a stored sign-in as the requests need it.
 function stateOf(auth) {
   if (auth?.type === "oauth") {
@@ -703,6 +834,15 @@ function stateOf(auth) {
     try {
       s = JSON.parse(auth.refresh)
     } catch {}
+    if (s.source === "zcode") {
+      // ZCode's own, read now: what it was when this was signed in, if
+      // ZCode has since signed out
+      const own = ownSignIn()
+      if (own) {
+        const { user, ...now } = own
+        s = { source: "zcode", device: s.device, plan: s.plan, ...now }
+      }
+    }
     const site = siteOf(s.site)
     return { ...s, site, base: s.base || SITES[site].base, key: s.key ?? (s.jwt ? "" : auth.access), device: s.device || anyDevice }
   }
@@ -983,6 +1123,7 @@ export async function ZCodeAuthPlugin({ client }) {
       methods: [
         oauth("zai"),
         oauth("bigmodel"),
+        { type: "oauth", label: "ZCode app's sign-in", authorize: async () => asZCode() },
         {
           type: "api",
           label: "GLM Coding Plan API key",
@@ -1004,4 +1145,4 @@ export async function ZCodeAuthPlugin({ client }) {
 }
 
 // for tests
-export const _internal = { limitWindows, termOf, startUsage, routes, teamKeys }
+export const _internal = { limitWindows, termOf, startUsage, routes, teamKeys, ownSignIn, stateOf }
