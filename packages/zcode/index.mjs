@@ -51,6 +51,12 @@ const uuid = () => crypto.randomUUID()
 const anyDevice = uuid() // X-Device-Mid for calls made signed out (the model list)
 const first = (...ss) => ss.map((s) => (typeof s === "string" ? s.trim() : "")).find((s) => s) ?? ""
 
+// STATUS_TEXT is Go's http.StatusText, which magpie's built-in said a
+// refusal with no message in.
+const STATUS_TEXT = { 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
+  408: "Request Timeout", 429: "Too Many Requests", 500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable",
+  504: "Gateway Timeout" }
+
 class ZError extends Error {
   constructor(message, status) {
     super(message)
@@ -75,7 +81,7 @@ async function call(method, url, { auth, body, headers, device, signal } = {}) {
   const code = env?.code == null ? "" : String(env.code)
   if (!res.ok) {
     if (env?.msg) throw new ZError(code && code !== "0" ? `${env.msg} (${res.status}, code ${code})` : `${env.msg} (${res.status})`, res.status)
-    throw new ZError(`${res.status} ${res.statusText}`.trim(), res.status)
+    throw new ZError(STATUS_TEXT[res.status] ?? `${res.status} ${res.statusText}`.trim(), res.status)
   }
   if (!env || typeof env !== "object") throw new ZError("not JSON", res.status)
   if (code && code !== "0" && code !== "200") throw new ZError(env.msg || `error ${code}`, res.status)
@@ -234,6 +240,270 @@ async function teamKey(s) {
     teamKeys.set(id, { err, at: Date.now() })
     throw err
   }
+}
+
+// ---- allowance ---------------------------------------------------------------------
+// As magpie's built-in told it (internal/provider zcode.go, zcode_start.go,
+// zcode_team.go): the Coding Plan's windows and term, the Start Plan's
+// buckets, or a team seat's windows and its plan's end.
+
+// bizRoot is the business API of the site a plan is served from.
+function bizRoot(base) {
+  let h = ""
+  try {
+    h = new URL(base).host.toLowerCase()
+  } catch {}
+  return h === new URL(BIGMODEL_BASE).host || h.endsWith("bigmodel.cn") ? BIGMODEL_API : rootOf(base)
+}
+
+// spanOf reads a limit's window, in seconds: unit 3 counts hours, 6 weeks
+// (and 1, 4, 5 minutes, days and months by the same count). A team's five
+// hours come with no count.
+function spanOf(unit, n) {
+  n = Math.trunc(Number(n) || 0)
+  if (unit === 3 && n <= 0) n = 5
+  n = Math.max(n, 1)
+  return { 1: 60, 3: 3600, 4: 86400, 5: 30 * 86400, 6: 7 * 86400 }[unit] * n || 0
+}
+
+function windowName(span) {
+  if (span === 0) return "Credits"
+  if (span < 86400) return `${Math.trunc(span / 3600)} hours`
+  if (span === 7 * 86400) return "Weekly"
+  if (span >= 28 * 86400) return "Monthly"
+  return `${Math.trunc(span / 86400)} days`
+}
+
+// compact is a count as magpie says one: whole, else to two places.
+const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""))
+const isNum = (v) => typeof v === "number" && Number.isFinite(v)
+
+// limitWindows are /api/monitor/usage/quota/limit's limits as windows: what
+// is used of the whole when both are told (the whole less what remains, or
+// the current value), else the percentage given.
+function limitWindows(d) {
+  const out = []
+  for (const x of d?.limits ?? []) {
+    const span = spanOf(Math.trunc(Number(x?.unit) || 0), x?.number)
+    const w = { name: windowName(span), used: 0 }
+    if (isNum(x?.percentage)) w.used = x.percentage
+    if (isNum(x?.usage) && x.usage > 0) {
+      const total = x.usage
+      if (isNum(x.remaining)) {
+        const used = total - x.remaining
+        w.used = (100 * used) / total
+        w.display = `${compact(used)} / ${compact(total)}`
+      } else if (isNum(x.currentValue)) {
+        if (!isNum(x.percentage)) w.used = (100 * x.currentValue) / total
+        w.display = `${compact(x.currentValue)} / ${compact(total)}`
+      }
+    }
+    const reset = Math.trunc(Number(x?.nextResetTime) || 0)
+    if (reset > 0) w.resetsAt = new Date(reset).toISOString()
+    if (span) w.span = span
+    out.push(w)
+  }
+  return out
+}
+
+// beijing reads the plan's times, "2026-10-18 12:00:00" in Beijing: ms, or 0.
+function beijing(s) {
+  s = String(s ?? "").trim().replace(" ", "T")
+  if (!/^\d{4}-\d{2}-\d{2}(T\d{2}:\d{2}:\d{2})?$/.test(s)) return 0
+  const t = Date.parse(s + (s.length === 10 ? "T00:00:00" : "") + "+08:00")
+  return Number.isFinite(t) ? t : 0
+}
+
+// termOf is how long a GLM Coding plan is paid for: the valid
+// subscription's next renewal, a charge when it renews itself, else the
+// end of its time, the last date its "valid" span names.
+function termOf(subs) {
+  for (const x of Array.isArray(subs) ? subs : []) {
+    if (String(x?.status ?? "").toUpperCase() !== "VALID") continue
+    const auto = x.autoRenew === true || x.autoRenew === 1
+    const t = beijing(typeof x.nextRenewTime === "string" ? x.nextRenewTime : "")
+    if (t) return { until: new Date(t).toISOString(), renew: auto ? "auto" : "off" }
+    const ds = String(typeof x.valid === "string" ? x.valid : "").match(/\d{4}-\d{2}-\d{2}(?:[ T]\d{2}:\d{2}:\d{2})?/g) ?? []
+    if (ds.length && !auto) {
+      const end = beijing(ds[ds.length - 1])
+      if (end) return { until: new Date(end).toISOString(), renew: "off" }
+    }
+    return {}
+  }
+  return {}
+}
+
+// codingUsage is a Coding Plan key's allowance: credits per five hours and
+// per week, the plan's level and its term.
+async function codingUsage(s) {
+  const root = rootOf(s.base)
+  const d = (await call("GET", root + "/api/monitor/usage/quota/limit", { auth: s.key })) ?? {}
+  const out = {}
+  const level = typeof d.level === "string" ? d.level : ""
+  if (level) out.plan = "GLM Coding " + level[0].toUpperCase() + level.slice(1)
+  out.windows = limitWindows(d)
+  try {
+    Object.assign(out, termOf(await call("GET", root + "/api/biz/subscription/list", { auth: s.key })))
+  } catch {}
+  return out
+}
+
+// startNum reads a number the balance gives as a number or a string.
+function startNum(v) {
+  if (isNum(v)) return v
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v.trim())
+    if (!Number.isNaN(n)) return n
+  }
+  return undefined
+}
+
+// startUsage is the Start Plan's allowance: a window for each of its
+// buckets, a model's tokens for the day or for the plan's time. A plan
+// still "active" past its end is over, and its buckets are left out.
+async function startUsage(s) {
+  if (!s.jwt) throw new Error("not signed in to ZCode")
+  if (jwtExpired(s.jwt)) throw new Error(EXPIRED)
+  const b = (await call("GET", `${ZCODE}/api/v1/zcode-plan/billing/balance?app_version=${APP_VERSION}`, { auth: "Bearer " + s.jwt, device: s.device })) ?? {}
+  const str = (v) => (typeof v === "string" ? v : "")
+  const plans = (Array.isArray(b.plans) ? b.plans : []).map((p) => ({ ...p, status: str(p?.status), user_plan_id: str(p?.user_plan_id), plan_id: str(p?.plan_id) }))
+  const now = startNum(b.server_time) > 0 ? startNum(b.server_time) : Math.trunc(Date.now() / 1000)
+  const over = new Set()
+  for (const p of plans) {
+    const end = startNum(p.ends_at)
+    if (end > 0 && end <= now && p.status.trim().toLowerCase() === "active") p.status = "expired"
+    if (p.status.trim().toLowerCase() === "expired") over.add(p.user_plan_id + "\0" + p.plan_id)
+  }
+  const same = (x, p) => (x.user_plan_id && p.user_plan_id ? x.user_plan_id === p.user_plan_id : x.plan_id === p.plan_id)
+  const balances = (Array.isArray(b.balances) ? b.balances : [])
+    .map((x) => ({ ...x, user_plan_id: str(x?.user_plan_id), plan_id: str(x?.plan_id) }))
+    .filter((x) => {
+      let keep = true
+      for (const p of plans) {
+        if (!same(x, p)) continue
+        keep = !over.has(p.user_plan_id + "\0" + p.plan_id)
+        if (keep) break
+      }
+      return keep
+    })
+
+  let active = null
+  for (const p of plans) {
+    if (p.status.trim().toLowerCase() !== "active") continue
+    const id = p.plan_id.trim().toLowerCase(), n = str(p.name).trim().toLowerCase()
+    const isStart = (x) => x.includes("start-plan") || x.includes("start plan")
+    if ((id || n) && !isStart(id) && !isStart(n)) continue
+    const end = startNum(p.ends_at)
+    active = { name: first(str(p.name), "Start Plan"), until: end > 0 ? new Date(Math.trunc(end) * 1000).toISOString() : "" }
+    break
+  }
+  if (!active) return { error: "this account has no GLM Coding Plan, and ZCode's Start Plan has ended or was never started" }
+  const out = { plan: active.name, windows: [] }
+  if (active.until) Object.assign(out, { until: active.until, renew: "off" })
+  for (const x of balances) {
+    const total = startNum(x.total_units), left = startNum(x.remaining_units)
+    let used = startNum(x.used_units)
+    if (total === undefined && used === undefined && left === undefined) continue
+    const models = (Array.isArray(x.capabilities) ? x.capabilities : [])
+      .map((c) => String(c ?? "").trim().replace(/^model:/, "").trim()).filter(Boolean)
+    const w = { name: first(str(x.show_name), models.join(", "), "Credits"), used: 0 }
+    if (used === undefined) used = total !== undefined && left !== undefined ? total - left : 0
+    if (total > 0) {
+      w.used = (100 * used) / total
+      w.display = `${compact(used)} / ${compact(total)}`
+    }
+    const exp = startNum(x.expires_at)
+    if (exp > 0) w.resetsAt = new Date(Math.trunc(exp) * 1000).toISOString()
+    let span = 0
+    for (const p of plans) {
+      if (!same(x, p)) continue
+      for (const e of Array.isArray(p.entitlements) ? p.entitlements : []) {
+        if (str(e?.entitlement_id) === str(x.entitlement_id)) span = periodOf(str(e?.period))
+      }
+    }
+    if (!span) {
+      const a = startNum(x.period_start), z = startNum(x.period_end)
+      if (a !== undefined && z !== undefined && z > a) span = Math.trunc(z - a)
+    }
+    if (span) w.span = span
+    if (models.length) w.models = models
+    out.windows.push(w)
+  }
+  return out
+}
+
+// periodOf reads an entitlement's period: "daily", "weekly", "monthly".
+function periodOf(p) {
+  p = p.toLowerCase()
+  if (p.includes("day") || p.includes("daily")) return 86400
+  if (p.includes("week")) return 7 * 86400
+  if (p.includes("month")) return 30 * 86400
+  return 0
+}
+
+// when is a team plan's end: a time in Beijing, or a Unix time in seconds
+// or milliseconds; ms, or 0.
+function when(v) {
+  if (typeof v === "string") {
+    const t = beijing(v)
+    if (t) return t
+  }
+  const n = startNum(v)
+  if (n > 0) return n > 1e12 ? Math.trunc(n) : Math.trunc(n) * 1000
+  return 0
+}
+
+// teamUsage is a team seat's allowance: the team plan's five hours and
+// week, and the plan's name and end.
+async function teamUsage(s, key) {
+  const root = bizRoot(s.base)
+  const headers = teamHeaders(s.base, s.org, s.project)
+  const d = (await call("GET", root + "/api/monitor/usage/quota/limit?type=2", { auth: key, headers })) ?? {}
+  const out = { windows: limitWindows(d) }
+  if (!s.token) return out
+  const resets = teamResets(root, s.token, headers)
+  try {
+    const t = (await call("GET", root + "/api/biz/team/subscribe/product/querySubscribeDetail", { auth: s.token, headers })) ?? {}
+    const usable = (t.hasSubscription == null || t.hasSubscription === true) && String(t.status ?? "").toUpperCase() === "EFFECTIVE" &&
+      String(t.memberGrantStatus ?? "").toUpperCase() === "VALID"
+    if (usable) {
+      if (typeof t.productName === "string" && t.productName) out.plan = t.productName
+      const end = when(t.subscribeEndTime)
+      if (end) Object.assign(out, { until: new Date(end).toISOString(), renew: "off" })
+    }
+  } catch {}
+  const r = await resets
+  if (r) out.resets = r
+  return out
+}
+
+// teamResets is how many resets a team member may spend, of the five hours
+// and of the week: those of customer-package-reset/list still available.
+// null when it can't be told or there are none.
+async function teamResets(root, auth, headers) {
+  let d
+  try {
+    d = (await call("GET", root + "/api/biz/customer-package-reset/list?targetType=TEAM", { auth, headers })) ?? {}
+  } catch {
+    return null
+  }
+  let until = 0
+  const count = (rs) => {
+    let n = 0
+    for (const x of Array.isArray(rs) ? rs : []) {
+      if (x?.available !== true) continue
+      n++
+      const t = when(x.expireTime)
+      if (t && (!until || t < until)) until = t
+    }
+    return n
+  }
+  const fiveHour = count(d.fiveHourResets)
+  const weekly = count(d.weekResets)
+  if (fiveHour + weekly === 0) return null
+  const r = { count: fiveHour + weekly, byWindow: true, fiveHour, weekly }
+  if (until) r.until = new Date(until).toISOString()
+  return r
 }
 
 // ---- signing in ------------------------------------------------------------------
@@ -687,6 +957,29 @@ export async function ZCodeAuthPlugin({ client }) {
           },
         }
       },
+      // the plan's allowance, as magpie's built-in showed it
+      async usage(getAuth, provider) {
+        const auth = await getAuth()
+        const s = stateOf(auth)
+        if (!s) return { error: "not signed in" }
+        try {
+          if (isTeam(s)) {
+            let key = s.key
+            if (!key) {
+              key = await teamKey(s)
+              if (auth?.type === "oauth") {
+                const next = { ...auth, refresh: JSON.stringify({ ...s, key }), access: key }
+                await client?.auth?.set?.({ path: { id: provider?.id ?? PROVIDER }, body: next }).catch?.(() => {})
+              }
+            }
+            return await teamUsage(s, key)
+          }
+          if (await onStart(s)) return await startUsage(s)
+          return await codingUsage(s)
+        } catch (e) {
+          return { error: e?.message ?? String(e) }
+        }
+      },
       methods: [
         oauth("zai"),
         oauth("bigmodel"),
@@ -709,3 +1002,6 @@ export async function ZCodeAuthPlugin({ client }) {
     },
   }
 }
+
+// for tests
+export const _internal = { limitWindows, termOf, startUsage, routes, teamKeys }

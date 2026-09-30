@@ -1,0 +1,192 @@
+// auth.usage tells what magpie's built-in ZCode usage told for the same
+// answers (internal/provider/zcode_test.go TestZCodeAccounts,
+// zcode_start_test.go TestZCodeStartPlanOwnAccount, zcode_team_test.go).
+import { test, expect, beforeAll, beforeEach } from "bun:test"
+import { homedir, tmpdir } from "node:os"
+import { realpathSync } from "node:fs"
+
+let ZCodeAuthPlugin, _internal
+beforeAll(async () => {
+  // Bun reads HOME once, at start: run as HOME=$(mktemp -d) bun test, so
+  // no real sign-in is ever read
+  if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error("run with HOME=$(mktemp -d) bun test")
+  ;({ ZCodeAuthPlugin, _internal } = await import("./index.mjs"))
+})
+// nothing leaves the machine
+const offline = async () => { throw new Error("no network in tests") }
+beforeEach(() => {
+  globalThis.fetch = offline
+  _internal.routes.clear()
+  _internal.teamKeys.clear()
+})
+
+const ok = (data) => new Response(JSON.stringify({ code: 0, data }))
+function serve(route) {
+  const calls = []
+  globalThis.fetch = async (url, init = {}) => {
+    const u = new URL(String(url))
+    const c = { url: u, method: init.method ?? "GET", headers: init.headers ?? {}, body: init.body }
+    calls.push(c)
+    return (await route(c)) ?? new Response("", { status: 404 })
+  }
+  return calls
+}
+const oauth = (state) => ({ type: "oauth", access: state.key ?? state.jwt ?? "", refresh: JSON.stringify(state), expires: 0 })
+async function usage(auth, sets = []) {
+  const hooks = await ZCodeAuthPlugin({ client: { auth: { set: async (x) => sets.push(x) } } })
+  return hooks.auth.usage(async () => auth, { id: "zcode" })
+}
+const jwt = (exp) => ["{}", JSON.stringify({ exp })].map((s) => Buffer.from(s).toString("base64url")).join(".") + ".sig"
+
+test("a Coding Plan's five hours and week", async () => {
+  const reset = Date.now() + 3600_000
+  const calls = serve(({ url, headers }) => {
+    if (headers.Authorization !== "two.secret2") return new Response("", { status: 401 })
+    if (url.pathname === "/api/biz/subscription/list") return ok([{ productName: "GLM Coding Pro", status: "VALID" }])
+    if (url.pathname === "/api/monitor/usage/quota/limit")
+      return ok({ level: "pro", limits: [
+        { type: "CREDIT_LIMIT", unit: 3, number: 5, usage: 2000, remaining: 1500, percentage: 25, nextResetTime: reset },
+        { type: "CREDIT_LIMIT", unit: 6, number: 1, usage: 10000, remaining: 9000, percentage: 10, nextResetTime: reset },
+      ] })
+  })
+  expect(await usage(oauth({ site: "zai", key: "two.secret2" }))).toEqual({
+    plan: "GLM Coding Pro",
+    windows: [
+      { name: "5 hours", used: 25, display: "500 / 2000", resetsAt: new Date(reset).toISOString(), span: 5 * 3600 },
+      { name: "Weekly", used: 10, display: "1000 / 10000", resetsAt: new Date(reset).toISOString(), span: 7 * 86400 },
+    ],
+  })
+  expect(calls.every((c) => c.url.origin === "https://api.z.ai")).toBe(true)
+  // an API key, BigModel's, is asked on its own site
+  const bm = serve(({ url }) => (url.pathname.endsWith("/limit") ? ok({ limits: [] }) : ok([])))
+  expect(await usage({ type: "api", key: "k", metadata: { site: "bigmodel" } })).toEqual({ windows: [] })
+  expect(bm[0].url.origin).toBe("https://open.bigmodel.cn")
+})
+
+test("windows, names and terms as Go reads them", () => {
+  const ws = _internal.limitWindows({ limits: [
+    { unit: 3, usage: 1000, currentValue: 420, percentage: 42 }, // the percentage stands
+    { unit: 6, usage: 800, currentValue: 200 }, // none: from the current value
+    { unit: 1, number: 30, percentage: 7.5 },
+    { unit: 4, number: 3 },
+    { unit: 5, number: 1, usage: 0, remaining: 5 },
+    { unit: 0 },
+  ] })
+  expect(ws).toEqual([
+    { name: "5 hours", used: 42, display: "420 / 1000", span: 18000 },
+    { name: "Weekly", used: 25, display: "200 / 800", span: 604800 },
+    { name: "0 hours", used: 7.5, span: 1800 },
+    { name: "3 days", used: 0, span: 3 * 86400 },
+    { name: "Monthly", used: 0, span: 30 * 86400 },
+    { name: "Credits", used: 0 },
+  ])
+  // Beijing times: the next renewal, auto or not; else the valid span's end
+  expect(_internal.termOf([{ status: "EXPIRED", nextRenewTime: "2026-01-01 00:00:00" },
+    { status: "VALID", autoRenew: 1, nextRenewTime: "2026-10-18 12:00:00" }]))
+    .toEqual({ until: "2026-10-18T04:00:00.000Z", renew: "auto" })
+  expect(_internal.termOf([{ status: "valid", autoRenew: false, valid: "2026-09-18 12:00:00-2026-10-18 12:00:00" }]))
+    .toEqual({ until: "2026-10-18T04:00:00.000Z", renew: "off" })
+  expect(_internal.termOf([{ status: "VALID", autoRenew: true, valid: "2026-09-18-2026-10-18" }])).toEqual({})
+  expect(_internal.termOf([{ status: "VALID", valid: "2026-09-18 - 2026-10-18" }])).toEqual({ until: "2026-10-17T16:00:00.000Z", renew: "off" })
+})
+
+// a Start Plan with one bucket, GLM-5.1's tokens for the day, a quarter used
+function startBalance(now, status) {
+  return { server_time: now, plans: [{ plan_id: "zai-start-plan", user_plan_id: "up1", name: "Start Plan", status, ends_at: now + 7 * 86400,
+    entitlements: [{ entitlement_id: "e1", period: "daily" }] }],
+    balances: [{ plan_id: "zai-start-plan", user_plan_id: "up1", entitlement_id: "e1", show_name: "GLM-5.1", capabilities: ["model:GLM-5.1"],
+      total_units: "1000000", used_units: 250000, remaining_units: 750000, expires_at: now + 3600 }] }
+}
+
+test("ZCode's Start Plan: its buckets, each for its models", async () => {
+  const now = Math.trunc(Date.now() / 1000)
+  const token = jwt(now + 86400)
+  let balance = startBalance(now, "active")
+  const calls = serve(({ url, headers }) => {
+    if (url.pathname !== "/api/v1/zcode-plan/billing/balance") return
+    if (!headers["X-Device-Mid"]) return new Response(JSON.stringify({ code: 3001, msg: "parameter error" }), { status: 400 })
+    if (headers.Authorization !== "Bearer " + token || !url.searchParams.get("app_version")) return new Response("", { status: 401 })
+    return ok(balance)
+  })
+  const auth = oauth({ site: "bigmodel", jwt: token, device: "11111111-2222-4333-8444-555555555555" })
+  expect(await usage(auth)).toEqual({
+    plan: "Start Plan", until: new Date((now + 7 * 86400) * 1000).toISOString(), renew: "off",
+    windows: [{ name: "GLM-5.1", used: 25, display: "250000 / 1000000", resetsAt: new Date((now + 3600) * 1000).toISOString(), span: 86400,
+      models: ["GLM-5.1"] }],
+  })
+  expect(calls[0].url.origin).toBe("https://zcode.z.ai")
+  expect(calls[0].headers["X-Device-Mid"]).toBe("11111111-2222-4333-8444-555555555555")
+
+  const over = { error: "this account has no GLM Coding Plan, and ZCode's Start Plan has ended or was never started" }
+  balance = startBalance(now, "expired")
+  expect(await usage(auth)).toEqual(over)
+  // still "active" past its end is over too, as ZCode reads it
+  balance = { ...startBalance(now, "active"), server_time: now + 8 * 86400 }
+  expect(await usage(auth)).toEqual(over)
+  // a bucket counted by what remains, spanned by its period
+  balance = startBalance(now, "active")
+  balance.balances = [{ plan_id: "zai-start-plan", capabilities: [" model: GLM-5-Turbo ", "model:"], total_units: 200, remaining_units: "150",
+    period_start: now, period_end: now + 7 * 86400 }]
+  expect((await usage(auth)).windows).toEqual([{ name: "GLM-5-Turbo", used: 25, display: "50 / 200", span: 7 * 86400, models: ["GLM-5-Turbo"] }])
+
+  // its token run out
+  expect(await usage(oauth({ site: "zai", jwt: jwt(now - 60) }))).toEqual({ error: "ZCode's sign-in has expired; sign in again" })
+})
+
+test("a team seat: the team plan's windows, name, end and resets, its key found and saved", async () => {
+  const reset = Date.now() + 2 * 3600_000
+  let made = null
+  const TOKEN = "Bearer team-token"
+  serve(({ url, method, headers, body }) => {
+    const p = url.pathname, org = headers["Bigmodel-Organization"], proj = headers["Bigmodel-Project"]
+    if (url.origin !== "https://bigmodel.cn") return
+    if (p === "/api/biz/team/subscribe/product/querySubscribeDetail" && headers.Authorization === TOKEN && org === "t1" && proj === "tp1")
+      return ok({ hasSubscription: true, status: "EFFECTIVE", memberGrantStatus: "VALID", productId: "prod-1", productName: "GLM Coding Team Pro",
+        subscribeEndTime: "2026-12-31 23:59:59" })
+    if (p === "/api/biz/v1/organization/t1/projects/tp1/api_keys" && headers.Authorization === TOKEN && org === "t1" && proj === "tp1") {
+      if (method === "POST") {
+        made = JSON.parse(body)
+        return ok({ name: "zcode-team-api-key", apiKey: "tk", keyType: 2 })
+      }
+      return ok([{ name: "zcode-team-api-key", apiKey: "wrong-type", keyType: 1 }, ...(made ? [{ name: "zcode-team-api-key", apiKey: "tk", keyType: 2 }] : [])])
+    }
+    if (p === "/api/biz/v1/organization/t1/projects/tp1/api_keys/copy/tk") return ok({ secretKey: "ts" })
+    if (p === "/api/biz/customer-package-reset/list" && headers.Authorization === TOKEN && org === "t1" && proj === "tp1" && url.searchParams.get("targetType") === "TEAM")
+      return ok({
+        fiveHourResets: [{ available: true, expireTime: "2026-11-30 23:59:59" }, { available: true, expireTime: 1790000000 }, { available: false, expireTime: 1 }],
+        weekResets: [{ available: true, expireTime: "2026-12-31 23:59:59" }],
+      })
+    if (p === "/api/monitor/usage/quota/limit") {
+      if (headers.Authorization !== "tk.ts" || url.searchParams.get("type") !== "2" || headers["Set-Language"] !== "zh") return ok({ limits: [] })
+      return ok({ limits: [
+        { type: "CREDIT_LIMIT", unit: 3, percentage: 42, currentValue: 420, usage: 1000, nextResetTime: reset },
+        { type: "CREDIT_LIMIT", unit: 6, percentage: 10, currentValue: 1000, usage: 10000, nextResetTime: reset + 86400000 },
+      ] })
+    }
+  })
+  const sets = []
+  const state = { site: "bigmodel", base: "https://open.bigmodel.cn/api/anthropic", token: TOKEN, org: "t1", project: "tp1", plan: "GLM Coding Team Pro" }
+  expect(await usage(oauth(state), sets)).toEqual({
+    plan: "GLM Coding Team Pro", until: "2026-12-31T15:59:59.000Z", renew: "off",
+    resets: { count: 3, byWindow: true, fiveHour: 2, weekly: 1, until: new Date(1790000000 * 1000).toISOString() },
+    windows: [
+      { name: "5 hours", used: 42, display: "420 / 1000", resetsAt: new Date(reset).toISOString(), span: 5 * 3600 },
+      { name: "Weekly", used: 10, display: "1000 / 10000", resetsAt: new Date(reset + 86400000).toISOString(), span: 7 * 86400 },
+    ],
+  })
+  expect(made).toEqual({ name: "zcode-team-api-key", keyType: 2 })
+  expect(sets.length).toBe(1)
+  expect(sets[0].path).toEqual({ id: "zcode" })
+  expect(sets[0].body.access).toBe("tk.ts")
+  expect(JSON.parse(sets[0].body.refresh)).toEqual({ ...state, key: "tk.ts", device: expect.any(String) })
+})
+
+test("Z.ai's refusals are the card's error", async () => {
+  serve(() => new Response("", { status: 401 }))
+  expect(await usage(oauth({ site: "zai", key: "k" }))).toEqual({ error: "Unauthorized" })
+  serve(() => new Response(JSON.stringify({ code: 1001, msg: "Authorization Token非法" }), { status: 401 }))
+  expect(await usage(oauth({ site: "zai", key: "k" }))).toEqual({ error: "Authorization Token非法 (401, code 1001)" })
+  serve(() => new Response(JSON.stringify({ code: 500, msg: "" })))
+  expect(await usage(oauth({ site: "zai", key: "k" }))).toEqual({ error: "error 500" })
+  expect(await usage(undefined)).toEqual({ error: "not signed in" })
+})
