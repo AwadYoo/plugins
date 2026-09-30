@@ -39,7 +39,6 @@ const MODELS = [
   { id: "GLM-5-Turbo", context: 200_000, output: 64_000, efforts: ["none", "high"] },
 ]
 const START_MODELS = MODELS.filter((m) => m.id !== "GLM-5.3")
-const OUTPUT = 131_072 // when ZCode's config names none
 
 const SITES = {
   zai: { name: "Z.ai", api: ZAI_API, base: ZAI_BASE, subscribe: "z.ai/subscribe" },
@@ -975,7 +974,8 @@ const entry = (m) => ({
   tool_call: true,
   attachment: !!m.image,
   modalities: { input: m.image ? ["text", "image"] : ["text"], output: ["text"] },
-  limit: { context: m.context || 200_000, output: m.output || OUTPUT },
+  // what ZCode's config names, else 0 (unknown), as magpie's built-in
+  limit: { context: m.context || 0, output: m.output || 0 },
   cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
   variants: variants(m.efforts),
 })
@@ -1102,6 +1102,14 @@ export async function ZCodeAuthPlugin({ client }) {
         const auth = await getAuth()
         const s = stateOf(auth)
         if (!s) return { error: "not signed in" }
+        // every card starts from the plan the sign-in saved, as magpie's
+        // built-in did: a reply without a level, a team detail that
+        // failed or an error keeps it
+        const saved = (out) => {
+          const plan = s.plan || auth?.plan
+          if (plan && !out.plan) out.plan = plan
+          return out
+        }
         try {
           if (isTeam(s)) {
             let key = s.key
@@ -1112,12 +1120,12 @@ export async function ZCodeAuthPlugin({ client }) {
                 await client?.auth?.set?.({ path: { id: provider?.id ?? PROVIDER }, body: next }).catch?.(() => {})
               }
             }
-            return await teamUsage(s, key)
+            return saved(await teamUsage(s, key))
           }
-          if (await onStart(s)) return await startUsage(s)
-          return await codingUsage(s)
+          if (await onStart(s)) return saved(await startUsage(s))
+          return saved(await codingUsage(s))
         } catch (e) {
-          return { error: e?.message ?? String(e) }
+          return saved({ error: e?.message ?? String(e) })
         }
       },
       methods: [
@@ -1145,4 +1153,4 @@ export async function ZCodeAuthPlugin({ client }) {
 }
 
 // for tests
-export const _internal = { limitWindows, termOf, startUsage, routes, teamKeys, ownSignIn, stateOf }
+export const _internal = { entry, limitWindows, termOf, startUsage, routes, teamKeys, ownSignIn, stateOf }

@@ -190,3 +190,31 @@ test("Z.ai's refusals are the card's error", async () => {
   expect(await usage(oauth({ site: "zai", key: "k" }))).toEqual({ error: "error 500" })
   expect(await usage(undefined)).toEqual({ error: "not signed in" })
 })
+
+// magpie's built-in starts every card from the saved plan (zcode.go
+// zcodeQuota, zcode_team.go zcodeTeamQuota, zcode_start.go zcodeStartQuota)
+test("the saved plan stays on the card when the reply has no level, a team detail fails, or on an error", async () => {
+  serve(({ url }) => {
+    if (url.pathname === "/api/monitor/usage/quota/limit") return ok({ limits: [] })
+    if (url.pathname === "/api/biz/subscription/list") return ok([])
+  })
+  const own = await usage(oauth({ site: "zai", key: "k", plan: "GLM Coding Max" }))
+  expect(own.plan).toBe("GLM Coding Max")
+  expect(own.error).toBeUndefined()
+
+  serve(({ url }) => {
+    if (url.pathname === "/api/monitor/usage/quota/limit") return ok({ limits: [] })
+    return new Response("", { status: 500 })
+  })
+  const team = { site: "bigmodel", base: "https://open.bigmodel.cn/api/anthropic", key: "tk.ts", token: "Bearer t", org: "t1", project: "tp1", plan: "GLM Coding Team Pro" }
+  expect((await usage(oauth(team))).plan).toBe("GLM Coding Team Pro")
+
+  serve(() => new Response("", { status: 401 }))
+  expect(await usage(oauth({ site: "zai", key: "k", plan: "GLM Coding Max" }))).toEqual({ plan: "GLM Coding Max", error: "Unauthorized" })
+})
+
+// the built-in left a limit ZCode's config doesn't name at 0
+test("a model ZCode's config gives no limits has none made up", () => {
+  expect(_internal.entry({ id: "GLM-9", context: 0, output: 0, efforts: [] }).limit).toEqual({ context: 0, output: 0 })
+  expect(_internal.entry({ id: "GLM-9", context: 300_000, output: 8_000, efforts: [] }).limit).toEqual({ context: 300_000, output: 8_000 })
+})
