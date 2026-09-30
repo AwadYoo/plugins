@@ -9,7 +9,7 @@ import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { createServer } from "node:http"
 import { gunzipSync } from "node:zlib"
 import { spawn } from "node:child_process"
-import { existsSync, statSync } from "node:fs"
+import { existsSync, readFileSync, statSync } from "node:fs"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
 import { join } from "node:path"
@@ -221,7 +221,10 @@ function variantFor(families, model, effort) {
 // the efforts its variants are at (picked as any model's effort is, and
 // turned into the variant by variantFor), its fast run likewise, and the
 // variants at no effort (glm-5-2-1m); a family's only variant is its id.
-function listed(families) {
+// A variant in keep (one the user picked: swe-2-medium) stays, at the one
+// effort its id is at, and goes to Devin as it is, as magpie's built-in
+// keeps it (devinCollapse).
+function listed(families, keep = []) {
   const out = []
   const seen = new Set()
   const add = (m) => {
@@ -244,24 +247,66 @@ function listed(families) {
       add({ id: m.id, name: m.name, context: m.context || context, output: m.output || output, efforts: [] })
     }
   }
+  for (const id of keep) {
+    if (seen.has(id)) continue
+    const f = families.find((g) => g.models.some((m) => m.id === id))
+    const m = f?.models.find((m) => m.id === id)
+    const level = tierOf(id)[1]
+    if (!m && !level) continue
+    add({ id, name: m?.name || id, context: m?.context ?? 0, output: m?.output ?? 0, efforts: level ? [level] : [] })
+  }
   return out
 }
 
+// seesImages is whether a model takes images, as magpie's built-in tells
+// it for Devin's ids (models.go: m.Images || catalog.SeesImages): Devin's
+// list says nothing of images, so it is models.dev's word for the id — most
+// of the providers listing it taking images — from the catalog magpie's
+// `magpie sync` or OpenCode keeps, and no when neither has it.
+let seen = null
+function seesImages(id) {
+  if (!seen) {
+    seen = new Set()
+    const cache = process.env.XDG_CACHE_HOME || join(homedir(), ".cache")
+    for (const p of [join(cache, "magpie", "models.json"), join(homedir(), ".cache", "opencode", "models.json")]) {
+      let m
+      try {
+        m = JSON.parse(readFileSync(p, "utf8"))
+      } catch {
+        continue
+      }
+      if (!m || typeof m !== "object" || !Object.keys(m).length) continue
+      const votes = new Map()
+      for (const pr of Object.values(m))
+        for (const [mid, x] of Object.entries(pr?.models ?? {})) {
+          const b = bare(mid)
+          votes.set(b, (votes.get(b) ?? 0) + ((x?.modalities?.input ?? []).includes("image") ? 1 : -1))
+        }
+      for (const [b, v] of votes) if (v > 0) seen.add(b)
+      break
+    }
+  }
+  return seen.has(bare(id))
+}
+const bare = (id) => String(id).toLowerCase().split("/").pop()
+
 function configModel(m) {
+  const image = seesImages(m.id)
   return {
     id: m.id,
     name: m.name,
     tool_call: true,
     reasoning: m.efforts.length > 0,
-    attachment: true,
+    attachment: image,
     temperature: true,
-    modalities: { input: ["text", "image"], output: ["text"] },
+    modalities: { input: image ? ["text", "image"] : ["text"], output: ["text"] },
     limit: { context: m.context, output: m.output },
     ...(m.efforts.length ? { variants: Object.fromEntries(m.efforts.map((e) => [e, { reasoningEffort: e }])) } : {}),
   }
 }
 
 function runtimeModel(m) {
+  const image = seesImages(m.id)
   return {
     id: m.id,
     providerID: ID,
@@ -275,9 +320,9 @@ function runtimeModel(m) {
     capabilities: {
       temperature: true,
       reasoning: m.efforts.length > 0,
-      attachment: true,
+      attachment: image,
       toolcall: true,
-      input: { text: true, image: true, audio: false, video: false, pdf: false },
+      input: { text: true, image, audio: false, video: false, pdf: false },
       output: { text: true, image: false, audio: false, video: false, pdf: false },
       interleaved: false,
     },
@@ -718,8 +763,9 @@ const textOf = (c) =>
 // effortOf is the effort a request names, as magpie reads it.
 function effortOf(s) {
   const e = String(s ?? "").trim().toLowerCase()
-  if (e === "minimal" || e === "none") return "low"
-  if (["low", "medium", "high", "xhigh", "max"].includes(e)) return e
+  // none and minimal go as given: the family's variant nearest them, as
+  // magpie's built-in picks it (devinVariantIn)
+  if (["none", "minimal", "low", "medium", "high", "xhigh", "max"].includes(e)) return e
   if (e === "ultra") return "max"
   return ""
 }
@@ -1080,18 +1126,23 @@ async function usage(key, server) {
     signal: AbortSignal.timeout(15_000),
   })
   const text = await res.text()
+  if (res.status === 401 || failure(res.status, text).status === 401)
+    return { error: "Devin's sign-in has expired — sign in again", windows: [] }
   if (!res.ok) return { error: failure(res.status, text).message, windows: [] }
   const st = JSON.parse(text || "{}")?.userStatus?.planStatus ?? {}
   const info = st.planInfo ?? {}
   const num = (v) => (typeof v === "number" ? v : typeof v === "string" && v.trim() && !isNaN(Number(v)) ? Number(v) : 0)
+  // no plan: the row keeps the one `devin auth status` gave the sign-in
+  // ("Devin Pro"), as magpie's built-in row said it, not planName's "Pro"
   const out = { windows: [] }
-  if (info.planName) out.plan = String(info.planName)
   if (st.planEnd) out.until = st.planEnd
+  // a quota's window is shown when Devin says what is left of it; one it
+  // leaves out is not taken for used up
   for (const [name, span, left, reset, hide] of [
-    ["Daily", 24 * 3600, st.dailyQuotaRemainingPercent, st.dailyQuotaResetAtUnix, info.hideDailyQuota],
-    ["Weekly", 7 * 24 * 3600, st.weeklyQuotaRemainingPercent, st.weeklyQuotaResetAtUnix, info.hideWeeklyQuota],
+    ["1 day", 24 * 3600, st.dailyQuotaRemainingPercent, st.dailyQuotaResetAtUnix, info.hideDailyQuota],
+    ["7 days", 7 * 24 * 3600, st.weeklyQuotaRemainingPercent, st.weeklyQuotaResetAtUnix, info.hideWeeklyQuota],
   ]) {
-    if (hide || (left === undefined && !num(reset))) continue
+    if (hide || left === undefined || left === null) continue
     const at = num(reset)
     out.windows.push({ name, used: Math.min(100, Math.max(0, 100 - num(left))), span, ...(at > 0 ? { resetsAt: at } : {}) })
   }
@@ -1180,11 +1231,11 @@ export async function DevinAuthPlugin() {
         if (auth?.type !== "api" || !auth.key || !cliPath()) return provider.models
         const { key, server } = await live(auth)
         const families = await familiesFor(key, server)
-        return Object.fromEntries(listed(families).map((m) => [m.id, runtimeModel(m)]))
+        return Object.fromEntries(listed(families, Object.keys(provider?.models ?? {})).map((m) => [m.id, runtimeModel(m)]))
       },
     },
   }
 }
 
 // for tests
-export const _internal = { live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readCredentials, credentials, fields, frame, PB, events, frames }
+export const _internal = { seesImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readCredentials, credentials, fields, frame, PB, events, frames }
