@@ -1,0 +1,450 @@
+// Grok (SuperGrok / X Premium+) through the Grok Build CLI's own sign-in.
+//
+// The CLI (https://x.ai/cli) signs in with a device code and keeps the
+// sign-in in its home (GROK_HOME, else ~/.grok) as auth.json. This plugin
+// only reads that file: the CLI refreshes the token, which changes each
+// time, so a token about to expire is renewed by running the CLI there
+// (`grok models`), never by the plugin itself. Requests go to the CLI's
+// backend, which speaks OpenAI's Responses API, signed as the CLI signs
+// them.
+import { spawn, execFile } from "node:child_process"
+import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } from "node:fs"
+import { homedir } from "node:os"
+import { delimiter, dirname, isAbsolute, join } from "node:path"
+import { randomBytes } from "node:crypto"
+
+const PROVIDER = "grok"
+const BASE = "https://cli-chat-proxy.grok.com/v1"
+const CLIENT_VERSION = "1.0.41"
+const REFRESH_MARGIN = 5 * 60 * 1000
+const LINK_WAIT = 30 * 1000
+const INSTALL = process.platform === "win32" ? "irm https://x.ai/cli/install.ps1 | iex" : "curl -fsSL https://x.ai/cli/install.sh | bash"
+
+// the tool types Grok's backend takes; it turns the whole request away over another
+const TOOLS = new Set(["function", "web_search", "x_search", "image_generation", "collections_search", "file_search",
+  "code_execution", "code_interpreter", "mcp", "shell", "tool_search"])
+
+const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
+const LINK = /https:\/\/\S+/
+
+// ---- the CLI ------------------------------------------------------------------
+
+// cliHome is where the CLI keeps its own sign-in and settings.
+function cliHome() {
+  return process.env.GROK_HOME || join(homedir(), ".grok")
+}
+
+// ownHomes is where this plugin keeps a sign-in made beside the CLI's own.
+function ownHomes() {
+  return join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "opencode-grok-auth")
+}
+
+function isFile(p) {
+  try {
+    return statSync(p).isFile()
+  } catch {
+    return false
+  }
+}
+
+// isGrokBuild tells xAI's grok from any other program by that name: its
+// installer keeps it under the grok home.
+function isGrokBuild(p) {
+  let real = p
+  try {
+    real = realpathSync(p)
+  } catch {}
+  return real.replaceAll("\\", "/").toLowerCase().includes("/.grok/")
+}
+
+// executable finds the CLI, first to last: the installer's bin
+// (GROK_BIN_DIR, GROK_HOME/bin, ~/.grok/bin), each folder on PATH, then
+// ~/.local/bin; those two only when it is really Grok Build.
+function executable() {
+  const name = process.platform === "win32" ? "grok.exe" : "grok"
+  const home = homedir()
+  const seen = new Set()
+  const out = []
+  const add = (dir, own) => {
+    if (!dir || !isAbsolute(dir)) return
+    const p = join(dir, name)
+    const k = process.platform === "win32" ? p.toLowerCase() : p
+    if (seen.has(k)) return
+    seen.add(k)
+    out.push({ p, own })
+  }
+  add(process.env.GROK_BIN_DIR, true)
+  add(join(cliHome(), "bin"), true)
+  if (home) add(join(home, ".grok", "bin"), true)
+  for (const d of (process.env.PATH ?? "").split(delimiter)) add(d.trim(), false)
+  if (home) add(join(home, ".local", "bin"), false)
+  for (const c of out) if (isFile(c.p) && (c.own || isGrokBuild(c.p))) return c.p
+  return ""
+}
+
+// envFor runs the CLI as the user runs it, in the given home.
+function envFor(home) {
+  const env = {}
+  for (const [k, v] of Object.entries(process.env)) {
+    if (["GROK_HOME", "GROK_AUTH_PROVIDER_COMMAND", "GROK_AUTH_EXPIRED"].includes(k.toUpperCase())) continue
+    env[k] = v
+  }
+  env.GROK_HOME = home
+  return env
+}
+
+// credential is the sign-in the CLI keeps in home: the first, by key, with a token.
+function credential(home) {
+  let all
+  try {
+    all = JSON.parse(readFileSync(join(home, "auth.json"), "utf8"))
+  } catch {
+    return null
+  }
+  if (!all || typeof all !== "object") return null
+  for (const k of Object.keys(all).sort()) {
+    const c = all[k]
+    if (c && typeof c.key === "string" && c.key) {
+      const t = Date.parse(c.expires_at ?? "")
+      return { key: c.key, email: c.email ?? "", expires: Number.isFinite(t) ? t : 0, issuer: c.oidc_issuer ?? "" }
+    }
+  }
+  return null
+}
+
+function run(file, args, opts) {
+  return new Promise((resolve) => {
+    execFile(file, args, { timeout: 30000, ...opts }, (err, stdout) => resolve({ err, stdout: String(stdout ?? "") }))
+  })
+}
+
+let refreshing = Promise.resolve()
+
+// token is the CLI's sign-in in home with a token still good. One about to
+// expire (or that a request found expired) is first renewed by the CLI in
+// its own home: a `grok models` there renews it as any use of the CLI does.
+async function token(home, expired) {
+  let c = credential(home)
+  const exe = executable()
+  if (c && exe && (expired || c.expires - Date.now() < REFRESH_MARGIN)) {
+    const done = refreshing.then(() => run(exe, ["models"], { cwd: dirname(home), env: envFor(home) }))
+    refreshing = done.catch(() => {})
+    await done
+    c = credential(home)
+  }
+  if (!c) throw new Error("Grok is not signed in; run `grok login`")
+  if (c.expires && c.expires <= Date.now()) throw new Error("Grok's sign-in has expired; run `grok login`")
+  return c
+}
+
+let version = { v: CLIENT_VERSION, at: 0 }
+
+// clientVersion is the CLI version the requests say they come from, unless
+// the installed one is newer: without it the backend calls the CLI outdated.
+async function clientVersion() {
+  if (Date.now() - version.at < 10 * 60 * 1000) return version.v
+  let v = CLIENT_VERSION
+  const exe = executable()
+  if (exe) {
+    const { err, stdout } = await run(exe, ["--version"], { timeout: 5000 }) // "grok 1.0.41 (4220f3b224a6)"
+    const got = !err && stdout.match(/\d+\.\d+\.\d+/)?.[0]
+    if (got && newer(got, v)) v = got
+  }
+  version = { v, at: Date.now() }
+  return v
+}
+
+function newer(a, b) {
+  const x = a.split(".").map(Number), y = b.split(".").map(Number)
+  for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i]
+  return false
+}
+
+// headers say a request comes from the Grok CLI.
+async function sign(headers, key) {
+  const v = await clientVersion()
+  const os = process.platform === "darwin" ? "macos" : process.platform === "win32" ? "windows" : process.platform
+  const arch = { arm64: "aarch64", x64: "x86_64", ia32: "386" }[process.arch] ?? process.arch
+  headers.set("Authorization", `Bearer ${key}`)
+  headers.set("x-grok-client-version", v)
+  headers.set("x-xai-token-auth", "xai-grok-cli")
+  headers.set("x-grok-client-identifier", "grok-shell")
+  headers.set("x-grok-client-mode", "headless")
+  headers.set("User-Agent", `grok-shell/${v} (${os}; ${arch})`)
+}
+
+// rewrite leaves out what Grok's backend doesn't take: tools of other
+// types (a freeform apply_patch, a namespace of sub-agent tools), a web
+// search's external_web_access, a tool_choice naming a dropped type, and a
+// reasoning item's "content": null, beside which it can't read the
+// encrypted reasoning.
+function rewrite(body) {
+  if (typeof body !== "string" || (!body.includes('"tools"') && !body.includes('"reasoning"'))) return body
+  let m
+  try {
+    m = JSON.parse(body)
+  } catch {
+    return body
+  }
+  if (!m || typeof m !== "object" || Array.isArray(m)) return body
+  let dirty = false
+  if (Array.isArray(m.tools)) {
+    m.tools = m.tools.filter((t) => {
+      if (!t || typeof t !== "object") return true
+      if (!TOOLS.has(t.type)) {
+        dirty = true
+        return false
+      }
+      if ("external_web_access" in t) {
+        delete t.external_web_access
+        dirty = true
+      }
+      return true
+    })
+    if (m.tool_choice && typeof m.tool_choice === "object" && !TOOLS.has(m.tool_choice.type)) {
+      delete m.tool_choice
+      dirty = true
+    }
+  }
+  for (const it of Array.isArray(m.input) ? m.input : []) {
+    if (it && it.type === "reasoning" && "content" in it && it.content === null) {
+      delete it.content
+      dirty = true
+    }
+  }
+  return dirty ? JSON.stringify(m) : body
+}
+
+// ---- models -------------------------------------------------------------------
+
+const DEFAULT_MODELS = {
+  "grok-4.7": { name: "Grok 4.7", attachment: true, reasoning: true, tool_call: true, modalities: { input: ["text", "image"], output: ["text"] } },
+}
+
+// listModels is what the account can use, as the CLI's backend lists it:
+// Responses models only, each with its context window and efforts
+// (listed hardest first, kept easiest first).
+async function listModels(key) {
+  const headers = new Headers()
+  await sign(headers, key)
+  const res = await fetch(`${BASE}/models`, { headers })
+  const text = await res.text()
+  if (!res.ok) throw new Error(`Grok models: ${res.status} ${text.slice(0, 200)}`)
+  const out = []
+  for (const d of JSON.parse(text)?.data ?? []) {
+    if (!d?.id || (d.api_backend && d.api_backend !== "responses")) continue
+    const efforts = (d.reasoning_efforts ?? []).map((e) => e?.value).filter(Boolean).reverse()
+    out.push({ id: d.id, name: d.name || d.id, context: d.context_window ?? 0, efforts })
+  }
+  if (!out.length) throw new Error("Grok listed no models")
+  return out
+}
+
+// ---- sign-in ------------------------------------------------------------------
+
+// login runs `grok login --device-auth` in home and hands on the first link
+// it prints; done is settled when the command is.
+function login(exe, home, own) {
+  const child = spawn(exe, ["login", "--device-auth"], {
+    cwd: homedir(),
+    env: own ? envFor(home) : process.env,
+    stdio: ["ignore", "pipe", "pipe"],
+  })
+  const tail = []
+  let buf = ""
+  let found
+  const link = new Promise((resolve) => (found = resolve))
+  const onData = (chunk) => {
+    buf += chunk.toString()
+    let i
+    while ((i = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, i).replace(/\r$/, "").replace(ANSI, "").trim()
+      buf = buf.slice(i + 1)
+      if (line) tail.push(line)
+      const u = line.match(LINK)?.[0]
+      if (u) found(u)
+    }
+  }
+  child.stdout.on("data", onData)
+  child.stderr.on("data", onData)
+  const done = new Promise((resolve) => {
+    child.on("error", (e) => resolve({ ok: false, why: e.message }))
+    child.on("close", (code) => {
+      const rest = buf.replace(ANSI, "").trim()
+      if (rest) {
+        tail.push(rest)
+        const u = rest.match(LINK)?.[0]
+        if (u) found(u)
+      }
+      found("")
+      resolve({ ok: code === 0, why: tail.at(-1) ?? "grok login didn't finish" })
+    })
+  })
+  return { child, link, done }
+}
+
+function newHome() {
+  const home = join(ownHomes(), randomBytes(9).toString("base64url").replace(/[-_]/g, "").toLowerCase())
+  mkdirSync(home, { recursive: true, mode: 0o700 })
+  return home
+}
+
+// signIn signs in with the CLI's device code: in the CLI's own home when
+// that isn't signed in, else in a home of this plugin's, so the CLI's own
+// sign-in stays as it is.
+async function signIn() {
+  const exe = executable()
+  if (!exe) throw new Error(`install Grok Build first: ${INSTALL}`)
+  const own = !!credential(cliHome())
+  const home = own ? newHome() : cliHome()
+  const { child, link, done } = login(exe, home, own)
+  const url = await Promise.race([link, new Promise((r) => setTimeout(() => r(""), LINK_WAIT))])
+  if (!url) {
+    child.kill()
+    if (own) rmSync(home, { recursive: true, force: true })
+    throw new Error("grok login gave no link to open")
+  }
+  return {
+    url,
+    instructions: "Approve the sign-in on the page; Grok Build finishes it.",
+    method: "auto",
+    callback: async () => {
+      const r = await done
+      const c = r.ok ? credential(home) : null
+      if (!c || (own && !c.email)) {
+        if (own) rmSync(home, { recursive: true, force: true })
+        return { type: "failed", error: r.ok ? "grok login finished without an account" : r.why }
+      }
+      return saved(home, c)
+    },
+  }
+}
+
+// saved is the sign-in as OpenCode keeps it: refresh is the home the CLI
+// keeps it in, access the token it had then.
+function saved(home, c) {
+  return { type: "success", refresh: home, access: c.key, expires: c.expires, accountId: c.email }
+}
+
+// current takes the sign-in the CLI already has, as it is.
+async function current() {
+  if (!executable()) throw new Error(`install Grok Build first: ${INSTALL}`)
+  const home = cliHome()
+  if (!credential(home)) throw new Error("Grok Build is not signed in; run `grok login`, or sign in with the device code")
+  const c = await token(home, false)
+  return {
+    url: "",
+    instructions: c.email ? `Grok Build is signed in as ${c.email}.` : "Grok Build is signed in.",
+    method: "auto",
+    callback: async () => saved(home, c),
+  }
+}
+
+// ---- the plugin ---------------------------------------------------------------
+
+export const GrokAuthPlugin = async ({ client }) => {
+  const remember = async (auth, c) => {
+    if (auth.access === c.key && auth.expires === c.expires) return
+    try {
+      await client.auth.set({ path: { id: PROVIDER }, body: { ...auth, access: c.key, expires: c.expires, accountId: c.email || auth.accountId } })
+    } catch {}
+  }
+
+  return {
+    config: async (cfg) => {
+      cfg.provider ??= {}
+      cfg.provider[PROVIDER] ??= {
+        name: "Grok (SuperGrok)",
+        npm: "@ai-sdk/openai",
+        api: BASE,
+        models: DEFAULT_MODELS,
+      }
+    },
+
+    auth: {
+      provider: PROVIDER,
+      async loader(getAuth) {
+        const auth = await getAuth()
+        if (!auth || auth.type !== "oauth") return {}
+        return {
+          baseURL: BASE,
+          apiKey: "grok",
+          async fetch(input, init) {
+            const auth = await getAuth()
+            const home = auth?.refresh
+            if (!home) throw new Error("Grok is not signed in; run `grok login`")
+            const req = new Request(input, init)
+            const body = rewrite(init?.body)
+            let parsed = {}
+            if (typeof body === "string") {
+              try {
+                parsed = JSON.parse(body) ?? {}
+              } catch {}
+            }
+            const send = async (expired) => {
+              const c = await token(home, expired)
+              await remember(auth, c)
+              const headers = new Headers(req.headers)
+              await sign(headers, c.key)
+              if (typeof parsed.model === "string" && parsed.model) headers.set("x-grok-model-override", parsed.model)
+              if (typeof parsed.prompt_cache_key === "string" && parsed.prompt_cache_key) headers.set("x-grok-conv-id", parsed.prompt_cache_key)
+              headers.delete("content-length")
+              return fetch(req.url, { ...init, method: req.method, headers, body })
+            }
+            const res = await send(false)
+            if (res.status !== 401) return res
+            return send(true)
+          },
+        }
+      },
+      methods: [
+        {
+          type: "oauth",
+          label: "Sign in with Grok Build (device code)",
+          authorize: signIn,
+        },
+        {
+          type: "oauth",
+          label: "Use Grok Build's current sign-in",
+          authorize: current,
+        },
+      ],
+    },
+
+    provider: {
+      id: PROVIDER,
+      async models(provider, { auth } = {}) {
+        const have = provider?.models ?? {}
+        if (!auth || auth.type !== "oauth" || !auth.refresh) return have
+        let list
+        try {
+          list = await listModels((await token(auth.refresh, false)).key)
+        } catch {
+          return have
+        }
+        const base = have["grok-4.7"] ?? Object.values(have)[0] ?? {}
+        const out = {}
+        for (const m of list) {
+          const was = have[m.id] ?? base
+          out[m.id] = {
+            ...was,
+            id: m.id,
+            providerID: provider.id,
+            name: m.name,
+            api: { ...(was.api ?? {}), id: m.id, url: BASE, npm: "@ai-sdk/openai" },
+            limit: { ...(was.limit ?? {}), context: m.context || was.limit?.context || 0, output: was.limit?.output ?? 0 },
+            capabilities: {
+              ...(was.capabilities ?? {}),
+              reasoning: m.efforts.length > 0 || !!was.capabilities?.reasoning,
+              attachment: true,
+              toolcall: true,
+              input: { ...(was.capabilities?.input ?? {}), text: true, image: true },
+            },
+            variants: Object.fromEntries(m.efforts.map((e) => [e, { reasoningEffort: e }])),
+          }
+        }
+        return out
+      },
+    },
+  }
+}
