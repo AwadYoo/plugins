@@ -189,6 +189,11 @@ async function saveBack(c) {
 // ---- tokens --------------------------------------------------------------------
 
 const EXPIRED = "Kiro's sign-in has expired; sign in again"
+
+// gone is an error saying the sign-in itself is gone — refused, or never
+// there — which alone answers a request with the 401 magpie marks the
+// account lapsed on; a refresh that timed out or met a 5xx may pass.
+const gone = (msg) => Object.assign(new Error(msg), { gone: true })
 const fresh = (c) => c.method === "apikey" || !c.expires || c.expires - Date.now() > 2 * 60 * 1000
 
 async function post(url, contentType, body, headers = {}) {
@@ -201,7 +206,7 @@ async function post(url, contentType, body, headers = {}) {
   }
   const text = await res.text()
   if (!res.ok) {
-    if ([400, 401, 403].includes(res.status)) throw new Error(EXPIRED)
+    if ([400, 401, 403].includes(res.status)) throw gone(EXPIRED)
     throw new Error(`refreshing Kiro's sign-in: ${res.status}`)
   }
   return JSON.parse(text)
@@ -218,7 +223,7 @@ async function refresh(c) {
       if (n && n.dbKey === c.dbKey && n.access !== c.access && fresh(n)) return n
     }
   }
-  if (!c.refresh) throw new Error(EXPIRED)
+  if (!c.refresh) throw gone(EXPIRED)
   let out
   switch (c.method) {
     case "social": {
@@ -234,16 +239,16 @@ async function refresh(c) {
       break
     }
     case "external-idp": {
-      if (!c.tokenURL) throw new Error(EXPIRED + " with `kiro-cli login`")
+      if (!c.tokenURL) throw gone(EXPIRED + " with `kiro-cli login`")
       const form = new URLSearchParams({ grant_type: "refresh_token", client_id: c.clientId ?? "", refresh_token: c.refresh })
       const r = await post(c.tokenURL, "application/x-www-form-urlencoded", form.toString())
       out = { access: r.access_token, refresh: r.refresh_token, expiresIn: r.expires_in }
       break
     }
     default:
-      throw new Error(EXPIRED)
+      throw gone(EXPIRED)
   }
-  if (!out.access) throw new Error(EXPIRED)
+  if (!out.access) throw gone(EXPIRED)
   const n = { ...c, access: out.access, expires: Date.now() + (out.expiresIn > 0 ? out.expiresIn : 3600) * 1000 }
   if (out.refresh) n.refresh = out.refresh
   await saveBack(n)
@@ -309,7 +314,10 @@ async function profileOf(c) {
       body: "{}",
       signal: AbortSignal.timeout(20_000),
     })
-    if (!res.ok) throw new Error(`Kiro didn't take the API key: ${res.status}`)
+    if (!res.ok) {
+      const msg = `Kiro didn't take the API key: ${res.status}`
+      throw res.status === 401 || res.status === 403 ? gone(msg) : new Error(msg)
+    }
     const arn = (await res.json().catch(() => null))?.profile?.arn
     if (!arn) throw new Error("Kiro didn't say which profile the API key is for")
     return arn
@@ -411,7 +419,7 @@ function account(client) {
       const read = await credOf(auth)
       if (!read) {
         held = null
-        throw new Error(
+        throw gone(
           auth?.source
             ? "Kiro isn't signed in; add the Kiro subscription in magpie, sign in with `kiro-cli login` or the Kiro IDE, or save a Kiro API key on the provider"
             : "this Kiro account's sign-in is gone; add it again in magpie",
@@ -423,7 +431,7 @@ function account(client) {
         if (stale && c && read.access !== c.access && fresh(read)) stale = false // the owner refreshed it already
         c = read
         if (!fresh(c) || stale) {
-          if (c.method === "apikey") throw new Error("Kiro turned down the API key")
+          if (c.method === "apikey") throw gone("Kiro turned down the API key")
           c = await refresh(c)
           await save(auth, c)
         }
@@ -716,7 +724,7 @@ const ERROR_TYPES = { 400: "invalid_request_error", 401: "authentication_error",
   404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 503: "overloaded_error", 529: "overloaded_error" }
 const errorType = (status) => ERROR_TYPES[status] ?? "api_error"
 const errorResponse = (status, message) =>
-  new Response(JSON.stringify({ type: "error", error: { type: errorType(status), message: "Kiro: " + message } }), {
+  new Response(JSON.stringify({ type: "error", error: { type: errorType(status), message } }), {
     status,
     headers: { "Content-Type": "application/json" },
   })
@@ -1037,7 +1045,7 @@ async function reply(it, model, stream) {
           break
         case "error":
           close()
-          ctl.enqueue(sse("error", { error: { type: "api_error", message: "Kiro: " + e.text } }))
+          ctl.enqueue(sse("error", { error: { type: "api_error", message: e.text } }))
           return ctl.close()
         case "stop":
           close()
@@ -1062,7 +1070,7 @@ async function generate(creds, auth, req, signal) {
   try {
     a = await creds(auth)
   } catch (e) {
-    return errorResponse(401, e.message)
+    return errorResponse(e?.gone ? 401 : 502, e.message)
   }
   let res
   try {
@@ -1076,7 +1084,7 @@ async function generate(creds, auth, req, signal) {
     try {
       a = await creds(auth, true)
     } catch (e) {
-      return errorResponse(401, e.message)
+      return errorResponse(e?.gone ? 401 : 502, e.message)
     }
     try {
       res = await sendKiro(a, buildKiro(req, model, a.profile, budget), signal)
