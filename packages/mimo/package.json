@@ -1,0 +1,11 @@
+{
+  "name": "@magpie-commuity/opencode-mimo-auth",
+  "version": "0.1.0",
+  "description": "OpenCode provider plugin for Xiaomi MiMo: the MiMo app's Xiaomi-account sign-in, MiMo Pro and MiMo Flash",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": ["index.mjs", "README.md"],
+  "keywords": ["opencode", "opencode-plugin", "xiaomi", "mimo"],
+  "license": "MIT"
+}
