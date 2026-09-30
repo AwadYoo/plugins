@@ -1,0 +1,776 @@
+// Command Code's plans (commandcode.ai) as an OpenCode provider plugin.
+//
+// An account is a Command Code API key. It is got the way Command Code's
+// CLI gets one (Studio approves a key for this machine and posts it to a
+// callback on 127.0.0.1), taken from the CLI's own sign-in
+// (~/.commandcode/auth.json, read only), or pasted from Studio's keys page.
+// A key doesn't expire: there is nothing to refresh.
+//
+// Every plan but Go is served on the Provider API: chat completions and
+// Responses at /provider/v1, Anthropic's Messages at /provider/v1/messages,
+// the key in Authorization and x-api-key. Go's key has no Provider API: it
+// is only taken where the CLI itself asks, POST /alpha/generate, in the
+// CLI's own format (command-code 1.72.2), which the fetch here writes from
+// the chat completion OpenCode sends and turns back into one.
+import { createServer } from "node:http"
+import { randomBytes, randomUUID } from "node:crypto"
+import { readFile } from "node:fs/promises"
+import { homedir } from "node:os"
+import { join } from "node:path"
+
+const ID = "commandcode-plan"
+const API = "https://api.commandcode.ai"
+const STUDIO = "https://commandcode.ai"
+const BASE = API + "/provider/v1"
+const CLI_VERSION = "1.72.2"
+const MAX_TOKENS = 64000 // the CLI's max_tokens when none is asked
+const ORIGINS = ["https://commandcode.ai", "https://staging.commandcode.ai"]
+const SIGN_IN_TIMEOUT = 10 * 60 * 1000
+
+const CHAT = "@ai-sdk/openai-compatible"
+const MESSAGES = "@ai-sdk/anthropic"
+
+// ---- models -------------------------------------------------------------------
+
+// The plan's models when its list can't be asked: Claude on Messages, the
+// rest on chat completions.
+const MODELS = [
+  { id: "claude-sonnet-5", name: "Claude Sonnet 5", context: 1_000_000 },
+  { id: "claude-opus-5-5", name: "Claude Opus 5.5", context: 1_000_000 },
+  { id: "gpt-6-sol", name: "GPT-6 Sol", context: 1_050_000 },
+  { id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro", context: 1_000_000 },
+  { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash", context: 1_000_000 },
+  { id: "moonshotai/Kimi-K3", name: "Kimi K3", context: 1_000_000 },
+  { id: "zai-org/GLM-5.3", name: "GLM-5.3", context: 1_000_000 },
+  { id: "MiniMaxAI/MiniMax-M3", name: "MiniMax M3", context: 1_000_000 },
+]
+
+// The models the Go plan is let use, as the CLI's own table has it
+// (1.72.2); Command Code has no list to ask for them.
+const EFF5 = ["low", "medium", "high", "xhigh", "max"]
+const GO_MODELS = [
+  { id: "gpt-6-luna", name: "GPT-6 Luna", context: 1_050_000, images: true, efforts: EFF5 },
+  { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", context: 1_050_000, images: true, efforts: EFF5 },
+  { id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro", context: 1_000_000, efforts: ["high", "max"] },
+  { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash", context: 1_000_000, efforts: ["high", "max"] },
+  { id: "moonshotai/Kimi-K3", name: "Kimi K3", context: 1_000_000, images: true, efforts: ["low", "high", "max"] },
+  { id: "zai-org/GLM-5.3", name: "GLM-5.3", context: 1_000_000, efforts: ["low", "high", "max"] },
+  { id: "MiniMaxAI/MiniMax-M3", name: "MiniMax M3", context: 1_000_000 },
+  { id: "Qwen/Qwen3.8-Max", name: "Qwen 3.8 Max", context: 1_000_000, images: true, efforts: ["low", "medium", "xhigh"] },
+  { id: "Qwen/Qwen3.8-Flash", name: "Qwen 3.8 Flash", context: 1_000_000 },
+  { id: "xiaomi/mimo-v2.6-pro", name: "MiMo V2.6 Pro", context: 1_048_576, images: true },
+]
+const GO_EFFORTS = Object.fromEntries(GO_MODELS.map((m) => [m.id, m.efforts ?? []]))
+
+const isClaude = (id) => /^claude-/i.test(id) || id.startsWith("anthropic/")
+
+// configModel is a model as opencode.json's provider.models has it.
+function configModel(m) {
+  const npm = m.npm ?? (isClaude(m.id) ? MESSAGES : CHAT)
+  return {
+    name: m.name,
+    ...(npm !== CHAT ? { provider: { npm, api: BASE } } : {}),
+    limit: { context: m.context ?? 0, output: m.output ?? 0 },
+    ...(m.images ? { attachment: true, modalities: { input: ["text", "image"], output: ["text"] } } : {}),
+    ...(m.efforts?.length
+      ? { reasoning: true, variants: Object.fromEntries(m.efforts.map((e) => [e, { reasoningEffort: e }])) }
+      : {}),
+    tool_call: true,
+  }
+}
+
+// runtimeModel is a model as OpenCode's provider.models hook returns it.
+function runtimeModel(m) {
+  const npm = m.npm ?? (isClaude(m.id) ? MESSAGES : CHAT)
+  const input = { text: true, image: !!m.images, audio: false, video: false, pdf: false }
+  return {
+    id: m.id,
+    providerID: ID,
+    name: m.name ?? m.id,
+    api: { id: m.id, url: BASE, npm },
+    status: "active",
+    headers: {},
+    options: {},
+    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    limit: { context: m.context ?? 0, output: m.output ?? 0 },
+    capabilities: {
+      temperature: true,
+      reasoning: !!m.efforts?.length,
+      attachment: !!m.images,
+      toolcall: true,
+      input,
+      output: { text: true, image: false, audio: false, video: false, pdf: false },
+      interleaved: false,
+    },
+    release_date: "",
+    variants: Object.fromEntries((m.efforts ?? []).map((e) => [e, { reasoningEffort: e }])),
+  }
+}
+
+// liveModels is the Provider API's list, with the APIs each model is
+// served on (its Claude models on /messages alone, the open ones on
+// /chat/completions and /responses); the default list's names and
+// windows fill in what it leaves out.
+async function liveModels(key) {
+  const res = await fetch(BASE + "/models", { headers: { Authorization: `Bearer ${key}`, "x-api-key": key } })
+  if (!res.ok) throw new Error(`models: ${res.status}`)
+  const body = await res.json()
+  const known = Object.fromEntries(MODELS.map((m) => [m.id, m]))
+  const out = []
+  for (const m of body?.data ?? []) {
+    if (!m?.id) continue
+    const k = known[m.id]
+    const eps = (m.supported_endpoints ?? []).map((e) => String(e).replace(/\/$/, "").replace(/^\/v1/, ""))
+    let npm = isClaude(m.id) ? MESSAGES : CHAT
+    if (eps.length) npm = eps.includes("/chat/completions") ? CHAT : eps.includes("/messages") ? MESSAGES : CHAT
+    const ctx = Number(m.context_length)
+    out.push({
+      id: m.id,
+      name: m.name && m.name !== m.id ? m.name : m.display_name || k?.name || m.id,
+      context: Number.isFinite(ctx) && ctx > 0 ? ctx : k?.context ?? 0,
+      images: (m.modalities?.input ?? []).includes("image") || undefined,
+      npm,
+    })
+  }
+  if (!out.length) throw new Error("models: an empty list")
+  return out
+}
+
+// ---- the account --------------------------------------------------------------
+
+async function accountJSON(path, key) {
+  const res = await fetch(API + path, {
+    headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+    signal: AbortSignal.timeout(15_000),
+  })
+  if (!res.ok) {
+    const e = new Error(`${path}: ${res.status}`)
+    e.status = res.status
+    throw e
+  }
+  return res.json()
+}
+
+// The plan names, by planId prefix, the longest first.
+const PLAN_NAMES = [
+  ["individual-provider", "Provider"],
+  ["individual-pro-v1", "Pro"],
+  ["individual-goat", "GOAT"],
+  ["individual-ultra", "Ultra"],
+  ["individual-max", "Max"],
+  ["individual-pro", "Pro"],
+  ["individual-go", "Go"],
+  ["teams-pro", "Teams Pro"],
+]
+const NO_PLAN = "No plan"
+
+function planName(id) {
+  const s = String(id).toLowerCase().replaceAll("_", "-")
+  return PLAN_NAMES.find(([p]) => s.startsWith(p))?.[1] ?? ""
+}
+
+// subscription is the account's plan as billing/subscriptions says;
+// undefined when it can't be read.
+async function subscription(key) {
+  try {
+    const d = (await accountJSON("/alpha/billing/subscriptions", key))?.data
+    if (d?.planId && d.status !== "canceled" && d.status !== "incomplete_expired") return planName(d.planId) || d.planId
+    return NO_PLAN
+  } catch {
+    return undefined
+  }
+}
+
+// Each key's plan as last read ("" when it couldn't be), and when: a plan
+// is kept 10 minutes, a failure to read it one.
+const plansSeen = new Map()
+const PLAN_KEEP = 10 * 60 * 1000
+const PLAN_RETRY = 60 * 1000
+
+async function planNow(key, saved) {
+  const seen = plansSeen.get(key)
+  if (seen && seen.plan && Date.now() - seen.at < PLAN_KEEP) return seen.plan
+  if (seen && !seen.plan && Date.now() - seen.at < PLAN_RETRY) return saved ?? ""
+  const plan = (await subscription(key)) ?? ""
+  plansSeen.set(key, { plan, at: Date.now() })
+  return plan || saved || ""
+}
+
+// signedIn names a new key's account with whoami and reads its plan. Only
+// whoami turning the key down (401, 403) fails: it has answered a key just
+// made with a 500, so one that errs is asked again a few times, then
+// passed over for the name Studio sent with the key.
+async function signedIn(a) {
+  let me
+  for (let tries = 0; ; tries++) {
+    try {
+      me = (await accountJSON("/alpha/whoami", a.apiKey))?.user
+      break
+    } catch (e) {
+      if (e.status === 401 || e.status === 403) throw new Error("Command Code didn't take the new key")
+      if (tries >= 2) break
+      await new Promise((r) => setTimeout(r, 1000))
+    }
+  }
+  const who = me?.userName || a.userName || me?.email || me?.id || a.userId || "Command Code"
+  const plan = (await subscription(a.apiKey)) ?? ""
+  if (plan) plansSeen.set(a.apiKey, { plan, at: Date.now() })
+  return { who, plan, email: me?.email ?? "" }
+}
+
+// success is what a sign-in gives OpenCode: the key, and who it is.
+async function success(a) {
+  const { who, plan } = await signedIn(a)
+  const metadata = { email: who }
+  if (a.userId) metadata.userId = a.userId
+  if (a.keyName) metadata.keyName = a.keyName
+  if (plan) metadata.plan = plan
+  return { type: "success", provider: ID, key: a.apiKey, metadata }
+}
+
+// ---- the browser sign-in --------------------------------------------------------
+
+function page(ok, title, text) {
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c])
+  return `<!doctype html><meta charset="utf-8"><title>${esc(title)}</title>
+<style>body{font:15px system-ui,sans-serif;display:grid;place-items:center;min-height:90vh;margin:0;color:#222;background:#fafafa}
+@media (prefers-color-scheme:dark){body{color:#eee;background:#161616}}main{text-align:center;max-width:28rem;padding:1rem}
+.d{font-size:2rem;color:${ok ? "#2a9d5c" : "#c0392b"}}</style>
+<main><div class="d">${ok ? "✓" : "✕"}</div><h1>${esc(title)}</h1><p>${esc(text)}</p></main>`
+}
+
+// browserSignIn is the CLI's: Studio asks the user to approve a key for
+// this machine, then posts it (a form, or JSON from an older Studio) to
+// the callback, which sends the browser on to a page saying how it went.
+async function browserSignIn() {
+  const state = randomBytes(24).toString("base64url")
+  let status = { state: "waiting" }
+  let settle
+  const done = new Promise((r) => (settle = r))
+  const finish = (st, result) => {
+    if (status.state !== "waiting") return
+    status = st
+    settle(result)
+  }
+
+  const server = createServer(async (req, res) => {
+    const origin = ORIGINS.includes(req.headers.origin) ? req.headers.origin : ORIGINS[0]
+    res.setHeader("Access-Control-Allow-Origin", origin)
+    res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    res.setHeader("Access-Control-Allow-Headers", "Content-Type")
+    if (req.headers["access-control-request-private-network"] === "true") res.setHeader("Access-Control-Allow-Private-Network", "true")
+    const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname
+    const html = (code, body) => {
+      res.writeHead(code, { "Content-Type": "text/html; charset=utf-8" })
+      res.end(body)
+    }
+    if (req.method === "OPTIONS") return res.writeHead(204).end()
+    if (path === "/callback/complete" && req.method === "GET") {
+      return status.state === "done"
+        ? html(200, page(true, "You're signed in", `${status.who} is signed in. You can close this tab.`))
+        : html(200, page(false, "Sign-in didn't finish", status.error || "Start it again."))
+    }
+    if (path === "/cancel") {
+      finish({ state: "canceled" }, { type: "failed" })
+      return res.writeHead(204).end()
+    }
+    if (path !== "/callback") return res.writeHead(404).end()
+    if (req.method !== "POST") return res.writeHead(405).end()
+
+    let raw = ""
+    for await (const chunk of req) {
+      raw += chunk
+      if (raw.length > 10_000) break
+    }
+    const isJSON = String(req.headers["content-type"] ?? "").trim().toLowerCase().startsWith("application/json")
+    let got = {}
+    if (isJSON) {
+      try {
+        got = JSON.parse(raw) ?? {}
+      } catch {}
+    } else got = Object.fromEntries(new URLSearchParams(raw))
+    const answer = (ok, msg) => {
+      if (isJSON) {
+        res.writeHead(ok ? 200 : 400, { "Content-Type": "application/json" })
+        return res.end(JSON.stringify({ success: ok, error: msg }))
+      }
+      res.writeHead(303, { Location: "/callback/complete?state=" + encodeURIComponent(got.state ?? ""), "Cache-Control": "no-store" })
+      res.end()
+    }
+    if (got.state !== state) return html(403, page(false, "This link isn't from this sign-in", "Start it again."))
+    if (status.state !== "waiting") return answer(false, "this sign-in is over")
+    if (got.error) {
+      const msg = got.error === "access_denied" ? "the sign-in was denied" : got.error_description || got.error
+      finish({ state: "failed", error: msg }, { type: "failed" })
+      return answer(false, msg)
+    }
+    if (!got.apiKey) return answer(false, "Command Code sent back no key")
+    try {
+      const r = await success({ apiKey: got.apiKey, userId: got.userId, userName: got.userName, keyName: got.keyName })
+      finish({ state: "done", who: r.metadata.email }, r)
+      answer(true, "")
+    } catch (e) {
+      finish({ state: "failed", error: e.message }, { type: "failed" })
+      answer(false, e.message)
+    }
+  })
+  await new Promise((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
+  const port = server.address().port
+  const timer = setTimeout(() => finish({ state: "failed", error: "the sign-in timed out" }, { type: "failed" }), SIGN_IN_TIMEOUT)
+  // the browser comes back for its page after the key: the server stays
+  // up a while for it
+  done.then(() => {
+    clearTimeout(timer)
+    setTimeout(() => server.close(), 10_000).unref?.()
+  })
+  const q = new URLSearchParams({ callback: `http://127.0.0.1:${port}/callback`, state, mode: "redirect" })
+  return {
+    url: `${STUDIO}/studio/auth/cli?${q}`,
+    instructions: "Approve the key for this machine in Command Code Studio.",
+    method: "auto",
+    callback: () => done,
+  }
+}
+
+// cliSignIn takes the account Command Code's CLI is signed in to, reading
+// ~/.commandcode/auth.json and changing nothing.
+async function cliSignIn() {
+  const path = join(homedir(), ".commandcode", "auth.json")
+  return {
+    url: "",
+    instructions: `Uses the account in ${path}.`,
+    method: "auto",
+    callback: async () => {
+      try {
+        const a = JSON.parse(await readFile(path, "utf8"))
+        if (!String(a?.apiKey ?? "").trim()) return { type: "failed" }
+        return await success(a)
+      } catch {
+        return { type: "failed" }
+      }
+    },
+  }
+}
+
+// ---- the Go plan: /alpha/generate ----------------------------------------------
+
+const session = randomUUID() // one x-session-id for as long as this runs, as one CLI session has
+
+const EFFORT_RANK = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+
+// fitEffort is the level the model has nearest the one asked, the higher
+// on a tie.
+function fitEffort(want, levels) {
+  if (want === "ultra" && !levels.includes(want)) want = "max"
+  if (!levels.length || levels.includes(want)) return want
+  const at = EFFORT_RANK.indexOf(want)
+  if (at < 0) return want
+  let best = want
+  let dist = EFFORT_RANK.length
+  for (const l of levels) {
+    const i = EFFORT_RANK.indexOf(l)
+    if (i < 0 || l === "none") continue
+    const d = Math.abs(i - at)
+    if (d < dist || (d === dist && i > at)) [best, dist] = [l, d]
+  }
+  return best
+}
+
+const textOf = (c) =>
+  typeof c === "string" ? c : Array.isArray(c) ? c.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("") : ""
+
+function imagePart(p) {
+  const u = typeof p.image_url === "string" ? p.image_url : p.image_url?.url
+  if (!u) return null
+  const m = /^data:([^;,]+)[;,]/.exec(u)
+  return m ? { type: "image", image: u, mimeType: m[1] } : { type: "image", image: u }
+}
+
+function parseArgs(s) {
+  if (s && typeof s === "object") return s
+  try {
+    const v = JSON.parse(s || "{}")
+    return v && typeof v === "object" ? v : {}
+  } catch {
+    return {}
+  }
+}
+
+// generateBody is a chat completion request as the CLI asks
+// /alpha/generate: no project behind it, the CLI's config outside a git
+// repository, in the user's home.
+function generateBody(chat) {
+  const system = []
+  const messages = []
+  const names = {} // a tool call's id → its tool
+  let results = null
+  const flush = () => {
+    if (results?.length) messages.push({ role: "tool", content: results })
+    results = null
+  }
+  for (const m of chat.messages ?? []) {
+    if (m.role === "system" || m.role === "developer") {
+      system.push(textOf(m.content))
+      continue
+    }
+    if (m.role === "tool") {
+      results ??= []
+      results.push({
+        type: "tool-result",
+        toolCallId: m.tool_call_id,
+        toolName: names[m.tool_call_id] || "unknown",
+        output: { type: "text", value: textOf(m.content) },
+      })
+      continue
+    }
+    flush()
+    if (m.role === "assistant") {
+      const parts = []
+      const thought = m.reasoning_content ?? m.reasoning
+      if (typeof thought === "string" && thought) parts.push({ type: "reasoning", text: thought })
+      const t = textOf(m.content)
+      if (t) parts.push({ type: "text", text: t })
+      for (const c of m.tool_calls ?? []) {
+        names[c.id] = c.function?.name
+        parts.push({ type: "tool-call", toolCallId: c.id, toolName: c.function?.name, input: parseArgs(c.function?.arguments) })
+      }
+      if (parts.length) messages.push({ role: "assistant", content: parts })
+      continue
+    }
+    const parts = []
+    if (typeof m.content === "string") {
+      if (m.content) parts.push({ type: "text", text: m.content })
+    } else
+      for (const p of m.content ?? []) {
+        if (p?.type === "text" && p.text) parts.push({ type: "text", text: p.text })
+        else if (p?.type === "image_url") {
+          const im = imagePart(p)
+          if (im) parts.push(im)
+        }
+      }
+    if (parts.length) messages.push({ role: "user", content: parts })
+  }
+  flush()
+  const tools = (chat.tools ?? [])
+    .filter((t) => t?.type === "function" && t.function?.name)
+    .map((t) => ({
+      name: t.function.name,
+      description: t.function.description ?? "",
+      input_schema: t.function.parameters ?? { type: "object", properties: {} },
+    }))
+  const params = {
+    model: chat.model,
+    messages,
+    tools,
+    system: system.join("\n\n"),
+    max_tokens: chat.max_completion_tokens || chat.max_tokens || MAX_TOKENS,
+    stream: true,
+  }
+  if (typeof chat.temperature === "number") params.temperature = chat.temperature
+  const effort = chat.reasoning_effort
+  if (effort && effort !== "none") params.reasoning_effort = fitEffort(effort, GO_EFFORTS[chat.model] ?? [])
+  const d = new Date()
+  const date = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`
+  return {
+    config: {
+      workingDir: homedir(),
+      date,
+      environment: process.platform,
+      structure: [],
+      isGitRepo: false,
+      currentBranch: "",
+      mainBranch: "",
+      gitStatus: "",
+      recentCommits: [],
+    },
+    memory: null,
+    taste: null,
+    skills: null,
+    permissionMode: "standard",
+    params,
+  }
+}
+
+// generateHeaders are the CLI's own (buildCommandAuthHeaders).
+const generateHeaders = (key) => ({
+  "Content-Type": "application/json",
+  "User-Agent": "cli",
+  "x-command-code-version": CLI_VERSION,
+  "x-cli-environment": "production",
+  "x-project-slug": "magpie",
+  "x-taste-learning": "false",
+  "x-session-id": session,
+  Authorization: `Bearer ${key}`,
+})
+
+// failure is the status and message for a failure, from Command Code's
+// {"error":{"type","message"}} or its text: a model the plan hasn't is a
+// 403, credits run out a 402, a window's limit a 429.
+function failure(status, text) {
+  let msg = ""
+  try {
+    const j = JSON.parse(text)
+    msg = [j?.error?.message, j?.message, typeof j?.error === "string" ? j.error : ""].find((s) => s && String(s).trim()) ?? ""
+  } catch {}
+  msg = String(msg || text || "").trim() || `HTTP ${status}`
+  if (msg.length > 600) msg = msg.slice(0, 600)
+  const low = msg.toLowerCase()
+  if (msg.includes("MODEL_NOT_IN_PLAN:")) {
+    status = 403
+    msg = "Model not in plan: " + msg.replace("MODEL_NOT_IN_PLAN:", "").trim()
+  } else if (low.includes("model_not_in_plan")) status = 403
+  else if (low.includes("premium_credits_exhausted") || low.includes("insufficient credits")) {
+    status = 402
+    msg = msg.replace("PREMIUM_CREDITS_EXHAUSTED:", "").trim()
+    if (!/credit|quota|balance|limit/i.test(msg)) msg = "out of credits: " + msg
+  } else if (msg.includes("RATE_LIMITED") || low.includes("usage limit") || low.includes("window_limit")) {
+    if (status < 400 || status === 500) status = 429
+  }
+  if (status < 400 || status > 599) status = 502
+  return { status, message: "Command Code: " + msg }
+}
+
+// streamError is an error line's status and message: a string, or
+// {message, statusCode}, whose message may hold the HTTP error it was.
+function streamError(e) {
+  let msg = typeof e === "string" ? e : e?.message ?? ""
+  let status = typeof e === "object" ? Number(e?.statusCode) || 0 : 0
+  msg ||= "Stream error"
+  const i = msg.indexOf("{")
+  if (i >= 0) {
+    try {
+      const j = JSON.parse(msg.slice(i))
+      const n = parseInt(msg.slice(0, i).trim(), 10)
+      if (n >= 400) status = n
+      if (j?.error?.message) msg = j.error.message
+    } catch {}
+  }
+  return failure(status || 500, msg)
+}
+
+const errorResponse = ({ status, message }) =>
+  new Response(JSON.stringify({ error: { message, type: "commandcode_error", code: status } }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  })
+
+// lines reads the reply a JSON object a line.
+async function* lines(body) {
+  const dec = new TextDecoder()
+  let buf = ""
+  for await (const chunk of body) {
+    buf += dec.decode(chunk, { stream: true })
+    let n
+    while ((n = buf.indexOf("\n")) >= 0) {
+      const s = buf.slice(0, n).trim()
+      buf = buf.slice(n + 1)
+      if (s) yield s
+    }
+  }
+  if (buf.trim()) yield buf.trim()
+}
+
+const FINISH = { "tool-calls": "tool_calls", length: "length", "content-filter": "content_filter" }
+
+// events turns the reply's lines into chat completion pieces: text,
+// reasoning, whole tool calls, then the finish with the usage. A reply
+// with no finish line was cut short: an error, not a shorter answer.
+async function* events(body) {
+  let tools = 0
+  let cacheWrite = 0
+  for await (const s of lines(body)) {
+    let l
+    try {
+      l = JSON.parse(s)
+    } catch {
+      continue
+    }
+    switch (l.type) {
+      case "text-delta":
+        if (l.text) yield { text: l.text }
+        break
+      case "reasoning-delta":
+        if (l.text) yield { reasoning: l.text }
+        break
+      case "tool-call": {
+        if (l.providerExecuted) break // run by the server, its result beside it
+        let input = l.input ?? l.args
+        input = typeof input === "string" ? parseArgs(input) : input ?? {}
+        yield { tool: { index: tools++, id: l.toolCallId || "call_" + randomBytes(12).toString("hex"), name: l.toolName, args: JSON.stringify(input) } }
+        break
+      }
+      case "cache-write-tokens":
+        cacheWrite = Math.max(cacheWrite, l.cacheWriteTokens ?? 0)
+        break
+      case "finish": {
+        const t = l.totalUsage ?? {}
+        const d = t.inputTokenDetails ?? {}
+        let stop = FINISH[l.finishReason] ?? "stop"
+        if (tools > 0 && stop === "stop") stop = "tool_calls"
+        const input = t.inputTokens ?? 0 // the AI SDK's counts the cache in it, as OpenAI's does
+        yield {
+          stop,
+          usage: {
+            prompt_tokens: input,
+            completion_tokens: t.outputTokens ?? 0,
+            total_tokens: input + (t.outputTokens ?? 0),
+            prompt_tokens_details: { cached_tokens: d.cacheReadTokens ?? 0, cache_write_tokens: Math.max(cacheWrite, d.cacheWriteTokens ?? 0) },
+            completion_tokens_details: { reasoning_tokens: t.outputTokenDetails?.reasoningTokens ?? 0 },
+          },
+        }
+        return
+      }
+      case "abort":
+        yield { stop: "stop" }
+        return
+      case "error":
+        yield { error: streamError(l.error) }
+        return
+    }
+  }
+  yield { error: { status: 502, message: "Command Code: the reply ended before it was complete" } }
+}
+
+// generate answers a chat completion through /alpha/generate.
+async function generate(key, chat, signal) {
+  const res = await fetch(API + "/alpha/generate", {
+    method: "POST",
+    headers: generateHeaders(key),
+    body: JSON.stringify(generateBody(chat)),
+    signal,
+  })
+  if (!res.ok) return errorResponse(failure(res.status, (await res.text()).slice(0, 1 << 20)))
+  const id = "chatcmpl-" + randomBytes(12).toString("hex")
+  const created = Math.floor(Date.now() / 1000)
+  const it = events(res.body)
+  // the first piece before the answer's status: a reply that fails
+  // straight away keeps its status
+  const first = await it.next()
+  if (first.value?.error) return errorResponse(first.value.error)
+
+  if (!chat.stream) {
+    const msg = { role: "assistant", content: "" }
+    let reasoning = ""
+    const calls = []
+    let stop = "stop"
+    let usage
+    for (let r = first; !r.done; r = await it.next()) {
+      const e = r.value
+      if (e.error) return errorResponse(e.error)
+      if (e.text) msg.content += e.text
+      if (e.reasoning) reasoning += e.reasoning
+      if (e.tool) calls.push({ id: e.tool.id, type: "function", function: { name: e.tool.name, arguments: e.tool.args } })
+      if (e.stop) [stop, usage] = [e.stop, e.usage]
+    }
+    if (reasoning) msg.reasoning_content = reasoning
+    if (calls.length) msg.tool_calls = calls
+    return Response.json({ id, object: "chat.completion", created, model: chat.model, choices: [{ index: 0, message: msg, finish_reason: stop }], ...(usage ? { usage } : {}) })
+  }
+
+  const enc = new TextEncoder()
+  const chunk = (delta, finish_reason = null, extra = {}) =>
+    enc.encode(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: chat.model, choices: [{ index: 0, delta, finish_reason }], ...extra })}\n\n`)
+  let pending = first
+  let began = false
+  const stream = new ReadableStream({
+    async pull(ctl) {
+      const r = pending ?? (await it.next())
+      pending = null
+      if (!began) {
+        began = true
+        ctl.enqueue(chunk({ role: "assistant", content: "" }))
+      }
+      if (r.done) {
+        ctl.enqueue(enc.encode("data: [DONE]\n\n"))
+        return ctl.close()
+      }
+      const e = r.value
+      if (e.text) ctl.enqueue(chunk({ content: e.text }))
+      else if (e.reasoning) ctl.enqueue(chunk({ reasoning_content: e.reasoning }))
+      else if (e.tool) ctl.enqueue(chunk({ tool_calls: [{ index: e.tool.index, id: e.tool.id, type: "function", function: { name: e.tool.name, arguments: e.tool.args } }] }))
+      else if (e.stop) ctl.enqueue(chunk({}, e.stop, e.usage ? { usage: e.usage } : {}))
+      else if (e.error) {
+        ctl.enqueue(enc.encode(`data: ${JSON.stringify({ error: { message: e.error.message, code: e.error.status } })}\n\n`))
+        ctl.close()
+      }
+    },
+    cancel() {
+      it.return?.()
+    },
+  })
+  return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } })
+}
+
+// ---- the plugin ---------------------------------------------------------------
+
+export async function CommandCodePlugin() {
+  return {
+    auth: {
+      provider: ID,
+      async loader(getAuth) {
+        const auth = await getAuth()
+        if (auth?.type !== "api" || !auth.key) return {}
+        const key = auth.key
+        const saved = auth.metadata?.plan
+        return {
+          baseURL: BASE,
+          apiKey: key,
+          headers: { "x-api-key": key },
+          // every request signed with the key, both ways Command Code
+          // takes it; a Go key's chat completions to /alpha/generate
+          async fetch(input, init = {}) {
+            const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+            const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
+            headers.set("Authorization", `Bearer ${key}`)
+            headers.set("x-api-key", key)
+            if (/\/chat\/completions$/.test(new URL(url).pathname) && (await planNow(key, saved)) === "Go") {
+              let chat
+              try {
+                const b = init.body ?? (input instanceof Request ? await input.clone().text() : undefined)
+                chat = JSON.parse(typeof b === "string" ? b : new TextDecoder().decode(b))
+              } catch {
+                return errorResponse({ status: 400, message: "Command Code: a request that isn't JSON" })
+              }
+              return generate(key, chat, init.signal)
+            }
+            return fetch(input, { ...init, headers })
+          },
+        }
+      },
+      methods: [
+        { type: "oauth", label: "Command Code (browser)", authorize: browserSignIn },
+        { type: "oauth", label: "Command Code CLI's sign-in", authorize: cliSignIn },
+        { type: "api", label: "API key (commandcode.ai/settings/keys)" },
+      ],
+    },
+    async config(config) {
+      config.provider ??= {}
+      const was = config.provider[ID] ?? {}
+      config.provider[ID] = {
+        name: "Command Code Plan",
+        npm: CHAT,
+        api: BASE,
+        ...was,
+        models: { ...Object.fromEntries(MODELS.map((m) => [m.id, configModel(m)])), ...(was.models ?? {}) },
+      }
+    },
+    // the plan's list: the Provider API's, with what each model is served
+    // on; Go's key has no Provider API, and its list is the CLI's
+    provider: {
+      id: ID,
+      async models(provider, { auth } = {}) {
+        if (auth?.type !== "api" || !auth.key) return provider.models
+        if ((await planNow(auth.key, auth.metadata?.plan)) === "Go")
+          return Object.fromEntries(GO_MODELS.map((m) => [m.id, runtimeModel(m)]))
+        try {
+          return Object.fromEntries((await liveModels(auth.key)).map((m) => [m.id, runtimeModel(m)]))
+        } catch {
+          return provider.models
+        }
+      },
+    },
+  }
+}

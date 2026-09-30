@@ -1,0 +1,11 @@
+{
+  "name": "@magpie-commuity/opencode-commandcode-auth",
+  "version": "0.1.0",
+  "description": "Command Code plans (Pro, GOAT, Max, Ultra, Go, Teams) in OpenCode and magpie",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": ["index.mjs", "README.md"],
+  "keywords": ["opencode", "opencode-plugin", "magpie", "commandcode"],
+  "license": "MIT"
+}
