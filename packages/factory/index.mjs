@@ -253,8 +253,19 @@ const orgRefused = (status, text) => status === 403 && text.toLowerCase().includ
 // the request carries what droid sends.
 function explain(status, text) {
   if (status !== 403) return ""
-  if (orgRefused(status, text)) return "the Factory account's organization changed; sign in to it again"
-  return "Factory refused this account the request; check that `droid`, signed in to the same account and organization, can use this model (an organization's model policy or the plan may not allow it), and if it can, sign in to the Factory account again"
+  if (orgRefused(status, text)) return "the Factory account's organization changed; remove the account in magpie and sign in to it again"
+  return "Factory refused this account the request; check that `droid`, signed in to the same account and organization, can use this model (an organization's model policy or the plan may not allow it), and if it can, remove the Factory account in magpie and sign in to it again"
+}
+
+// errorReply is an error as the API the request was for words one:
+// Anthropic's on /llm/a/, OpenAI's on the others.
+function errorReply(url, status, type, message, headers = new Headers()) {
+  headers.set("content-type", "application/json")
+  headers.delete("content-length")
+  headers.delete("content-encoding")
+  const anthropic = new URL(url).pathname.includes("/llm/a/")
+  const body = anthropic ? { type: "error", error: { type, message } } : { error: { message, type, code: null } }
+  return new Response(JSON.stringify(body), { status, headers })
 }
 
 // ---- sign-in ----------------------------------------------------------------
@@ -462,9 +473,11 @@ export const FactoryAuthPlugin = async ({ client }) => {
     lock = run.catch(() => {})
     return run
   }
-  // when the account last asked whoami for its org, so one whoami can't
-  // answer doesn't ask before every request
-  let asked = 0
+  // when each account last asked whoami for its org, so one whoami can't
+  // answer doesn't ask before every request, nor hold back the others
+  const asked = new Map()
+  const askedOf = (c) => asked.get(c.accountId || c.refresh || "") ?? 0
+  const ask = (c) => asked.set(c.accountId || c.refresh || "", Date.now())
 
   // account is the account getAuth reads, with what keeps its token live
   // and its org right.
@@ -483,8 +496,8 @@ export const FactoryAuthPlugin = async ({ client }) => {
     // whoami as soon as it holds a token and sends the orgId it answers
     // as X-Factory-Org-Id on every request after.
     const orgOf = async (c) => {
-      if (c.activeOrganizationId || Date.now() - asked < ASK_AGAIN) return c
-      asked = Date.now()
+      if (c.activeOrganizationId || Date.now() - askedOf(c) < ASK_AGAIN) return c
+      ask(c)
       if (await reconcile(c)) await save(c)
       return c
     }
@@ -500,7 +513,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
         } catch (e) {
           // a hiccup while the token still runs: go on with it
           if (!refused(e) && c.expires > 0 && Date.now() < c.expires) return orgOf(c)
-          if (refused(e)) throw new Error(`${c.accountId || "the account"}'s Factory sign-in has expired — sign in again (${e.message})`)
+          if (refused(e)) throw Object.assign(new Error(`${c.accountId || "the account"}'s Factory sign-in has expired — sign in again (${e.message})`), { lapsed: true })
           throw e
         }
         c.access = t.access_token
@@ -508,7 +521,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
         if (t.refresh_token) c.refresh = t.refresh_token
         // droid asks whoami again for each new token, keeping the org it names
         await reconcile(c)
-        asked = Date.now()
+        ask(c)
         await save(c)
         return c
       })
@@ -528,12 +541,12 @@ export const FactoryAuthPlugin = async ({ client }) => {
           const was = c.activeOrganizationId
           c.activeOrganizationId = ""
           if ((await reconcile(c)) && c.activeOrganizationId === was) c.activeOrganizationId = "" // whoami names the org refused: send none
-          asked = Date.now()
+          ask(c)
           await save(c)
           return true
         }
         if (!isOrg) {
-          asked = Date.now()
+          ask(c)
           if ((await reconcile(c)) && c.activeOrganizationId) {
             await save(c)
             return true
@@ -651,7 +664,15 @@ export const FactoryAuthPlugin = async ({ client }) => {
             let body = init?.body
             if (body == null && input instanceof Request && input.body) body = new Uint8Array(await input.arrayBuffer())
             if (body instanceof ReadableStream) body = new Uint8Array(await new Response(body).arrayBuffer())
-            let res = await send(input, init, body)
+            const url = input instanceof Request ? input.url : String(input)
+            let res
+            try {
+              res = await send(input, init, body)
+            } catch (e) {
+              // Factory refused to renew the sign-in: the account's own 401
+              if (e?.lapsed) return errorReply(url, 401, "authentication_error", e.message)
+              throw e
+            }
             if (res.status !== 403) return res
             let text = await res.text()
             if (await mendOrg(res.status, text).catch(() => false)) {
@@ -661,15 +682,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
             }
             const why = explain(res.status, text)
             const msg = `${apiError(text, "Forbidden")}: ${why}`
-            const headers = new Headers(res.headers)
-            headers.set("content-type", "application/json")
-            headers.delete("content-length")
-            headers.delete("content-encoding")
-            return new Response(JSON.stringify({ type: "error", error: { type: "permission_error", message: msg } }), {
-              status: res.status,
-              statusText: res.statusText,
-              headers,
-            })
+            return errorReply(url, res.status, "permission_error", msg, new Headers(res.headers))
           },
         }
       },

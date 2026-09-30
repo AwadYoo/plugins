@@ -493,8 +493,8 @@ export const MimoAuthPlugin = async ({ client }) => {
                   const p = await waitPoll(t)
                   const { creds, cookies } = await signedInWith(p, t.device)
                   return { ...toAuth(creds, cookies, Date.now()), type: "success" }
-                } catch {
-                  return { type: "failed" }
+                } catch (e) {
+                  return { type: "failed", error: e.message }
                 }
               },
             }

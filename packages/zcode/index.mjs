@@ -661,7 +661,7 @@ async function authorize(site, log) {
     instructions: `Sign in to ${SITES[site].name} in the browser; this finishes on its own.`,
     method: "auto",
     async callback() {
-      const fail = (msg) => (log(msg), { type: "failed" })
+      const fail = (msg) => (log(msg), { type: "failed", error: msg })
       for (;;) {
         await sleep(interval)
         if (Date.now() > deadline) return fail("the sign-in expired; start again")

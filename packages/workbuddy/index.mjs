@@ -243,7 +243,7 @@ async function browserSignIn(site) {
         const deadline = Date.now() + SIGN_IN_MS
         const q = encodeURIComponent(state.state)
         const token = await poll(site, `/v2/plugin/auth/token?state=${q}`, {}, [11217], deadline)
-        if (!token.accessToken) return { type: "failed" }
+        if (!token.accessToken) return { type: "failed", error: `${site.name} sent back no token` }
         let a = merge({}, token)
         const who = await poll(site, `/v2/plugin/login/account?state=${q}`, {
           Authorization: "Bearer " + a.access,
@@ -253,8 +253,8 @@ async function browserSignIn(site) {
         }, [12151], deadline)
         a.uid = who.uid ?? ""
         return success(site, a, who.nickname || who.phoneNumber || who.uid)
-      } catch {
-        return { type: "failed" }
+      } catch (e) {
+        return { type: "failed", error: e.message }
       }
     },
   }
@@ -319,7 +319,7 @@ function desktopSignIn(site) {
     method: "auto",
     async callback() {
       const d = readDesktop(site)
-      if (!d) return { type: "failed" }
+      if (!d) return { type: "failed", error: `${site.name} desktop isn't signed in` }
       return { type: "success", refresh: "", access: "", expires: 0, source: "desktop", accountId: d.name || site.name, uid: d.uid }
     },
   }

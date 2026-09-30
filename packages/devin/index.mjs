@@ -508,7 +508,7 @@ async function browserSignIn() {
     if (over) return html(200, page(false, "This sign-in is over", "Start it again."))
     if (q.get("error")) {
       const msg = q.get("error_description") || q.get("error")
-      finish({ type: "failed" })
+      finish({ type: "failed", error: msg })
       return html(200, page(false, "Sign-in didn't finish", msg))
     }
     if (q.get("state") !== state || !q.get("code")) return html(200, page(false, "This link isn't from this sign-in", "Start it again."))
@@ -518,7 +518,7 @@ async function browserSignIn() {
       finish(r)
       html(200, page(true, "You're signed in", `${r.metadata.email} is signed in. You can close this tab.`))
     } catch (e) {
-      finish({ type: "failed" })
+      finish({ type: "failed", error: e.message })
       html(200, page(false, "Sign-in didn't finish", e.message))
     }
   })
@@ -527,7 +527,7 @@ async function browserSignIn() {
     server.listen(0, "127.0.0.1", resolve)
   })
   redirect = `http://127.0.0.1:${server.address().port}/callback`
-  const timer = setTimeout(() => finish({ type: "failed" }), SIGN_IN_TIMEOUT)
+  const timer = setTimeout(() => finish({ type: "failed", error: "the sign-in timed out" }), SIGN_IN_TIMEOUT)
   done.then(() => {
     clearTimeout(timer)
     setTimeout(() => server.close(), 5_000).unref?.()
@@ -559,10 +559,12 @@ async function cliSignIn() {
     callback: async () => {
       try {
         const c = readCredentials(await readFile(path, "utf8"))
-        if (!c.windsurf_api_key) return { type: "failed" }
-        return await success(c.windsurf_api_key, (c.api_server_url || SERVER).replace(/\/+$/, ""))
-      } catch {
-        return { type: "failed" }
+        if (!c.windsurf_api_key) return { type: "failed", error: `Devin isn't signed in: ${path} has no key` }
+        const r = await success(c.windsurf_api_key, (c.api_server_url || SERVER).replace(/\/+$/, ""))
+        r.metadata.cli = true
+        return r
+      } catch (e) {
+        return { type: "failed", error: e?.code === "ENOENT" ? "Devin isn't signed in: run `devin auth login`" : e.message }
       }
     },
   }
@@ -1105,6 +1107,21 @@ async function usage(key, server) {
 
 const serverOf = (auth) => (process.env.WINDSURF_API_SERVER_URL || auth?.metadata?.server || SERVER).replace(/\/+$/, "")
 
+// live is the key and server an account has now: one taken from the CLI's
+// sign-in reads credentials.toml again, as a `devin auth login` since may
+// have changed it, and keeps the ones it was saved with while the CLI has
+// none.
+async function live(auth) {
+  if (auth?.metadata?.cli) {
+    try {
+      const c = readCredentials(await readFile(cliCredentialsPath(), "utf8"))
+      if (c.windsurf_api_key)
+        return { key: c.windsurf_api_key, server: (process.env.WINDSURF_API_SERVER_URL || c.api_server_url || SERVER).replace(/\/+$/, "") }
+    } catch {}
+  }
+  return { key: auth?.key, server: serverOf(auth) }
+}
+
 export async function DevinAuthPlugin() {
   return {
     auth: {
@@ -1127,9 +1144,9 @@ export async function DevinAuthPlugin() {
             } catch {
               return errorResponse({ status: 400, message: "Devin: a request that isn't JSON" })
             }
-            const server = serverOf(now)
-            const families = await familiesFor(now.key, server)
-            return complete({ key: now.key, server, families }, chat, init.signal)
+            const { key, server } = await live(now)
+            const families = await familiesFor(key, server)
+            return complete({ key, server, families }, chat, init.signal)
           },
         }
       },
@@ -1141,7 +1158,8 @@ export async function DevinAuthPlugin() {
       async usage(getAuth) {
         const auth = await getAuth()
         if (auth?.type !== "api" || !auth.key) return { error: "Devin isn't signed in" }
-        return usage(auth.key, serverOf(auth))
+        const { key, server } = await live(auth)
+        return usage(key, server)
       },
     },
     async config(config) {
@@ -1160,7 +1178,8 @@ export async function DevinAuthPlugin() {
       id: ID,
       async models(provider, { auth } = {}) {
         if (auth?.type !== "api" || !auth.key || !cliPath()) return provider.models
-        const families = await familiesFor(auth.key, serverOf(auth))
+        const { key, server } = await live(auth)
+        const families = await familiesFor(key, server)
         return Object.fromEntries(listed(families).map((m) => [m.id, runtimeModel(m)]))
       },
     },
@@ -1168,4 +1187,4 @@ export async function DevinAuthPlugin() {
 }
 
 // for tests
-export const _internal = { build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readCredentials, credentials, fields, frame, PB, events, frames }
+export const _internal = { live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readCredentials, credentials, fields, frame, PB, events, frames }

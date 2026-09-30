@@ -424,10 +424,10 @@ async function signIn() {
       let timer
       try {
         const cb = await Promise.race([back, new Promise((r) => (timer = setTimeout(() => r(null), SIGN_IN_TIMEOUT)))])
-        if (!cb) return { type: "failed" }
+        if (!cb) return { type: "failed", error: "the sign-in timed out" }
         return await signedInWith(privateKey, cb.uid, cb.tok, systemId)
-      } catch {
-        return { type: "failed" }
+      } catch (e) {
+        return { type: "failed", error: e.message }
       } finally {
         clearTimeout(timer)
         close()

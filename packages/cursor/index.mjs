@@ -268,7 +268,7 @@ async function browserSignIn() {
         try {
           res = await fetch(`${API}/auth/poll?uuid=${uuid}&verifier=${verifier}`, { headers, signal: AbortSignal.timeout(15_000) })
         } catch {
-          if (++errors >= 3) return { type: "failed" }
+          if (++errors >= 3) return { type: "failed", error: "couldn't reach Cursor" }
           await sleep(wait)
           continue
         }
@@ -278,12 +278,12 @@ async function browserSignIn() {
           continue
         }
         if (!res.ok) {
-          if (res.status === 403 || ++errors >= 3) return { type: "failed" }
+          if (res.status === 403 || ++errors >= 3) return { type: "failed", error: res.status === 403 ? "Cursor refused the sign-in (403)" : `Cursor's sign-in answered HTTP ${res.status}` }
           await sleep(wait)
           continue
         }
         const j = await res.json().catch(() => null)
-        if (!j?.accessToken || !("refreshToken" in j)) return { type: "failed" }
+        if (!j?.accessToken || !("refreshToken" in j)) return { type: "failed", error: "Cursor sent back no token" }
         const who = await whoIs(j.accessToken)
         return {
           type: "success",
@@ -294,7 +294,7 @@ async function browserSignIn() {
           ...(who.plan ? { plan: who.plan } : {}),
         }
       }
-      return { type: "failed" }
+      return { type: "failed", error: "the sign-in timed out" }
     },
   }
 }
@@ -309,9 +309,10 @@ async function cliSignIn() {
     async callback() {
       const tok = await cliToken()
       const exp = expiry(tok)
-      if (!tok || (exp && exp <= Date.now())) return { type: "failed" }
+      if (!tok) return { type: "failed", error: "cursor-agent isn't signed in: run `cursor-agent login`" }
+      if (exp && exp <= Date.now()) return { type: "failed", error: "cursor-agent's sign-in has run out: run `cursor-agent login` again" }
       const who = await whoIs(tok)
-      if (!who.email) return { type: "failed" }
+      if (!who.email) return { type: "failed", error: "Cursor couldn't say which account is signed in" }
       return { type: "success", access: "", refresh: CLI_MARK, expires: 0, accountId: who.email, ...(who.plan ? { plan: who.plan } : {}) }
     },
   }

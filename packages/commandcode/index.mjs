@@ -414,7 +414,7 @@ async function browserSignIn() {
         : html(200, page(false, "Sign-in didn't finish", status.error || "Start it again."))
     }
     if (path === "/cancel") {
-      finish({ state: "canceled" }, { type: "failed" })
+      finish({ state: "canceled" }, { type: "failed", error: "the sign-in was canceled" })
       return res.writeHead(204).end()
     }
     if (path !== "/callback") return res.writeHead(404).end()
@@ -444,7 +444,7 @@ async function browserSignIn() {
     if (status.state !== "waiting") return answer(false, "this sign-in is over")
     if (got.error) {
       const msg = got.error === "access_denied" ? "the sign-in was denied" : got.error_description || got.error
-      finish({ state: "failed", error: msg }, { type: "failed" })
+      finish({ state: "failed", error: msg }, { type: "failed", error: msg })
       return answer(false, msg)
     }
     if (!got.apiKey) return answer(false, "Command Code sent back no key")
@@ -453,7 +453,7 @@ async function browserSignIn() {
       finish({ state: "done", who: r.metadata.email }, r)
       answer(true, "")
     } catch (e) {
-      finish({ state: "failed", error: e.message }, { type: "failed" })
+      finish({ state: "failed", error: e.message }, { type: "failed", error: e.message })
       answer(false, e.message)
     }
   })
@@ -462,7 +462,7 @@ async function browserSignIn() {
     server.listen(0, "127.0.0.1", resolve)
   })
   const port = server.address().port
-  const timer = setTimeout(() => finish({ state: "failed", error: "the sign-in timed out" }, { type: "failed" }), SIGN_IN_TIMEOUT)
+  const timer = setTimeout(() => finish({ state: "failed", error: "the sign-in timed out" }, { type: "failed", error: "the sign-in timed out" }), SIGN_IN_TIMEOUT)
   // the browser comes back for its page after the key: the server stays
   // up a while for it
   done.then(() => {
@@ -489,13 +489,28 @@ async function cliSignIn() {
     callback: async () => {
       try {
         const a = JSON.parse(await readFile(path, "utf8"))
-        if (!String(a?.apiKey ?? "").trim()) return { type: "failed" }
-        return await success(a)
-      } catch {
-        return { type: "failed" }
+        if (!String(a?.apiKey ?? "").trim()) return { type: "failed", error: `Command Code's CLI isn't signed in: ${path} has no key` }
+        const r = await success(a)
+        r.metadata.cli = true
+        return r
+      } catch (e) {
+        return { type: "failed", error: e?.code === "ENOENT" ? "Command Code's CLI isn't signed in: run `commandcode login`" : e instanceof SyntaxError ? `${path} can't be read` : e.message }
       }
     },
   }
+}
+
+// liveKey is the key an account has now: one taken from the CLI's sign-in
+// reads the CLI's again, as a `commandcode login` since may have changed
+// it, and keeps the one it was saved with while the CLI has none.
+async function liveKey(auth) {
+  if (!auth?.metadata?.cli) return auth?.key
+  try {
+    const a = JSON.parse(await readFile(join(homedir(), ".commandcode", "auth.json"), "utf8"))
+    const k = String(a?.apiKey ?? "").trim()
+    if (k) return k
+  } catch {}
+  return auth.key
 }
 
 // ---- the Go plan: /alpha/generate ----------------------------------------------
@@ -849,7 +864,7 @@ async function generate(key, chat, signal) {
 
 // ---- the plugin ---------------------------------------------------------------
 
-export const _internal = { subsSeen, waits }
+export const _internal = { subsSeen, waits, liveKey }
 
 export async function CommandCodePlugin({ client } = {}) {
   return {
@@ -858,7 +873,7 @@ export async function CommandCodePlugin({ client } = {}) {
       async loader(getAuth) {
         const auth = await getAuth()
         if (auth?.type !== "api" || !auth.key) return {}
-        const key = auth.key
+        const key = await liveKey(auth)
         const saved = auth.metadata?.plan
         return {
           baseURL: BASE,
@@ -869,6 +884,7 @@ export async function CommandCodePlugin({ client } = {}) {
           async fetch(input, init = {}) {
             const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
             const headers = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined))
+            const key = await liveKey((await getAuth()) ?? auth)
             headers.set("Authorization", `Bearer ${key}`)
             headers.set("x-api-key", key)
             if (/\/chat\/completions$/.test(new URL(url).pathname) && (await planNow(key, saved)) === "Go") {
@@ -895,7 +911,7 @@ export async function CommandCodePlugin({ client } = {}) {
         const auth = await getAuth()
         if (auth?.type !== "api" || !auth.key) return { error: "not signed in" }
         const md = auth.metadata ?? {}
-        const { out, read } = await usage(auth.key, md.plan ? { id: md.planId ?? "", plan: md.plan } : undefined)
+        const { out, read } = await usage(await liveKey(auth), md.plan ? { id: md.planId ?? "", plan: md.plan } : undefined)
         // the plan read is saved with the key, so a start doesn't wait on
         // billing/subscriptions again, for the models, Go's endpoint or this
         if (read && (read.plan !== md.plan || read.id !== (md.planId ?? "")) && client?.auth?.set) {
@@ -923,10 +939,11 @@ export async function CommandCodePlugin({ client } = {}) {
       id: ID,
       async models(provider, { auth } = {}) {
         if (auth?.type !== "api" || !auth.key) return provider.models
-        if ((await planNow(auth.key, auth.metadata?.plan)) === "Go")
+        const key = await liveKey(auth)
+        if ((await planNow(key, auth.metadata?.plan)) === "Go")
           return Object.fromEntries(GO_MODELS.map((m) => [m.id, runtimeModel(m)]))
         try {
-          return Object.fromEntries((await liveModels(auth.key)).map((m) => [m.id, runtimeModel(m)]))
+          return Object.fromEntries((await liveModels(key)).map((m) => [m.id, runtimeModel(m)]))
         } catch {
           return provider.models
         }

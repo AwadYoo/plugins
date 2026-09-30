@@ -124,3 +124,10 @@ test("the desktop's sign-in is renewed in memory only", async () => {
   await usageOf(WorkBuddyAuthPlugin, auth, client)
   expect(calls.filter((c) => c.url.pathname.endsWith("/refresh")).length).toBe(1)
 })
+
+test("a desktop sign-in with the app signed out says why it failed", async () => {
+  const p = await WorkBuddyAIAuthPlugin({ client: {} })
+  const m = p.auth.methods.find((x) => x.label.endsWith("desktop's sign-in"))
+  const r = await (await m.authorize()).callback()
+  expect(r).toEqual({ type: "failed", error: "WorkBuddy AI desktop isn't signed in" })
+})

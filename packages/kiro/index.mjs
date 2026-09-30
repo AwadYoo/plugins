@@ -1171,7 +1171,7 @@ async function browserSignIn() {
     const q = url.searchParams
     if (!waiting) return html(200, page(false, "This sign-in is over", "Start it again."))
     const fail = (msg) => {
-      finish({ type: "failed" })
+      finish({ type: "failed", error: msg })
       html(200, page(false, "Sign-in didn't finish", msg))
     }
     if (q.get("error")) return fail(q.get("error_description") || q.get("error"))
@@ -1226,7 +1226,7 @@ async function browserSignIn() {
     html(200, page(true, "You're signed in", `${user} is signed in. You can close this tab.`))
   })
 
-  const timer = setTimeout(() => finish({ type: "failed" }), SIGN_IN_TIMEOUT)
+  const timer = setTimeout(() => finish({ type: "failed", error: "the sign-in timed out" }), SIGN_IN_TIMEOUT)
   done.then(() => {
     clearTimeout(timer)
     setTimeout(() => server.close(), 10_000).unref?.()
@@ -1251,7 +1251,7 @@ async function ownSignIn() {
     callback: async () => {
       const cli = await readCLI()
       const c = cli ?? (await readIDE())
-      if (!c) return { type: "failed" }
+      if (!c) return { type: "failed", error: "neither kiro-cli nor the Kiro IDE is signed in" }
       const who = fresh(c) ? await whoIs(c) : { email: "", plan: "" }
       return { type: "success", provider: ID, refresh: "", access: "", expires: 0, source: cli ? "kiro-cli" : "kiro-ide",
         accountId: who.email || (cli ? "kiro-cli's account" : "Kiro IDE's account"), ...(who.plan ? { plan: who.plan } : {}) }
