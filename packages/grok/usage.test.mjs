@@ -1,0 +1,74 @@
+// auth.usage tells what magpie's built-in Grok account shows
+// (internal/provider/grok_usage.go), against the CLI backend's replies as
+// its tests give them (grok_usage_test.go).
+import { afterAll, afterEach, expect, test } from "bun:test"
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { GrokAuthPlugin } from "./index.mjs"
+
+const real = globalThis.fetch
+afterEach(() => (globalThis.fetch = real))
+
+// a CLI home whose token is good for a day, so nothing renews it
+const home = mkdtempSync(join(tmpdir(), "grok-usage-"))
+afterAll(() => rmSync(home, { recursive: true, force: true }))
+const expires = new Date(Date.now() + 24 * 3600_000).toISOString()
+writeFileSync(join(home, "auth.json"), JSON.stringify({ a: { key: "tok-2", email: "g@x.ai", expires_at: expires } }))
+const auth = { type: "oauth", refresh: home, access: "tok-1", expires: 0, accountId: "g@x.ai" }
+
+async function run(a, reply) {
+  const seen = []
+  const saved = []
+  globalThis.fetch = async (url, init) => {
+    seen.push({ url: String(url), headers: init.headers })
+    return reply()
+  }
+  const client = { auth: { set: async (x) => saved.push(x) } }
+  const hooks = await GrokAuthPlugin({ client })
+  return { u: await hooks.auth.usage(async () => a), seen, saved }
+}
+
+test("SuperGrok's week and its on-demand spending; the CLI's newer token is kept", async () => {
+  const { u, seen, saved } = await run(auth, () =>
+    Response.json({
+      config: {
+        creditUsagePercent: 42.5,
+        currentPeriod: { type: "USAGE_PERIOD_TYPE_WEEKLY", start: "2026-09-21T02:17:59.504011+00:00", end: "2026-09-28T02:17:59.504011+00:00" },
+        onDemandCap: { val: 2000 },
+        onDemandUsed: { val: 500 },
+        billingPeriodEnd: "2026-09-28T02:17:59.504011+00:00",
+      },
+    }),
+  )
+  expect(u).toEqual({
+    windows: [
+      { name: "7 days", used: 42.5, span: 604800, resetsAt: "2026-09-28T02:17:59.504011+00:00" },
+      { name: "On-demand", used: 25, resetsAt: "2026-09-28T02:17:59.504011+00:00", aside: true },
+    ],
+  })
+  expect(seen).toEqual([{ url: "https://cli-chat-proxy.grok.com/v1/billing?format=credits", headers: { Authorization: "Bearer tok-2", Accept: "application/json" } }])
+  expect(saved).toEqual([{ path: { id: "grok" }, body: { ...auth, access: "tok-2", expires: Date.parse(expires), accountId: "g@x.ai" } }])
+})
+
+test("a month with no on-demand cap is one window", async () => {
+  const { u, saved } = await run({ ...auth, access: "tok-2", expires: Date.parse(expires) }, () =>
+    Response.json({ config: { currentPeriod: { type: "USAGE_PERIOD_TYPE_MONTHLY", end: "2026-10-01T00:00:00+00:00" }, onDemandCap: { val: 0 } } }),
+  )
+  expect(u).toEqual({ windows: [{ name: "Month", used: 0, span: 2592000, resetsAt: "2026-10-01T00:00:00+00:00" }] })
+  expect(saved).toEqual([])
+})
+
+test("no current period: the billing period's Allowance; an unknown one has no span", async () => {
+  let { u } = await run(auth, () => Response.json({ config: { creditUsagePercent: 7, billingPeriodEnd: "2026-10-05T00:00:00Z" } }))
+  expect(u).toEqual({ windows: [{ name: "Allowance", used: 7, resetsAt: "2026-10-05T00:00:00Z" }] })
+  ;({ u } = await run(auth, () => Response.json({ config: { currentPeriod: { type: "USAGE_PERIOD_TYPE_HOURLY", end: "soon" } } })))
+  expect(u).toEqual({ windows: [{ name: "Allowance", used: 0 }] })
+})
+
+test("a refused token is the status magpie says; no sign-in says to sign in", async () => {
+  expect((await run(auth, () => new Response("", { status: 401 }))).u).toEqual({ error: "Unauthorized", windows: [] })
+  const { u, seen } = await run({ ...auth, refresh: join(home, "none") }, () => Response.json({}))
+  expect(u).toEqual({ error: "Grok is not signed in; run `grok login`", windows: [] })
+  expect(seen).toEqual([])
+})

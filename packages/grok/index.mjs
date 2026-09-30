@@ -12,6 +12,7 @@ import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync } f
 import { homedir } from "node:os"
 import { delimiter, dirname, isAbsolute, join } from "node:path"
 import { randomBytes } from "node:crypto"
+import { STATUS_CODES } from "node:http"
 
 const PROVIDER = "grok"
 const BASE = "https://cli-chat-proxy.grok.com/v1"
@@ -340,6 +341,42 @@ async function current() {
   }
 }
 
+// ---- usage ----------------------------------------------------------------------
+
+// How much of the subscription's allowance is gone, as magpie's built-in
+// Grok account shows it (internal/provider/grok_usage.go) and the CLI's own
+// /usage reads it: the credits of the current period, weekly for
+// SuperGrok, and what on-demand spending has used of its cap.
+
+const PERIODS = { DAILY: ["1 day", 24 * 3600], WEEKLY: ["7 days", 7 * 24 * 3600], MONTHLY: ["Month", 30 * 24 * 3600] }
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})$/
+
+// statusText is a refused request's status as magpie says it (Go's
+// http.StatusText).
+const statusText = (s) =>
+  ({ 413: "Request Entity Too Large", 414: "Request URI Too Long", 416: "Requested Range Not Satisfiable", 418: "I'm a teapot", 509: "" })[s] ?? STATUS_CODES[s] ?? ""
+
+async function usage(key) {
+  const res = await fetch(`${BASE}/billing?format=credits`, {
+    headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+    signal: AbortSignal.timeout(15_000),
+  })
+  if (!res.ok) return { error: statusText(res.status), windows: [] }
+  const cfg = (await res.json())?.config ?? {}
+  const num = (v) => (typeof v === "number" ? v : 0)
+  let [name, span] = ["Allowance", 0]
+  let end = cfg.billingPeriodEnd
+  if (cfg.currentPeriod) {
+    ;[name, span] = PERIODS[String(cfg.currentPeriod.type ?? "").replace(/^USAGE_PERIOD_TYPE_/, "")] ?? ["Allowance", 0]
+    end = cfg.currentPeriod.end
+  }
+  const at = typeof end === "string" && RFC3339.test(end) && !Number.isNaN(Date.parse(end)) ? { resetsAt: end } : {}
+  const out = [{ name, used: num(cfg.creditUsagePercent), ...(span ? { span } : {}), ...at }]
+  const cap = num(cfg.onDemandCap?.val)
+  if (cap > 0) out.push({ name: "On-demand", used: (100 * num(cfg.onDemandUsed?.val)) / cap, ...at, aside: true })
+  return { windows: out }
+}
+
 // ---- the plugin ---------------------------------------------------------------
 
 export const GrokAuthPlugin = async ({ client }) => {
@@ -409,6 +446,19 @@ export const GrokAuthPlugin = async ({ client }) => {
           authorize: current,
         },
       ],
+      // magpie's: how much of the subscription's allowance is gone
+      async usage(getAuth) {
+        const auth = await getAuth()
+        let c
+        try {
+          if (!auth || auth.type !== "oauth" || !auth.refresh) throw new Error("Grok is not signed in; run `grok login`")
+          c = await token(auth.refresh, false)
+        } catch (e) {
+          return { error: e.message, windows: [] }
+        }
+        await remember(auth, c)
+        return usage(c.key)
+      },
     },
 
     provider: {
