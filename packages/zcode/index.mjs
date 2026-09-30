@@ -282,13 +282,18 @@ const isNum = (v) => typeof v === "number" && Number.isFinite(v)
 
 // limitWindows are /api/monitor/usage/quota/limit's limits as windows: what
 // is used of the whole when both are told (the whole less what remains, or
-// the current value), else the percentage given.
+// the current value), else the percentage given. TIME_LIMIT is the month's
+// MCP tool calls, which ZCode shows but never stops the models on, so it is
+// set aside, as is a limit whose whole is told as 0: no cap (an older
+// plan's), which the vendor may still give as 100% used.
 function limitWindows(d) {
   const out = []
   for (const x of d?.limits ?? []) {
     const span = spanOf(Math.trunc(Number(x?.unit) || 0), x?.number)
     const w = { name: windowName(span), used: 0 }
+    if (String(x?.type ?? "").toUpperCase() === "TIME_LIMIT") (w.name = "MCP · Month"), (w.aside = true)
     if (isNum(x?.percentage)) w.used = x.percentage
+    if (x?.usage === 0) (w.used = 0), (w.aside = true)
     if (isNum(x?.usage) && x.usage > 0) {
       const total = x.usage
       if (isNum(x.remaining)) {

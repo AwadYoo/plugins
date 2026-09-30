@@ -78,7 +78,7 @@ test("windows, names and terms as Go reads them", () => {
     { name: "Weekly", used: 25, display: "200 / 800", span: 604800 },
     { name: "0 hours", used: 7.5, span: 1800 },
     { name: "3 days", used: 0, span: 3 * 86400 },
-    { name: "Monthly", used: 0, span: 30 * 86400 },
+    { name: "Monthly", used: 0, aside: true, span: 30 * 86400 }, // a whole of 0: no cap
     { name: "Credits", used: 0 },
   ])
   // Beijing times: the next renewal, auto or not; else the valid span's end
@@ -89,6 +89,32 @@ test("windows, names and terms as Go reads them", () => {
     .toEqual({ until: "2026-10-18T04:00:00.000Z", renew: "off" })
   expect(_internal.termOf([{ status: "VALID", autoRenew: true, valid: "2026-09-18-2026-10-18" }])).toEqual({})
   expect(_internal.termOf([{ status: "VALID", valid: "2026-09-18 - 2026-10-18" }])).toEqual({ until: "2026-10-17T16:00:00.000Z", renew: "off" })
+})
+
+// Go's TestZCodeNoMonthlyCap (#366): the month's MCP tool calls are named
+// and set aside as the built-in's are, so an older plan's uncapped month,
+// told as 100% used, never reads as the account run out
+test("the month's MCP calls: named and set aside, an uncapped month nothing used", () => {
+  const reset = Date.now() + 3 * 3600_000
+  const month = Date.now() + 20 * 86400_000
+  expect(_internal.limitWindows({ level: "pro", limits: [
+    { type: "TOKENS_LIMIT", unit: 3, number: 5, percentage: 0, nextResetTime: reset },
+    { type: "TIME_LIMIT", unit: 5, number: 1, usage: 0, currentValue: 0, remaining: 0, percentage: 100, nextResetTime: month },
+  ] })).toEqual([
+    { name: "5 hours", used: 0, resetsAt: new Date(reset).toISOString(), span: 5 * 3600 },
+    { name: "MCP · Month", used: 0, aside: true, resetsAt: new Date(month).toISOString(), span: 30 * 86400 },
+  ])
+  // capped and used up: still shown as used, still aside
+  const ws = _internal.limitWindows({ limits: [
+    { type: "TOKENS_LIMIT", unit: 3, number: 5, percentage: 10, nextResetTime: reset },
+    { type: "TOKENS_LIMIT", unit: 6, number: 1, percentage: 30, nextResetTime: month },
+    { type: "TIME_LIMIT", unit: 5, number: 1, usage: 100, currentValue: 100, remaining: 0, percentage: 100, nextResetTime: month },
+  ] })
+  expect(ws.map((w) => [w.name, w.used, !!w.aside, w.display])).toEqual([
+    ["5 hours", 10, false, undefined],
+    ["Weekly", 30, false, undefined],
+    ["MCP · Month", 100, true, "100 / 100"],
+  ])
 })
 
 // a Start Plan with one bucket, GLM-5.1's tokens for the day, a quarter used
