@@ -324,7 +324,9 @@ function serverTime(v) {
 // ---- the plugin -------------------------------------------------------------
 
 export const MimoAuthPlugin = async ({ client }) => {
-  let renewing = null
+  // renewals under way, one to an account: two accounts signing on at
+  // once each keep their own session
+  const renewing = new Map()
 
   const save = async (auth) => {
     try {
@@ -339,8 +341,10 @@ export const MimoAuthPlugin = async ({ client }) => {
     const a = fromAuth(await getAuth())
     if (!a) throw new Error("Xiaomi MiMo: not signed in")
     if (!force && Object.keys(a.cookies).length && Date.now() < a.expires) return a
-    if (!renewing) {
-      renewing = (async () => {
+    const who = String(a.creds.userId ?? "")
+    let r = renewing.get(who)
+    if (!r) {
+      r = (async () => {
         try {
           const s = await session(a.creds, a.creds.base)
           const issued = Date.now()
@@ -352,10 +356,11 @@ export const MimoAuthPlugin = async ({ client }) => {
           throw e
         }
       })().finally(() => {
-        renewing = null
+        renewing.delete(who)
       })
+      renewing.set(who, r)
     }
-    return renewing
+    return r
   }
 
   // page asks the MiMo server for one of the account's pages, signing on

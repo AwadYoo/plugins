@@ -76,6 +76,34 @@ test("the allowance unread leaves the plan alone; a refused sign-in says so", as
   expect(await p.usage()).toEqual({ error: "42: the Xiaomi MiMo sign-in has expired — sign in again" })
 })
 
+test("two accounts signing on at once each keep their own session", async () => {
+  const stale = (uid, host) => ({
+    type: "oauth",
+    refresh: JSON.stringify({ userId: uid, passToken: "pt-" + uid, deviceId: "d", base: `https://${host}/api` }),
+    access: JSON.stringify({ serviceToken: "old-" + uid }),
+    expires: 0,
+    accountId: uid,
+  })
+  const asked = []
+  globalThis.fetch = async (url, init = {}) => {
+    const u = new URL(String(url))
+    if (u.pathname.endsWith("/user/xiaomi/me")) {
+      await new Promise((r) => setTimeout(r, 30))
+      const uid = u.host[0].toUpperCase()
+      return new Response(JSON.stringify({ code: 0, data: { userId: uid } }), { headers: { "set-cookie": `serviceToken=st-${uid}; Path=/` } })
+    }
+    asked.push(`${u.host} ${new Headers(init.headers).get("Cookie")}`)
+    return u.pathname.endsWith("/self") ? json({ code: 0, data: { current: { title: "plan of " + u.host } } }) : json(USAGE)
+  }
+  const hooks = await MimoAuthPlugin({ client: { auth: { set: async () => {} } } })
+  const A = stale("A", "a.example"),
+    B = stale("B", "b.example")
+  const [a, b] = await Promise.all([hooks.auth.usage(async () => A), hooks.auth.usage(async () => B)])
+  expect(a.plan).toBe("plan of a.example")
+  expect(b.plan).toBe("plan of b.example")
+  for (const x of asked) expect(x).toContain(x.startsWith("a.") ? "serviceToken=st-A" : "serviceToken=st-B")
+})
+
 test("a failure is the page's and the server's word", async () => {
   let p = await plugin(account(), () => json({ code: 10001, msg: "no such user" }))
   expect(await p.usage()).toEqual({ error: "Xiaomi MiMo /user/xiaomi/subscription/self: code 10001 no such user" })
