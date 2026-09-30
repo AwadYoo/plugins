@@ -84,6 +84,16 @@ test("WorkBuddy's refusals are the card's error", async () => {
   expect(await usageOf(WorkBuddyAuthPlugin, null)).toEqual({ error: "not signed in" })
 })
 
+// Go's http.StatusText has words for every status WorkBuddy may give, and
+// the card must never get an empty error
+test("any refused status is an error with words", async () => {
+  const auth = { type: "oauth", access: "a", expires: later(), uid: "u" }
+  for (const [status, said] of [[409, "Conflict"], [402, "Payment Required"], [422, "Unprocessable Entity"], [501, "Not Implemented"], [520, "HTTP 520"], [302, "Found"]]) {
+    serve({ "/billing/meter/get-user-resource-summary": () => new Response("", { status }) })
+    expect([status, await usageOf(WorkBuddyAuthPlugin, auth)]).toEqual([status, { error: said }])
+  }
+})
+
 test("a token near its end is renewed and saved, as the loader does", async () => {
   const sets = []
   const calls = serve({
