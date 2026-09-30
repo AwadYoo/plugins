@@ -560,9 +560,113 @@ function errorBody(wire, status, message) {
 const errorResponse = (wire, status, message) =>
   new Response(JSON.stringify(errorBody(wire, status, message)), { status, headers: { "content-type": "application/json" } })
 
+// said tells whether one of the provider's own events says anything —
+// text, reasoning, a call, a finish — rather than only framing the reply,
+// as magpie's decoders tell a reply begun from its lead (message_start,
+// response.created, a role-only chunk).
+function said(wire, ev) {
+  if (!ev || typeof ev !== "object") return true
+  switch (wire) {
+    case "anthropic":
+      switch (ev.type) {
+        case "message_start":
+        case "ping":
+        case "content_block_stop":
+          return false
+        case "content_block_start":
+          return !["text", "thinking", "redacted_thinking"].includes(ev.content_block?.type) || !!(ev.content_block?.text || ev.content_block?.thinking)
+        case "content_block_delta": {
+          const d = ev.delta ?? {}
+          return !(d.text === "" || d.thinking === "" || d.partial_json === "")
+        }
+      }
+      return true
+    case "responses":
+      switch (ev.type) {
+        case "response.created":
+        case "response.in_progress":
+        case "response.queued":
+        case "response.content_part.added":
+        case "response.reasoning_summary_part.added":
+          return false
+        case "response.output_item.added":
+          return !["message", "reasoning"].includes(ev.item?.type)
+        case "response.output_text.delta":
+        case "response.reasoning_summary_text.delta":
+        case "response.reasoning_text.delta":
+          return ev.delta !== ""
+      }
+      return true
+    case "chat":
+      if (ev.error) return true
+      if (!Array.isArray(ev.choices)) return false // usage alone
+      return ev.choices.some((c) => {
+        const d = c?.delta ?? {}
+        return !!(c?.finish_reason || d.content || d.reasoning_content || d.reasoning || d.tool_calls?.length)
+      })
+    case "gemini":
+      if (ev.error) return true
+      return (ev.candidates ?? []).some((c) => c?.finishReason || (c?.content?.parts ?? []).some((p) => p?.text || p?.functionCall || p?.thought))
+  }
+  return true
+}
+
+// eventError is the message of an error the provider's own stream carries
+// (Anthropic's error event, a failed response, a chat or Gemini chunk's
+// error), undefined for any other event.
+function eventError(wire, ev) {
+  if (!ev || typeof ev !== "object") return undefined
+  if (wire === "anthropic" && ev.type === "error") return String(ev.error?.message ?? "")
+  if (wire === "responses") {
+    if (["response.completed", "response.incomplete", "response.failed"].includes(ev.type) && ev.response?.error) return String(ev.response.error.message ?? "")
+    if (ev.type === "error") return String((ev.error ? ev.error.message : ev.message) ?? "")
+    return undefined
+  }
+  if ((wire === "chat" || wire === "gemini") && ev.error) return String(ev.error?.message ?? "")
+  return undefined
+}
+
 // streamed turns Zed's lines into the provider's own server-sent events.
-function streamed(wire, res) {
+// What comes before the reply says anything is held, as magpie's built-in
+// holds it (relayStatus): a failure there — a failed status, the
+// provider's own error event, a reply that broke off or ended without an
+// answer — is answered as a refused request with its status (a 429, a 402
+// is another account's turn), not a 200 whose stream carries it.
+async function streamed(wire, res) {
   const wrapped = !!res.headers.get("x-zed-server-supports-status-messages")
+  const it = lines(res.body, wrapped)
+  const head = []
+  let ended = false
+  let first = null // the first line that says something
+  try {
+    for (;;) {
+      const r = await it.next()
+      if (r.done) break
+      const l = r.value
+      if (l.ended) {
+        ended = true
+        continue
+      }
+      if (l.failed) {
+        let status = failedStatus(l.failed.code)
+        if (status < 400 || status > 599) status = 502
+        return errorResponse(wire, status, l.failed.message || l.failed.code)
+      }
+      const bad = eventError(wire, l.event)
+      if (bad !== undefined) return errorResponse(wire, 502, bad)
+      if (said(wire, l.event)) {
+        first = l
+        break
+      }
+      head.push(l.event)
+    }
+  } catch (e) {
+    return errorResponse(wire, 502, String(e?.message ?? e).replace(/^Zed: /, ""))
+  }
+  if (!first) {
+    if (wrapped && !ended) return errorResponse(wire, 502, "the reply ended before it was complete")
+    return errorResponse(wire, 502, "Zed ended without an answer")
+  }
   const enc = new TextEncoder()
   const body = new ReadableStream({
     async start(ctl) {
@@ -572,9 +676,13 @@ function streamed(wire, res) {
         else if (wire === "responses") put(`event: error\ndata: ${JSON.stringify(errorBody(wire, status, message))}\n\n`)
         else put(`data: ${JSON.stringify(errorBody(wire, status, message))}\n\n`)
       }
-      let ended = false
+      for (const ev of head) put(sse(wire, ev))
+      put(sse(wire, first.event))
       try {
-        for await (const l of lines(res.body, wrapped)) {
+        for (;;) {
+          const r = await it.next()
+          if (r.done) break
+          const l = r.value
           if (l.ended) ended = true
           else if (l.failed) {
             fail(failedStatus(l.failed.code), l.failed.message || l.failed.code)
@@ -594,6 +702,7 @@ function streamed(wire, res) {
       }
     },
     cancel() {
+      it.return?.().catch?.(() => {})
       res.body?.cancel?.().catch(() => {})
     },
   })
@@ -701,8 +810,15 @@ async function whole(wire, res) {
   try {
     for await (const l of lines(res.body, wrapped)) {
       if (l.ended) ended = true
-      else if (l.failed) return errorResponse(wire, failedStatus(l.failed.code), l.failed.message || l.failed.code)
-      else events.push(l.event)
+      else if (l.failed) {
+        const n = failedStatus(l.failed.code)
+        return errorResponse(wire, n >= 400 && n <= 599 ? n : 502, l.failed.message || l.failed.code)
+      } else {
+        // the provider's own error, as the built-in's decoders read it
+        const bad = eventError(wire, l.event)
+        if (bad !== undefined) return errorResponse(wire, 502, bad)
+        events.push(l.event)
+      }
     }
   } catch (e) {
     return errorResponse(wire, 502, String(e?.message ?? e).replace(/^Zed: /, ""))
@@ -860,4 +976,4 @@ export async function ZedAuthPlugin({ client } = {}) {
 }
 
 // for tests
-export const _internal = { stateOf, parseModels, entry, providerRequest, wireOf, refusal, failedStatus, decrypt, padded, signedInWith, complete, vendors, tokens, lists, orgOf, who, planName, usage }
+export const _internal = { said, eventError, stateOf, parseModels, entry, providerRequest, wireOf, refusal, failedStatus, decrypt, padded, signedInWith, complete, vendors, tokens, lists, orgOf, who, planName, usage }
