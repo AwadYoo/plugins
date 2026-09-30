@@ -2,7 +2,7 @@
 // (internal/provider/cursor_usage.go), against Cursor's replies as its tests
 // give them (cursor_usage_test.go).
 import { afterEach, expect, test } from "bun:test"
-import { CursorAuthPlugin } from "./index.mjs"
+import { CursorAuthPlugin, _internal } from "./index.mjs"
 
 const real = globalThis.fetch
 afterEach(() => (globalThis.fetch = real))
@@ -11,6 +11,9 @@ afterEach(() => (globalThis.fetch = real))
 const jwt = (exp) => ["e30", Buffer.from(JSON.stringify({ exp })).toString("base64url"), "sig"].join(".")
 const tok = jwt(Math.floor(Date.now() / 1000) + 3600)
 const auth = { type: "oauth", access: tok, refresh: "", expires: 0, accountId: "a@b.c" }
+// a sign-in of its own, so no plan asked before is remembered for it
+let n = 0
+const fresh = () => ({ ...auth, access: jwt(Math.floor(Date.now() / 1000) + 7200 + ++n) })
 
 const firstParty = ["grok-4.7-xhigh-fast", "cursor-grok-4.7-high-fast", "cursor-grok-4.6-high-fast", "grok-4.5-fast-high", "auto", "default", "composer-2.5", "COMPOSER-2.5-FAST", "composer"]
 const bucketed = ["future-first-party", "grok-4.8-high", "cursor-grok-4.8-xhigh-fast"]
@@ -21,7 +24,7 @@ async function run(a, reply) {
   const seen = []
   globalThis.fetch = async (url, init) => {
     seen.push({ url: String(url), method: init.method, headers: init.headers, body: init.body })
-    return reply()
+    return reply(String(url))
   }
   const hooks = await CursorAuthPlugin()
   return { u: await hooks.auth.usage(async () => a, provider), seen }
@@ -36,18 +39,21 @@ function counts(w, model) {
   return true
 }
 
+const PERIOD = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage"
+const PLAN = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetPlanInfo"
+
 test("the period's three windows, reset at the cycle's end", async () => {
-  const { u, seen } = await run(auth, () =>
-    Response.json({ billingCycleEnd: "1792833042000", planUsage: { autoPercentUsed: 12.5, apiPercentUsed: 40, totalPercentUsed: 20 } }),
+  const { u, seen } = await run(auth, (url) =>
+    url === PLAN
+      ? Response.json({ planInfo: { planName: "Pro" } })
+      : Response.json({ billingCycleEnd: "1792833042000", planUsage: { autoPercentUsed: 12.5, apiPercentUsed: 40, totalPercentUsed: 20 } }),
   )
-  expect(seen).toEqual([
-    {
-      url: "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
-      method: "POST",
-      headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
-      body: "{}",
-    },
-  ])
+  expect(seen.find((r) => r.url === PERIOD)).toEqual({
+    url: PERIOD,
+    method: "POST",
+    headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
+    body: "{}",
+  })
   const at = new Date(1792833042000).toISOString()
   expect(u.windows.map(({ models, notModels, ...w }) => w)).toEqual([
     { name: "Cursor Models", used: 12.5, resetsAt: at },
@@ -55,7 +61,27 @@ test("the period's three windows, reset at the cycle's end", async () => {
     { name: "Total", used: 20, resetsAt: at, aside: true },
   ])
   expect(u.error).toBeUndefined()
-  expect(u.plan).toBeUndefined() // the sign-in's, as magpie's
+})
+
+test("the card names the plan as cursor-agent about does (GetPlanInfo's planName), asked once an hour", async () => {
+  const a = fresh()
+  const reply = (url) =>
+    url === PLAN ? Response.json({ planInfo: { planName: "Pro+" } }) : Response.json({ planUsage: { autoPercentUsed: 1, apiPercentUsed: 2, totalPercentUsed: 3 } })
+  const first = await run(a, reply)
+  expect(first.u.plan).toBe("Pro+")
+  const plan = first.seen.find((r) => r.url === PLAN)
+  expect(plan.method).toBe("POST")
+  expect(plan.headers.Authorization).toBe(`Bearer ${a.access}`)
+  const again = await run(a, reply)
+  expect(again.u.plan).toBe("Pro+")
+  expect(again.seen.map((r) => r.url)).toEqual([PERIOD])
+})
+
+test("a plan Cursor doesn't say leaves the card's plan out", async () => {
+  const a = fresh()
+  const { u } = await run(a, (url) => (url === PLAN ? new Response("no", { status: 500 }) : Response.json({ planUsage: { autoPercentUsed: 1 } })))
+  expect(u.plan).toBeUndefined()
+  expect(u.windows.length).toBe(3)
 })
 
 for (const bucket of [["default", "composer-2.5", "cursor-grok-4.5-high", "future-first-party", "Grok-4.8"], undefined]) {
@@ -74,15 +100,39 @@ for (const bucket of [["default", "composer-2.5", "cursor-grok-4.5-high", "futur
 }
 
 test("an enterprise plan's spend is no window", async () => {
-  expect((await run(auth, () => Response.json({ spendLimitUsage: {} }))).u).toEqual({ windows: [] })
+  expect((await run(fresh(), () => Response.json({ spendLimitUsage: {} }))).u).toEqual({ windows: [] })
 })
 
 test("a refused token is the status magpie says", async () => {
-  expect((await run(auth, () => new Response("no", { status: 401 }))).u).toEqual({ error: "Unauthorized", windows: [] })
+  expect((await run(fresh(), () => new Response("no", { status: 401 }))).u).toEqual({ error: "Unauthorized", windows: [] })
 })
 
 test("a run-out sign-in says so, and asks nothing", async () => {
   const { u, seen } = await run({ ...auth, access: jwt(1) }, () => Response.json({}))
   expect(u).toEqual({ error: "Cursor's sign-in has run out; sign in to Cursor again", windows: [] })
   expect(seen).toEqual([])
+})
+
+// magpie marks a plugin's account lapsed on any 401, so only a sign-in
+// that is gone says 401
+test("an expired token is a lapsed sign-in; an expired trial is not", () => {
+  const { failure } = _internal
+  const says = (msg) => failure(400, JSON.stringify({ code: "failed_precondition", message: msg }))
+  expect(says("Your access token has expired").status).toBe(401)
+  expect(says("Session expired, please log in again").status).toBe(401)
+  expect(says("Your free trial has expired").status).toBe(502)
+  expect(says("This link has expired").status).toBe(502)
+})
+
+// the gateway names the provider before a plugin's error
+test("an error doesn't name Cursor again", () => {
+  const f = _internal.failure(429, JSON.stringify({ code: "resource_exhausted", message: "slow down" }))
+  expect(f).toEqual({ status: 429, message: "usage limit reached: slow down" })
+})
+
+test("a model list Cursor couldn't give fails, not shrinks to the configured few", async () => {
+  globalThis.fetch = async () => new Response("down", { status: 503 })
+  const hooks = await CursorAuthPlugin()
+  const configured = { models: { auto: { id: "auto" } } }
+  await expect(hooks.provider.models(configured, { auth: fresh() })).rejects.toThrow()
 })

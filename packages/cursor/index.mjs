@@ -207,6 +207,23 @@ async function whoIs(tok) {
   }
 }
 
+// plans are the plan each token's account is on, as `cursor-agent about`
+// names it (GetPlanInfo's planName, magpie's card title), asked again after
+// an hour.
+const plans = new Map()
+const PLAN_TTL = 3600_000
+async function planOf(tok) {
+  const had = plans.get(tok)
+  if (had && Date.now() - had.at < PLAN_TTL) return had.plan
+  try {
+    const plan = String((await unary(API, "aiserver.v1.DashboardService/GetPlanInfo", tok))?.planInfo?.planName ?? "").trim()
+    if (plan) plans.set(tok, { plan, at: Date.now() })
+    return plan || had?.plan || ""
+  } catch {
+    return had?.plan ?? ""
+  }
+}
+
 // exchanged are API keys' tokens, by the key's hash.
 const exchanged = new Map()
 
@@ -222,9 +239,9 @@ async function keyToken(key) {
     body: "{}",
     signal: AbortSignal.timeout(15_000),
   }).catch((e) => {
-    throw Object.assign(new Error("Cursor: couldn't reach the API: " + e.message), { status: 502 })
+    throw Object.assign(new Error("couldn't reach Cursor's API: " + e.message), { status: 502 })
   })
-  if (res.status >= 500) throw Object.assign(new Error(`Cursor: exchange_user_api_key: HTTP ${res.status}`), { status: 502 })
+  if (res.status >= 500) throw Object.assign(new Error(`exchange_user_api_key: HTTP ${res.status}`), { status: 502 })
   const j = res.ok ? await res.json().catch(() => null) : null
   if (!j?.accessToken) throw new AuthError("Cursor didn't take this API key")
   exchanged.set(h, { tok: j.accessToken, exp: expiry(j.accessToken) })
@@ -830,15 +847,21 @@ function failure(status, text) {
   return statusOf(status, f.code ?? "", msg)
 }
 
+// signInExpired is a message of a token or session run out; a trial, a
+// plan or a link run out is no lapsed sign-in, and magpie marks the
+// account lapsed on a 401.
+const signInExpired = (low) => low.includes("expired") && /token|session|sign[- ]?in|log[- ]?in|auth|credential/.test(low)
+
 // statusOf is the status and words for Cursor's error of this code and
 // message. A region the team isn't served in says so, not to sign in.
 function statusOf(status, code, msg) {
   msg ||= `HTTP ${status}`
   const low = msg.toLowerCase()
-  const out = (status, message) => ({ status, message: "Cursor: " + message })
+  // magpie names the provider before the message itself
+  const out = (status, message) => ({ status, message })
   if (regional(msg)) return out(403, msg + " — Cursor serves your team only in some regions and turned this request away; signing in again won't change that")
   if (code === "permission_denied") return out(403, msg)
-  if (code === "unauthenticated" || status === 401 || low.includes("expired")) return out(401, msg + " — sign in to Cursor again")
+  if (code === "unauthenticated" || status === 401 || signInExpired(low)) return out(401, msg + " — sign in to Cursor again")
   if (code === "resource_exhausted" || low.includes("quota") || low.includes("rate limit") || low.includes("usage limit"))
     return out(429, "usage limit reached: " + msg)
   if (low.includes("too long") || low.includes("context length") || low.includes("too many tokens"))
@@ -1077,7 +1100,7 @@ function open(base, headers, signal) {
       if (done) return
       done = true
       session.destroy()
-      resolve({ error: { status: 502, message: "Cursor: " + (e?.message ?? String(e)) } })
+      resolve({ error: { status: 502, message: e?.message ?? String(e) } })
     }
     session.on("error", fail)
     const req = session.request({
@@ -1152,7 +1175,7 @@ async function runOnce({ tok, base, id, tools, conv, signal }) {
   // an error comes before anything of the answer: out of quota, a model the
   // plan doesn't have — answered with its own status
   const head = await wrapped.next()
-  if (head.done) return { error: { status: 502, message: "Cursor: an empty reply" } }
+  if (head.done) return { error: { status: 502, message: "an empty reply" } }
   if (head.value.error) {
     await wrapped.return()
     return { error: head.value.error }
@@ -1192,7 +1215,7 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
       if (f.end) {
         const e = failure(200, f.data)
         if (e.status < 200 || e.status > 299) yield { error: e }
-        else if (said === 0 && calls === 0) yield { error: { status: 502, message: "Cursor: an empty reply" } }
+        else if (said === 0 && calls === 0) yield { error: { status: 502, message: "an empty reply" } }
         else yield finish()
         return
       }
@@ -1275,13 +1298,13 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
       yield finish()
       return
     }
-    yield { error: { status: 502, message: "Cursor: the reply broke off: EOF" } }
+    yield { error: { status: 502, message: "the reply broke off: EOF" } }
   } catch (e) {
     if (calls > 0 && /EOF/.test(e?.message ?? "")) {
       yield finish()
       return
     }
-    yield { error: { status: 502, message: "Cursor: the reply broke off: " + (e?.message ?? e) } }
+    yield { error: { status: 502, message: "the reply broke off: " + (e?.message ?? e) } }
   }
 }
 
@@ -1347,7 +1370,7 @@ async function answer(auth, chat, signal) {
   try {
     tok = await tokenOf(auth)
   } catch (e) {
-    return errorResponse({ status: e.status ?? 401, message: e.message.startsWith("Cursor") ? e.message : "Cursor: " + e.message })
+    return errorResponse({ status: e.status ?? 401, message: e.message })
   }
   const model = String(chat.model ?? "")
   let raw = []
@@ -1439,13 +1462,13 @@ export async function CursorAuthPlugin() {
           async fetch(input, init = {}) {
             const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
             if (!/\/chat\/completions$/.test(new URL(url).pathname))
-              return errorResponse({ status: 404, message: "Cursor: only chat completions are served" })
+              return errorResponse({ status: 404, message: "only chat completions are served" })
             let chat
             try {
               const b = init.body ?? (input instanceof Request ? await input.clone().text() : undefined)
               chat = JSON.parse(typeof b === "string" ? b : new TextDecoder().decode(b))
             } catch {
-              return errorResponse({ status: 400, message: "Cursor: a request that isn't JSON" })
+              return errorResponse({ status: 400, message: "a request that isn't JSON" })
             }
             return answer((await getAuth()) ?? auth, chat, init.signal ?? (input instanceof Request ? input.signal : undefined))
           },
@@ -1465,7 +1488,8 @@ export async function CursorAuthPlugin() {
         } catch (e) {
           return { error: e.message, windows: [] }
         }
-        return usage(tok, Object.keys(provider?.models ?? {}))
+        const [u, plan] = await Promise.all([usage(tok, Object.keys(provider?.models ?? {})), planOf(tok)])
+        return plan ? { ...u, plan } : u
       },
     },
     async config(config) {
@@ -1488,12 +1512,10 @@ export async function CursorAuthPlugin() {
       id: ID,
       async models(provider, { auth } = {}) {
         if (!auth) return provider.models
-        try {
-          const tok = await tokenOf(auth)
-          return Object.fromEntries(offered(await usable(tok)).map((m) => [m.id, runtimeModel(m)]))
-        } catch {
-          return provider.models
-        }
+        // a list Cursor couldn't give is a failure, not the few models
+        // configured: magpie keeps the list it had
+        const tok = await tokenOf(auth)
+        return Object.fromEntries(offered(await usable(tok)).map((m) => [m.id, runtimeModel(m)]))
       },
     },
   }
