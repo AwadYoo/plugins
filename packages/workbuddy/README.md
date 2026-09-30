@@ -17,22 +17,25 @@ The package exports `WorkBuddyAuthPlugin` (`workbuddy`) and
   one WorkBuddy's desktop app opens. The plugin then asks WorkBuddy for the
   token every second until you're signed in, for 5 minutes at most. Nothing
   needs to be pasted.
-- **Desktop's sign-in.** Copies the account WorkBuddy desktop is signed in
-  to. The app's file is only read, never changed:
+- **Desktop's sign-in.** Uses the account WorkBuddy desktop is signed in
+  to. Nothing is copied: the app's file is read on each request, and never
+  changed:
   - macOS: `~/Library/Application Support/CodeBuddyExtension/Data/Public/auth/workbuddy-desktop[-ai].info`
   - Windows: `~/AppData/Local/CodeBuddyExtension/…`
   - Linux: `~/.local/share/CodeBuddyExtension/…`
 
   A sign-in the app keeps encrypted can't be read, and this way fails.
 
-The sign-in is kept as an OpenCode `oauth` auth: the access and refresh
-tokens, their expiry, the user id and the domain. OpenCode keeps it in
+A browser sign-in is kept as an OpenCode `oauth` auth: the access and
+refresh tokens, their expiry, the user id and the domain; desktop's as a
+marker, `{"type": "oauth", "source": "desktop", "accountId", "uid"}`. OpenCode keeps it in
 `auth.json`; magpie keeps it in `plugin-auth.json`. The access token is
 refreshed a minute before it ends, and the new one is saved. If the refresh
 fails, the old token is used while it lasts.
 
-If you signed in with desktop's sign-in, the refresh can rotate the
-desktop app's refresh token as well. The app then has to sign in again.
+Desktop's sign-in is refreshed only when the app hasn't refreshed it
+itself, and the new token is kept in memory, never written back, as magpie's
+built-in WorkBuddy does.
 
 ## Requests
 

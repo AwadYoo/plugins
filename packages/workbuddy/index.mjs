@@ -284,35 +284,62 @@ function desktopFile(site) {
   return join(base, "Data", "Public", "auth", site.authID + ".info")
 }
 
-// desktopSignIn copies WorkBuddy desktop's sign-in (read only; the app's
-// file is left as it is). Tokens the app keeps encrypted can't be read.
+// readDesktop is WorkBuddy desktop's sign-in as the app keeps it now, null
+// for none (or tokens the app keeps encrypted, which can't be read).
+function readDesktop(site) {
+  try {
+    const f = JSON.parse(readFileSync(desktopFile(site), "utf8"))
+    const t = f?.auth ?? {}
+    if (typeof t.accessToken !== "string" || !t.accessToken || !f?.account?.uid) return null
+    const now = Date.now()
+    const acct = f.account
+    return {
+      access: t.accessToken,
+      refresh: typeof t.refreshToken === "string" ? t.refreshToken : "",
+      expires: t.expiresAt > 0 ? t.expiresAt : t.expiresIn > 0 ? now + t.expiresIn * 1000 : 0,
+      refreshExpiresAt: t.refreshExpiresAt > 0 ? t.refreshExpiresAt : t.refreshExpiresIn > 0 ? now + t.refreshExpiresIn * 1000 : 0,
+      domain: typeof t.domain === "string" ? t.domain : "",
+      tokenType: typeof t.tokenType === "string" ? t.tokenType : "",
+      uid: acct.uid,
+      name: acct.nickname || acct.phoneNumber || acct.uid,
+    }
+  } catch {
+    return null
+  }
+}
+
+// desktopSignIn uses the account WorkBuddy desktop is signed in to: nothing
+// is copied (a copied refresh token would be the app's and the plugin's
+// both, and the first to use it would sign the other out); its file is
+// read each time, as the app keeps it.
 function desktopSignIn(site) {
   return {
     url: "",
     instructions: `Uses the account ${site.name} desktop is signed in to.`,
     method: "auto",
     async callback() {
-      try {
-        const f = JSON.parse(readFileSync(desktopFile(site), "utf8"))
-        const t = f?.auth ?? {}
-        if (typeof t.accessToken !== "string" || !t.accessToken) return { type: "failed" }
-        const now = Date.now()
-        const a = {
-          access: t.accessToken,
-          refresh: typeof t.refreshToken === "string" ? t.refreshToken : "",
-          expires: t.expiresAt > 0 ? t.expiresAt : t.expiresIn > 0 ? now + t.expiresIn * 1000 : 0,
-          refreshExpiresAt: t.refreshExpiresAt > 0 ? t.refreshExpiresAt : t.refreshExpiresIn > 0 ? now + t.refreshExpiresIn * 1000 : 0,
-          domain: typeof t.domain === "string" ? t.domain : "",
-          tokenType: typeof t.tokenType === "string" ? t.tokenType : "",
-          uid: f?.account?.uid ?? "",
-        }
-        const acct = f?.account ?? {}
-        return success(site, a, acct.nickname || acct.phoneNumber || acct.uid)
-      } catch {
-        return { type: "failed" }
-      }
+      const d = readDesktop(site)
+      if (!d) return { type: "failed" }
+      return { type: "success", refresh: "", access: "", expires: 0, source: "desktop", accountId: d.name || site.name, uid: d.uid }
     },
   }
+}
+
+// desktopHeld is what a desktop sign-in was renewed to here, by site and
+// account: kept in memory only, never written where the app keeps it.
+const desktopHeld = new Map()
+
+// current is the sign-in a stored auth names, fresh: WorkBuddy desktop's,
+// read where it keeps it, or one kept here.
+async function current(site, client, auth) {
+  if (auth?.source !== "desktop") return fresh(site, client, auth)
+  const d = readDesktop(site)
+  if (!d) throw new Error(`${site.name} desktop isn't signed in`)
+  const k = site.id + "|" + d.uid
+  const h = desktopHeld.get(k)
+  const a = await fresh(site, null, h && h.expires >= d.expires ? h : d)
+  desktopHeld.set(k, a)
+  return a
 }
 
 // ---- models -----------------------------------------------------------------
@@ -422,9 +449,9 @@ function makePlugin(site) {
       // the account's own list, when it's signed in and WorkBuddy answers;
       // else the list above
       async models(provider, { auth }) {
-        if (auth?.type !== "oauth" || !auth.access) return provider.models
+        if (auth?.type !== "oauth" || !(auth.access || auth.source)) return provider.models
         try {
-          const a = await fresh(site, client, auth)
+          const a = await current(site, client, auth)
           const ms = await liveModels(site, a)
           if (!ms.length) return provider.models
           return Object.fromEntries(ms.map((m) => [m.id, modelOf(site, provider, m)]))
@@ -444,7 +471,7 @@ function makePlugin(site) {
           async fetch(input, init) {
             let a = await getAuth()
             if (a?.type !== "oauth") throw new Error(`${site.name} isn't signed in`)
-            a = await fresh(site, client, a)
+            a = await current(site, client, a)
             const req = input instanceof Request ? input : null
             const headers = new Headers(init?.headers ?? req?.headers)
             headers.delete("authorization")
