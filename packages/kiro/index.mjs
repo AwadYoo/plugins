@@ -266,13 +266,18 @@ function regionOf(profile, signedIn) {
   return String(signedIn ?? "").startsWith("eu-") ? "eu-central-1" : "us-east-1"
 }
 
+// STATUS_TEXT is Go's http.StatusText for the answers Kiro gives.
+const STATUS_TEXT = { 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 408: "Request Timeout",
+  409: "Conflict", 413: "Request Entity Too Large", 429: "Too Many Requests", 500: "Internal Server Error", 502: "Bad Gateway",
+  503: "Service Unavailable", 504: "Gateway Timeout" }
+
 class KiroError extends Error {
   constructor(status, body) {
     let msg = ""
     try {
       msg = JSON.parse(body)?.message ?? ""
     } catch {}
-    super(msg ? `Kiro: ${msg} (${status})` : `Kiro: HTTP ${status}`)
+    super(msg ? `Kiro: ${msg} (${status})` : `Kiro: ${STATUS_TEXT[status] ?? ""}`)
     this.status = status
   }
 }
@@ -332,6 +337,38 @@ function usageLimits(a, email) {
 // "Kiro Free".
 const planName = (title) =>
   String(title ?? "").toLowerCase().split(/\s+/).filter(Boolean).map((w) => (w === "kiro" ? "Kiro" : w[0].toUpperCase() + w.slice(1))).join(" ")
+
+// goG is Go's %g of x: an exponent from a million up.
+function goG(x) {
+  const [m, e] = x.toExponential().split("e")
+  const exp = Number(e)
+  if (exp < -4 || exp >= 6) return `${m}e${exp < 0 ? "-" : "+"}${String(Math.abs(exp)).padStart(2, "0")}`
+  return String(x)
+}
+
+// usageOf is the allowance Get-Usage-Limits tells, as magpie's built-in
+// said it: the account's email, the credits of each allowance, the month's and a free trial's
+// while it runs.
+function usageOf(l) {
+  const at = (secs) => (secs > 0 ? new Date(Math.trunc(secs) * 1000).toISOString() : undefined)
+  const count = (used, limit) => used.toFixed(2).replace(/0+$/, "").replace(/\.$/, "") + " / " + goG(limit)
+  const num = (x) => (typeof x === "number" && Number.isFinite(x) ? x : 0)
+  const windows = []
+  for (const u of l?.usageBreakdownList ?? []) {
+    const t = u?.freeTrialInfo
+    if (t && String(t.freeTrialStatus ?? "").toUpperCase() === "ACTIVE" && num(t.usageLimitWithPrecision) > 0) {
+      const used = num(t.currentUsageWithPrecision), limit = num(t.usageLimitWithPrecision)
+      windows.push({ name: "Free trial", used: (100 * used) / limit, resetsAt: at(num(t.freeTrialExpiry)), display: count(used, limit) })
+    }
+    const used = num(u?.currentUsageWithPrecision), limit = num(u?.usageLimitWithPrecision)
+    if (limit <= 0) continue
+    const reset = num(u?.nextDateReset) || num(l?.nextDateReset)
+    windows.push({ name: u?.displayNamePlural || u?.displayName || "Credits", used: (100 * used) / limit, resetsAt: at(reset),
+      display: count(used, limit), span: 30 * 24 * 3600 })
+  }
+  const email = l?.userInfo?.email
+  return { plan: planName(l?.subscriptionInfo?.subscriptionTitle), ...(typeof email === "string" && email ? { user: email } : {}), windows }
+}
 
 // ---- the account, as the plugin holds it -------------------------------------------
 
@@ -1255,6 +1292,16 @@ export async function KiroAuthPlugin({ client } = {}) {
           },
         }
       },
+      // the account's credits, as magpie's built-in showed them
+      async usage(getAuth) {
+        const auth = await getAuth()
+        if (!(auth?.type === "api" && auth.key) && auth?.type !== "oauth") return { error: "not signed in" }
+        try {
+          return usageOf(await usageLimits(await creds(auth), true))
+        } catch (e) {
+          return { error: e.message }
+        }
+      },
       methods: [
         { type: "oauth", label: "Kiro (Google, GitHub, AWS Builder ID, IAM Identity Center)", authorize: browserSignIn },
         { type: "oauth", label: "Kiro CLI's or Kiro IDE's sign-in", authorize: ownSignIn },
@@ -1289,4 +1336,4 @@ export async function KiroAuthPlugin({ client } = {}) {
 }
 
 // for tests
-export const _internal = { buildKiro, events, reply, failure, toolID, thinking, readCLI, readIDE, regionOf, planName, frames }
+export const _internal = { usageOf, buildKiro, events, reply, failure, toolID, thinking, readCLI, readIDE, regionOf, planName, frames }
