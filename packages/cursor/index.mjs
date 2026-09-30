@@ -25,6 +25,7 @@
 // OpenCode speaks chat completions to it (@ai-sdk/openai-compatible); the
 // fetch here answers them.
 import http2 from "node:http2"
+import { STATUS_CODES } from "node:http"
 import { gunzipSync } from "node:zlib"
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { execFile } from "node:child_process"
@@ -317,6 +318,79 @@ async function cliSignIn() {
 }
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// ---- usage ------------------------------------------------------------------------
+//
+// How much of the plan's included usage is gone, as magpie's built-in Cursor
+// account shows it (internal/provider/cursor_usage.go): the dashboard's
+// current period, split into the Cursor Models and Other Models pools.
+
+// statusText is a refused request's status as magpie says it (Go's
+// http.StatusText).
+const statusText = (s) =>
+  ({ 413: "Request Entity Too Large", 414: "Request URI Too Long", 416: "Requested Range Not Satisfiable", 418: "I'm a teapot", 509: "" })[s] ?? STATUS_CODES[s] ?? ""
+
+const POOL_VARIANT = /-(fast|none|low|medium|high|xhigh|extra-high|max|thinking)$/
+
+// poolBase names a model's family: lower case, without cursor- and the
+// effort and speed the CLI adds to it.
+function poolBase(model) {
+  model = String(model).trim().toLowerCase()
+  if (model.startsWith("cursor-")) model = model.slice("cursor-".length)
+  for (;;) {
+    const b = model.replace(POOL_VARIANT, "")
+    if (b === model) return model
+    model = b
+  }
+}
+
+// Cursor's autoBucketModels can lag model releases: it still omitted Grok
+// 4.6/4.7 when the published Cursor Models pool already included them.
+// Keep those documented families alongside the server's exact model list.
+// See https://cursor.com/docs/models-and-pricing.
+function firstParty(model) {
+  if (model.startsWith("cursor-")) model = model.slice("cursor-".length)
+  if (model === "default" || model === "composer" || model.startsWith("composer-")) return true
+  return ["grok-4.5", "grok-4.6", "grok-4.7"].some((b) => model === b || model.startsWith(b + "-"))
+}
+
+// usage is the account's windows this billing period; an enterprise plan
+// reports spend instead, and gets none. ids are the models it can be
+// asked for, each counted by the pool Cursor bills it to.
+async function usage(tok, ids) {
+  const res = await fetch(API + "/aiserver.v1.DashboardService/GetCurrentPeriodUsage", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${tok}`, "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
+    body: "{}",
+    signal: AbortSignal.timeout(15_000),
+  })
+  if (!res.ok) return { error: statusText(res.status), windows: [] }
+  const data = await res.json()
+  const u = data?.planUsage
+  if (!u) return { windows: [] }
+  const ms = /^[+-]?\d+$/.test(data.billingCycleEnd ?? "") ? Number(data.billingCycleEnd) : 0
+  const resets = ms > 0 ? { resetsAt: new Date(ms).toISOString() } : {}
+  const bucket = new Set((data.autoBucketModels ?? []).map(poolBase))
+  const inPool = (model) => {
+    model = poolBase(model)
+    if (model === "auto") model = "default" // the CLI's Auto is default in Cursor's API
+    // the server names a family (grok-4.8); the CLI asks for one at an
+    // effort or speed (grok-4.8-high-fast)
+    return bucket.has(model) || firstParty(model)
+  }
+  // Auto is always one, so the pool's list is never empty (which would
+  // count every model)
+  const pool = [...new Set(["auto", ...ids, ...(data.autoBucketModels ?? [])])].filter(inPool)
+  const num = (v) => (typeof v === "number" ? v : 0)
+  // the two pools fit the line; the total goes in its tooltip
+  return {
+    windows: [
+      { name: "Cursor Models", used: num(u.autoPercentUsed), ...resets, models: pool },
+      { name: "Other Models", used: num(u.apiPercentUsed), ...resets, notModels: pool },
+      { name: "Total", used: num(u.totalPercentUsed), ...resets, aside: true },
+    ],
+  }
+}
 
 // ---- models ----------------------------------------------------------------------
 //
@@ -1381,6 +1455,17 @@ export async function CursorAuthPlugin() {
         { type: "oauth", label: "cursor-agent's sign-in", authorize: cliSignIn },
         { type: "api", label: "Cursor API key (cursor.com/dashboard → Integrations)" },
       ],
+      // magpie's: how much of the plan's included usage is gone (the plan
+      // is the one the sign-in read)
+      async usage(getAuth, provider) {
+        let tok
+        try {
+          tok = await tokenOf(await getAuth())
+        } catch (e) {
+          return { error: e.message, windows: [] }
+        }
+        return usage(tok, Object.keys(provider?.models ?? {}))
+      },
     },
     async config(config) {
       config.provider ??= {}
@@ -1414,4 +1499,4 @@ export async function CursorAuthPlugin() {
 }
 
 // for tests
-export const _internal = { splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
+export const _internal = { poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
