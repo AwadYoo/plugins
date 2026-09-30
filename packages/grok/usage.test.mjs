@@ -5,7 +5,7 @@ import { afterAll, afterEach, expect, test } from "bun:test"
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { GrokAuthPlugin } from "./index.mjs"
+import { GrokAuthPlugin, _internal } from "./index.mjs"
 
 const real = globalThis.fetch
 afterEach(() => (globalThis.fetch = real))
@@ -71,4 +71,48 @@ test("a refused token is the status magpie says; no sign-in says to sign in", as
   const { u, seen } = await run({ ...auth, refresh: join(home, "none") }, () => Response.json({}))
   expect(u).toEqual({ error: "Grok is not signed in; run `grok login`", windows: [] })
   expect(seen).toEqual([])
+})
+
+// grok_usage.go gives the card Go's error for a request that got no
+// answer or JSON that won't read; the plugin said nothing and threw
+test("a fetch that fails is the card's error, worded for magpie's keepLast", async () => {
+  const url = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+  const fail = (e) => () => { throw e }
+  const cases = [
+    [Object.assign(new TypeError("Unable to connect. Is the computer able to access the url?"), { code: "ConnectionRefused" }), "connection refused"],
+    [Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:443"), { code: "ECONNREFUSED" }), "connection refused"],
+    [Object.assign(new Error("getaddrinfo ENOTFOUND cli-chat-proxy.grok.com"), { code: "ENOTFOUND" }), "no such host"],
+    [new DOMException("The operation timed out.", "TimeoutError"), "timeout"],
+    [new TypeError("fetch failed"), "EOF"],
+  ]
+  for (const [e, said] of cases) {
+    const { u } = await run(auth, fail(e))
+    expect(u.windows).toEqual([])
+    expect(u.error.startsWith(`Get "${url}": `)).toBe(true)
+    expect(u.error).toMatch(/no such host|connection refused|timeout|EOF|Service Unavailable/)
+    expect(u.error).toContain(said)
+  }
+})
+
+test("a reply that isn't JSON is the card's error, as Go's encoding/json says it", async () => {
+  expect((await run(auth, () => new Response("<html>oops</html>"))).u).toEqual({ error: "invalid character '<' looking for beginning of value", windows: [] })
+  expect((await run(auth, () => new Response(""))).u).toEqual({ error: "unexpected end of JSON input", windows: [] })
+})
+
+test("a status Go has no words for still says something", async () => {
+  expect((await run(auth, () => new Response("", { status: 509 }))).u).toEqual({ error: "HTTP 509", windows: [] })
+})
+
+test("a model list Grok couldn't give fails, not falls back to the configured few", async () => {
+  globalThis.fetch = async () => new Response("down", { status: 503 })
+  const hooks = await GrokAuthPlugin({ client: { auth: { set: async () => {} } } })
+  await expect(hooks.provider.models({ id: "grok", models: { "grok-4.7": { id: "grok-4.7" } } }, { auth })).rejects.toThrow()
+})
+
+test("a body in bytes is reshaped as a string one is", () => {
+  const { rewrite, bodyText } = _internal
+  const chat = { model: "grok-4.7", tools: [{ type: "function", name: "f" }, { type: "custom", name: "apply_patch" }] }
+  const want = rewrite(JSON.stringify(chat))
+  expect(JSON.parse(want).tools.length).toBe(1)
+  for (const b of [Buffer.from(JSON.stringify(chat)), new TextEncoder().encode(JSON.stringify(chat))]) expect(rewrite(bodyText(b))).toBe(want)
 })

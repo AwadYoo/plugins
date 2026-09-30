@@ -174,6 +174,13 @@ async function sign(headers, key) {
   headers.set("User-Agent", `grok-shell/${v} (${os}; ${arch})`)
 }
 
+// bodyText is a request body handed over as bytes read as the text it
+// is, so it can be reshaped; any other body is as it came.
+function bodyText(body) {
+  if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) return new TextDecoder().decode(body)
+  return body
+}
+
 // rewrite leaves out what Grok's backend doesn't take: tools of other
 // types (a freeform apply_patch, a namespace of sub-agent tools), a web
 // search's external_web_access, a tool_choice naming a dropped type, and a
@@ -353,16 +360,52 @@ const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?(Z|[+-]\d{2}:\d{2})
 
 // statusText is a refused request's status as magpie says it (Go's
 // http.StatusText).
+// http.StatusText); one Go has no words for is "HTTP <n>", never empty.
 const statusText = (s) =>
-  ({ 413: "Request Entity Too Large", 414: "Request URI Too Long", 416: "Requested Range Not Satisfiable", 418: "I'm a teapot", 509: "" })[s] ?? STATUS_CODES[s] ?? ""
+  ((GO_TEXT[s] ?? STATUS_CODES[s]) || `HTTP ${s}`)
+// where Go's words differ from Node's (509 Go has none for)
+const GO_TEXT = { 413: "Request Entity Too Large", 414: "Request URI Too Long", 416: "Requested Range Not Satisfiable", 418: "I'm a teapot", 509: "" }
+
+// netError is a request that got no answer, as Go's http client words it
+// (`Get "<url>": …`), with the words magpie's keepLast looks for to keep
+// the card it had: no such host, connection refused, timeout, EOF.
+function netError(url, e) {
+  const m = String(e?.message ?? e)
+  const code = String(e?.code ?? e?.cause?.code ?? "")
+  let why = m
+  if (e?.name === "TimeoutError" || e?.name === "AbortError" || /timed? ?out/i.test(m)) why = "timeout"
+  else if (code === "ENOTFOUND" || code === "EAI_AGAIN" || /getaddrinfo|ENOTFOUND|resolve|DNS/i.test(m)) why = "dial tcp: lookup: no such host"
+  else if (code === "ECONNREFUSED" || /ECONNREFUSED|Unable to connect|refused/i.test(m)) why = "dial tcp: connection refused"
+  else if (/ECONNRESET|socket|closed|fetch failed/i.test(m + code)) why = "EOF"
+  return `Get "${url}": ${why}`
+}
+
+// jsonError is JSON that won't read, as Go's encoding/json says it.
+function jsonError(text) {
+  const c = text.trimStart()[0]
+  return c === undefined ? "unexpected end of JSON input" : `invalid character '${c}' looking for beginning of value`
+}
 
 async function usage(key) {
-  const res = await fetch(`${BASE}/billing?format=credits`, {
-    headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
-    signal: AbortSignal.timeout(15_000),
-  })
+  const url = `${BASE}/billing?format=credits`
+  let res, text
+  try {
+    res = await fetch(url, {
+      headers: { Authorization: `Bearer ${key}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(15_000),
+    })
+    if (res.ok) text = await res.text()
+  } catch (e) {
+    return { error: netError(url, e), windows: [] }
+  }
   if (!res.ok) return { error: statusText(res.status), windows: [] }
-  const cfg = (await res.json())?.config ?? {}
+  let data
+  try {
+    data = JSON.parse(text)
+  } catch {
+    return { error: jsonError(text), windows: [] }
+  }
+  const cfg = data?.config ?? {}
   const num = (v) => (typeof v === "number" ? v : 0)
   let [name, span] = ["Allowance", 0]
   let end = cfg.billingPeriodEnd
@@ -411,7 +454,7 @@ export const GrokAuthPlugin = async ({ client }) => {
             const home = auth?.refresh
             if (!home) throw new Error("Grok is not signed in; run `grok login`")
             const req = new Request(input, init)
-            const body = rewrite(init?.body)
+            const body = rewrite(bodyText(init?.body))
             let parsed = {}
             if (typeof body === "string") {
               try {
@@ -466,12 +509,9 @@ export const GrokAuthPlugin = async ({ client }) => {
       async models(provider, { auth } = {}) {
         const have = provider?.models ?? {}
         if (!auth || auth.type !== "oauth" || !auth.refresh) return have
-        let list
-        try {
-          list = await listModels((await token(auth.refresh, false)).key)
-        } catch {
-          return have
-        }
+        // a list Grok couldn't give is a failure, not the few configured:
+        // magpie keeps the list it had
+        const list = await listModels((await token(auth.refresh, false)).key)
         const base = have["grok-4.7"] ?? Object.values(have)[0] ?? {}
         const out = {}
         for (const m of list) {
@@ -498,3 +538,6 @@ export const GrokAuthPlugin = async ({ client }) => {
     },
   }
 }
+
+// for tests
+export const _internal = { rewrite, bodyText }
