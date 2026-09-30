@@ -855,7 +855,7 @@ const signInExpired = (low) => low.includes("expired") && /token|session|sign[- 
 // statusOf is the status and words for Cursor's error of this code and
 // message. A region the team isn't served in says so, not to sign in.
 function statusOf(status, code, msg) {
-  msg ||= `HTTP ${status}`
+  msg ||= statusText(status) || `HTTP ${status}`
   const low = msg.toLowerCase()
   // magpie names the provider before the message itself
   const out = (status, message) => ({ status, message })
