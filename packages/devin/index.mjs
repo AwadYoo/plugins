@@ -1,0 +1,1121 @@
+// Devin subscriptions for OpenCode and magpie: the devin CLI's own sign-in
+// (a PKCE round through app.devin.ai to a callback on 127.0.0.1), and each
+// chat completion sent whole to the API the CLI talks to, Windsurf's
+// GetChatMessage (a Connect RPC in protobuf), its reply streamed back as
+// chat completion chunks. Ported from magpie's built-in Devin account
+// (internal/provider/devin*.go, internal/gateway/devin.go).
+
+import { createHash, randomBytes, randomUUID } from "node:crypto"
+import { createServer } from "node:http"
+import { gunzipSync } from "node:zlib"
+import { spawn } from "node:child_process"
+import { existsSync, statSync } from "node:fs"
+import { mkdir, readFile, writeFile } from "node:fs/promises"
+import { homedir } from "node:os"
+import { join } from "node:path"
+
+const ID = "devin"
+const CHAT = "@ai-sdk/openai-compatible"
+
+const SERVER = "https://server.codeium.com"
+const AUTHORIZE = "https://app.devin.ai/auth/cli/continue"
+const EXCHANGE = "/exa.seat_management_pb.SeatManagementService/ExchangeDevinCLIPKCECode"
+const CHAT_RPC = "/exa.api_server_pb.ApiServerService/GetChatMessage"
+// the CLI the requests say they come from
+const CLI_VERSION = "3000.11.3"
+// the AI SDK is given a chat completions URL; the loader's fetch answers
+// every request itself, so nothing is ever sent here
+const BASE = SERVER + "/devin/v1"
+const SIGN_IN_TIMEOUT = 10 * 60 * 1000
+// how long the CLI's model list is kept, and how long a failed read waits
+const FRESH = 5 * 60 * 1000
+const RETRY = 60 * 1000
+
+// ---- models ---------------------------------------------------------------------
+
+// Devin's list as `devin models list --format json` gave it (2026-09-30),
+// less Adaptive and Fusion, which route between models inside Devin's own
+// agent and aren't served by the API: family id, label, aliases, and each
+// variant's id, label, context and output. The CLI's list, when the CLI is
+// installed, replaces it.
+const SNAPSHOT = [
+  ["swe-2","SWE-2",["swe"],[["swe-2-high","SWE-2 High",262000,128000],["swe-2-medium","SWE-2 Medium",262000,128000],["swe-2-max","SWE-2 Max",262000,128000]]],
+  ["swe-1.7-lightning","SWE-1.7 Lightning",[],[["swe-1-7-lightning","SWE-1.7 Lightning Max",202752,96000],["swe-1-7-lightning-medium","SWE-1.7 Lightning Medium",202752,96000]]],
+  ["claude-fable-5-1","Claude Fable 5.1",["fable"],[["claude-fable-5-1-medium","Claude Fable 5.1 Medium",1000000,128000],["claude-fable-5-1-low","Claude Fable 5.1 Low",1000000,128000],["claude-fable-5-1-high","Claude Fable 5.1 High",1000000,128000],["claude-fable-5-1-xhigh","Claude Fable 5.1 XHigh",1000000,128000],["claude-fable-5-1-max","Claude Fable 5.1 Max",1000000,128000]]],
+  ["claude-opus-5-5","Claude Opus 5.5",[],[["claude-opus-5-5-medium","Claude Opus 5.5 Medium",1000000,128000],["claude-opus-5-5-low","Claude Opus 5.5 Low",1000000,128000],["claude-opus-5-5-high","Claude Opus 5.5 High",1000000,128000],["claude-opus-5-5-xhigh","Claude Opus 5.5 XHigh",1000000,128000],["claude-opus-5-5-max","Claude Opus 5.5 Max",1000000,128000],["claude-opus-5-5-low-fast","Claude Opus 5.5 Low Fast",1000000,128000],["claude-opus-5-5-medium-fast","Claude Opus 5.5 Medium Fast",1000000,128000],["claude-opus-5-5-high-fast","Claude Opus 5.5 High Fast",1000000,128000],["claude-opus-5-5-xhigh-fast","Claude Opus 5.5 XHigh Fast",1000000,128000],["claude-opus-5-5-max-fast","Claude Opus 5.5 Max Fast",1000000,128000]]],
+  ["gpt-6-astra","GPT-6 Astra",[],[["gpt-6-astra-medium","GPT-6 Astra Medium Thinking",1000000,128000],["gpt-6-astra-low","GPT-6 Astra Low Thinking",1000000,128000],["gpt-6-astra-high","GPT-6 Astra High Thinking",1000000,128000],["gpt-6-astra-xhigh","GPT-6 Astra XHigh Thinking",1000000,128000],["gpt-6-astra-max","GPT-6 Astra Max Thinking",1000000,128000],["gpt-6-astra-low-priority","GPT-6 Astra Low Thinking Fast",1000000,128000],["gpt-6-astra-medium-priority","GPT-6 Astra Medium Thinking Fast",1000000,128000],["gpt-6-astra-high-priority","GPT-6 Astra High Thinking Fast",1000000,128000],["gpt-6-astra-xhigh-priority","GPT-6 Astra XHigh Thinking Fast",1000000,128000],["gpt-6-astra-max-priority","GPT-6 Astra Max Thinking Fast",1000000,128000]]],
+  ["gpt-6-sol","GPT-6 Sol",[],[["gpt-6-sol-medium","GPT-6 Sol Medium Thinking",1000000,128000],["gpt-6-sol-none","GPT-6 Sol No Thinking",1000000,128000],["gpt-6-sol-low","GPT-6 Sol Low Thinking",1000000,128000],["gpt-6-sol-high","GPT-6 Sol High Thinking",1000000,128000],["gpt-6-sol-xhigh","GPT-6 Sol XHigh Thinking",1000000,128000],["gpt-6-sol-max","GPT-6 Sol Max Thinking",1000000,128000],["gpt-6-sol-none-priority","GPT-6 Sol No Thinking Fast",1000000,128000],["gpt-6-sol-low-priority","GPT-6 Sol Low Thinking Fast",1000000,128000],["gpt-6-sol-medium-priority","GPT-6 Sol Medium Thinking Fast",1000000,128000],["gpt-6-sol-high-priority","GPT-6 Sol High Thinking Fast",1000000,128000],["gpt-6-sol-xhigh-priority","GPT-6 Sol XHigh Thinking Fast",1000000,128000],["gpt-6-sol-max-priority","GPT-6 Sol Max Thinking Fast",1000000,128000]]],
+  ["gpt-6-luna","GPT-6 Luna",[],[["gpt-6-luna-medium","GPT-6 Luna Medium Thinking",1000000,128000],["gpt-6-luna-none","GPT-6 Luna No Thinking",1000000,128000],["gpt-6-luna-low","GPT-6 Luna Low Thinking",1000000,128000],["gpt-6-luna-high","GPT-6 Luna High Thinking",1000000,128000],["gpt-6-luna-xhigh","GPT-6 Luna XHigh Thinking",1000000,128000],["gpt-6-luna-max","GPT-6 Luna Max Thinking",1000000,128000],["gpt-6-luna-none-priority","GPT-6 Luna No Thinking Fast",1000000,128000],["gpt-6-luna-low-priority","GPT-6 Luna Low Thinking Fast",1000000,128000],["gpt-6-luna-medium-priority","GPT-6 Luna Medium Thinking Fast",1000000,128000],["gpt-6-luna-high-priority","GPT-6 Luna High Thinking Fast",1000000,128000],["gpt-6-luna-xhigh-priority","GPT-6 Luna XHigh Thinking Fast",1000000,128000],["gpt-6-luna-max-priority","GPT-6 Luna Max Thinking Fast",1000000,128000]]],
+  ["kimi-k3","Kimi K3",[],[["kimi-k3-high","Kimi K3 High",1048576,131072],["kimi-k3-low","Kimi K3 Low",1048576,131072],["kimi-k3-max","Kimi K3 Max",1048576,131072]]],
+  ["glm-5.2","GLM-5.2",[],[["glm-5-2","GLM-5.2 High",200000,128000],["glm-5-2-max","GLM-5.2 Max",200000,128000],["glm-5-2-1m","GLM-5.2 High 1M",1000000,128000],["glm-5-2-max-1m","GLM-5.2 Max 1M",1000000,128000],["glm-5-2-none","GLM-5.2 No Thinking",200000,128000],["glm-5-2-none-1m","GLM-5.2 No Thinking 1M",1000000,128000]]],
+  ["glm-5-3","GLM-5.3",[],[["glm-5-3-low","GLM-5.3 Low",1048576,128000],["glm-5-3-high","GLM-5.3 High",1048576,128000],["glm-5-3-max","GLM-5.3 Max",1048576,128000]]],
+  ["claude-sonnet-5-5","Claude Sonnet 5.5",[],[["claude-sonnet-5-5-medium","Claude Sonnet 5.5 Medium",1000000,128000],["claude-sonnet-5-5-low","Claude Sonnet 5.5 Low",1000000,128000],["claude-sonnet-5-5-high","Claude Sonnet 5.5 High",1000000,128000],["claude-sonnet-5-5-xhigh","Claude Sonnet 5.5 XHigh",1000000,128000],["claude-sonnet-5-5-max","Claude Sonnet 5.5 Max",1000000,128000]]],
+  ["gemini-3-8-flash","Gemini 3.8 Flash",["gemini"],[["gemini-3-8-flash-medium","Gemini 3.8 Flash Medium",1048576,65535],["gemini-3-8-flash-low","Gemini 3.8 Flash Low",1048576,65535],["gemini-3-8-flash-high","Gemini 3.8 Flash High",1048576,65535]]],
+  ["claude-opus-4.7","Claude Opus 4.7",[],[["claude-opus-4-7-medium","Claude Opus 4.7 Medium",1000000,128000],["claude-opus-4-7-low","Claude Opus 4.7 Low",1000000,128000],["claude-opus-4-7-high","Claude Opus 4.7 High",1000000,128000],["claude-opus-4-7-xhigh","Claude Opus 4.7 XHigh",1000000,128000],["claude-opus-4-7-max","Claude Opus 4.7 Max",1000000,128000]]],
+  ["claude-opus-4.8","Claude Opus 4.8",[],[["claude-opus-4-8-medium","Claude Opus 4.8 Medium",1000000,128000],["claude-opus-4-8-low","Claude Opus 4.8 Low",1000000,128000],["claude-opus-4-8-high","Claude Opus 4.8 High",1000000,128000],["claude-opus-4-8-xhigh","Claude Opus 4.8 XHigh",1000000,128000],["claude-opus-4-8-max","Claude Opus 4.8 Max",1000000,128000],["claude-opus-4-8-low-fast","Claude Opus 4.8 Low Fast",1000000,128000],["claude-opus-4-8-medium-fast","Claude Opus 4.8 Medium Fast",1000000,128000],["claude-opus-4-8-high-fast","Claude Opus 4.8 High Fast",1000000,128000],["claude-opus-4-8-xhigh-fast","Claude Opus 4.8 XHigh Fast",1000000,128000],["claude-opus-4-8-max-fast","Claude Opus 4.8 Max Fast",1000000,128000]]],
+  ["claude-opus-5","Claude Opus 5",["opus"],[["claude-opus-5-medium","Claude Opus 5 Medium",1000000,128000],["claude-opus-5-low","Claude Opus 5 Low",1000000,128000],["claude-opus-5-high","Claude Opus 5 High",1000000,128000],["claude-opus-5-xhigh","Claude Opus 5 XHigh",1000000,128000],["claude-opus-5-max","Claude Opus 5 Max",1000000,128000],["claude-opus-5-low-fast","Claude Opus 5 Low Fast",1000000,128000],["claude-opus-5-medium-fast","Claude Opus 5 Medium Fast",1000000,128000],["claude-opus-5-high-fast","Claude Opus 5 High Fast",1000000,128000],["claude-opus-5-xhigh-fast","Claude Opus 5 XHigh Fast",1000000,128000],["claude-opus-5-max-fast","Claude Opus 5 Max Fast",1000000,128000]]],
+  ["claude-5-fable","Claude Fable 5",[],[["claude-5-fable-low","Claude Fable 5 Low",1000000,128000],["claude-5-fable-medium","Claude Fable 5 Medium",1000000,128000],["claude-5-fable-high","Claude Fable 5 High",1000000,128000],["claude-5-fable-xhigh","Claude Fable 5 XHigh",1000000,128000],["claude-5-fable-max","Claude Fable 5 Max",1000000,128000]]],
+  ["claude-sonnet-5","Claude Sonnet 5",["claude","sonnet"],[["claude-sonnet-5-low","Claude Sonnet 5 Low",1000000,128000],["claude-sonnet-5-medium","Claude Sonnet 5 Medium",1000000,128000],["claude-sonnet-5-high","Claude Sonnet 5 High",1000000,128000],["claude-sonnet-5-xhigh","Claude Sonnet 5 XHigh",1000000,128000],["claude-sonnet-5-max","Claude Sonnet 5 Max",1000000,128000]]],
+  ["gemini-3.5-flash","Gemini 3.5 Flash",[],[["gemini-3-5-flash-minimal","Gemini 3.5 Flash Minimal",1048576,65535],["gemini-3-5-flash-low","Gemini 3.5 Flash Low",1048576,65535],["gemini-3-5-flash-medium","Gemini 3.5 Flash Medium",1048576,65535],["gemini-3-5-flash-high","Gemini 3.5 Flash High",1048576,65535]]],
+  ["gemini-3.6-flash","Gemini 3.6 Flash",[],[["gemini-3-6-flash-minimal","Gemini 3.6 Flash Minimal",1048576,65535],["gemini-3-6-flash-low","Gemini 3.6 Flash Low",1048576,65535],["gemini-3-6-flash-medium","Gemini 3.6 Flash Medium",1048576,65535],["gemini-3-6-flash-high","Gemini 3.6 Flash High",1048576,65535]]],
+  ["gemini-3-7-flash","Gemini 3.7 Flash",[],[["gemini-3-7-flash-low","Gemini 3.7 Flash Low",1048576,65535],["gemini-3-7-flash-medium","Gemini 3.7 Flash Medium",1048576,65535],["gemini-3-7-flash-high","Gemini 3.7 Flash High",1048576,65535]]],
+  ["gpt-5.6-sol","GPT-5.6 Sol",[],[["gpt-5-6-sol-none","GPT-5.6 Sol No Thinking",1000000,128000],["gpt-5-6-sol-low","GPT-5.6 Sol Low Thinking",1000000,128000],["gpt-5-6-sol-medium","GPT-5.6 Sol Medium Thinking",1000000,128000],["gpt-5-6-sol-high","GPT-5.6 Sol High Thinking",1000000,128000],["gpt-5-6-sol-xhigh","GPT-5.6 Sol XHigh Thinking",1000000,128000],["gpt-5-6-sol-max","GPT-5.6 Sol Max Thinking",1000000,128000],["gpt-5-6-sol-none-priority","GPT-5.6 Sol No Thinking Fast",1000000,128000],["gpt-5-6-sol-low-priority","GPT-5.6 Sol Low Thinking Fast",1000000,128000],["gpt-5-6-sol-medium-priority","GPT-5.6 Sol Medium Thinking Fast",1000000,128000],["gpt-5-6-sol-high-priority","GPT-5.6 Sol High Thinking Fast",1000000,128000],["gpt-5-6-sol-xhigh-priority","GPT-5.6 Sol XHigh Thinking Fast",1000000,128000],["gpt-5-6-sol-max-priority","GPT-5.6 Sol Max Thinking Fast",1000000,128000]]],
+  ["gpt-5.6-terra","GPT-5.6 Terra",[],[["gpt-5-6-terra-none","GPT-5.6 Terra No Thinking",1000000,128000],["gpt-5-6-terra-low","GPT-5.6 Terra Low Thinking",1000000,128000],["gpt-5-6-terra-medium","GPT-5.6 Terra Medium Thinking",1000000,128000],["gpt-5-6-terra-high","GPT-5.6 Terra High Thinking",1000000,128000],["gpt-5-6-terra-xhigh","GPT-5.6 Terra XHigh Thinking",1000000,128000],["gpt-5-6-terra-max","GPT-5.6 Terra Max Thinking",1000000,128000],["gpt-5-6-terra-none-priority","GPT-5.6 Terra No Thinking Fast",1000000,128000],["gpt-5-6-terra-low-priority","GPT-5.6 Terra Low Thinking Fast",1000000,128000],["gpt-5-6-terra-medium-priority","GPT-5.6 Terra Medium Thinking Fast",1000000,128000],["gpt-5-6-terra-high-priority","GPT-5.6 Terra High Thinking Fast",1000000,128000],["gpt-5-6-terra-xhigh-priority","GPT-5.6 Terra XHigh Thinking Fast",1000000,128000],["gpt-5-6-terra-max-priority","GPT-5.6 Terra Max Thinking Fast",1000000,128000]]],
+  ["gpt-5.6-luna","GPT-5.6 Luna",[],[["gpt-5-6-luna-none","GPT-5.6 Luna No Thinking",1000000,128000],["gpt-5-6-luna-low","GPT-5.6 Luna Low Thinking",1000000,128000],["gpt-5-6-luna-medium","GPT-5.6 Luna Medium Thinking",1000000,128000],["gpt-5-6-luna-high","GPT-5.6 Luna High Thinking",1000000,128000],["gpt-5-6-luna-xhigh","GPT-5.6 Luna XHigh Thinking",1000000,128000],["gpt-5-6-luna-max","GPT-5.6 Luna Max Thinking",1000000,128000],["gpt-5-6-luna-none-priority","GPT-5.6 Luna No Thinking Fast",1000000,128000],["gpt-5-6-luna-low-priority","GPT-5.6 Luna Low Thinking Fast",1000000,128000],["gpt-5-6-luna-medium-priority","GPT-5.6 Luna Medium Thinking Fast",1000000,128000],["gpt-5-6-luna-high-priority","GPT-5.6 Luna High Thinking Fast",1000000,128000],["gpt-5-6-luna-xhigh-priority","GPT-5.6 Luna XHigh Thinking Fast",1000000,128000],["gpt-5-6-luna-max-priority","GPT-5.6 Luna Max Thinking Fast",1000000,128000]]],
+  ["gpt-6-1-sol","GPT-6.1 Sol",[],[["gpt-6-1-sol-low","GPT-6.1 Sol Low Thinking",1000000,128000],["gpt-6-1-sol-medium","GPT-6.1 Sol Medium Thinking",1000000,128000],["gpt-6-1-sol-high","GPT-6.1 Sol High Thinking",1000000,128000],["gpt-6-1-sol-xhigh","GPT-6.1 Sol XHigh Thinking",1000000,128000],["gpt-6-1-sol-max","GPT-6.1 Sol Max Thinking",1000000,128000],["gpt-6-1-sol-low-priority","GPT-6.1 Sol Low Thinking Fast",1000000,128000],["gpt-6-1-sol-medium-priority","GPT-6.1 Sol Medium Thinking Fast",1000000,128000],["gpt-6-1-sol-high-priority","GPT-6.1 Sol High Thinking Fast",1000000,128000],["gpt-6-1-sol-xhigh-priority","GPT-6.1 Sol XHigh Thinking Fast",1000000,128000],["gpt-6-1-sol-max-priority","GPT-6.1 Sol Max Thinking Fast",1000000,128000]]],
+  ["grok-4.5","Grok 4.5",[],[["grok-4-5-low","Grok 4.5 Low",500000,100000],["grok-4-5-medium","Grok 4.5 Medium",500000,100000],["grok-4-5-high","Grok 4.5 High",500000,100000]]],
+  ["grok-4-6","Grok 4.6",[],[["grok-4-6-low","Grok 4.6 Low",500000,100000],["grok-4-6-medium","Grok 4.6 Medium",500000,100000],["grok-4-6-high","Grok 4.6 High",500000,100000],["grok-4-6-xhigh","Grok 4.6 XHigh",500000,100000]]],
+  ["grok-4-7","Grok 4.7",[],[["grok-4-7-low","Grok 4.7 Low",500000,100000],["grok-4-7-medium","Grok 4.7 Medium",500000,100000],["grok-4-7-high","Grok 4.7 High",500000,100000],["grok-4-7-xhigh","Grok 4.7 XHigh",500000,100000]]],
+  ["inkling","Inkling",[],[["inkling-none","Inkling None",1048576,131072],["inkling-low","Inkling Low",1048576,131072],["inkling-medium","Inkling Medium",1048576,131072],["inkling-high","Inkling High",1048576,131072],["inkling-xhigh","Inkling X-High",1048576,131072],["inkling-max","Inkling Max",1048576,131072]]],
+  ["glm-5-3-flash","GLM-5.3 Flash",[],[["glm-5-3-flash-low","GLM-5.3 Flash Low",1000000,128000],["glm-5-3-flash-high","GLM-5.3 Flash High",1000000,128000],["glm-5-3-flash-max","GLM-5.3 Flash Max",1000000,128000]]],
+  ["deepseek-v4-flash","DeepSeek V4 Flash",[],[["deepseek-v4-flash-high","DeepSeek V4 Flash High",1048576,384000],["deepseek-v4-flash-max","DeepSeek V4 Flash Max",1048576,384000]]],
+  ["deepseek-v4-1-flash","DeepSeek V4.1 Flash",[],[["deepseek-v4-1-flash-high","DeepSeek V4.1 Flash High",1048576,384000],["deepseek-v4-1-flash-max","DeepSeek V4.1 Flash Max",1048576,384000]]],
+  ["swe-1.7","SWE-1.7",[],[["swe-1-7","SWE-1.7 Max",262000,128000],["swe-1-7-medium","SWE-1.7 Medium",262000,128000]]],
+  ["claude-opus-4.6","Claude Opus 4.6",[],[["claude-opus-4-6","Claude Opus 4.6",200000,128000],["claude-opus-4-6-thinking","Claude Opus 4.6 Thinking",200000,128000],["claude-opus-4-6-1m","Claude Opus 4.6 1M",1000000,128000],["claude-opus-4-6-thinking-1m","Claude Opus 4.6 Thinking 1M",1000000,128000]]],
+  ["gpt-5.4","GPT-5.4",[],[["gpt-5-4-none","GPT-5.4 No Thinking",272000,128000],["gpt-5-4-low","GPT-5.4 Low Thinking",272000,128000],["gpt-5-4-medium","GPT-5.4 Medium Thinking",272000,128000],["gpt-5-4-high","GPT-5.4 High Thinking",272000,128000],["gpt-5-4-xhigh","GPT-5.4 XHigh Thinking",272000,128000],["gpt-5-4-none-priority","GPT-5.4 No Thinking Fast",272000,128000],["gpt-5-4-low-priority","GPT-5.4 Low Thinking Fast",272000,128000],["gpt-5-4-medium-priority","GPT-5.4 Medium Thinking Fast",272000,128000],["gpt-5-4-high-priority","GPT-5.4 High Thinking Fast",272000,128000],["gpt-5-4-xhigh-priority","GPT-5.4 XHigh Thinking Fast",272000,128000]]],
+  ["gpt-5.5","GPT-5.5",["gpt"],[["gpt-5-5-none","GPT-5.5 No Thinking",272000,128000],["gpt-5-5-low","GPT-5.5 Low Thinking",272000,128000],["gpt-5-5-medium","GPT-5.5 Medium Thinking",272000,128000],["gpt-5-5-high","GPT-5.5 High Thinking",272000,128000],["gpt-5-5-xhigh","GPT-5.5 XHigh Thinking",272000,128000],["gpt-5-5-none-priority","GPT-5.5 No Thinking Fast",272000,128000],["gpt-5-5-low-priority","GPT-5.5 Low Thinking Fast",272000,128000],["gpt-5-5-medium-priority","GPT-5.5 Medium Thinking Fast",272000,128000],["gpt-5-5-high-priority","GPT-5.5 High Thinking Fast",272000,128000],["gpt-5-5-xhigh-priority","GPT-5.5 XHigh Thinking Fast",272000,128000]]],
+  ["gpt-5.4-mini","GPT-5.4 Mini",[],[["gpt-5-4-mini-low","GPT-5.4 Mini Low Thinking",400000,128000],["gpt-5-4-mini-medium","GPT-5.4 Mini Medium Thinking",400000,128000],["gpt-5-4-mini-high","GPT-5.4 Mini High Thinking",400000,128000],["gpt-5-4-mini-xhigh","GPT-5.4 Mini XHigh Thinking",400000,128000]]],
+  ["claude-sonnet-4.6","Claude Sonnet 4.6",[],[["claude-sonnet-4-6","Claude Sonnet 4.6",200000,128000],["claude-sonnet-4-6-thinking","Claude Sonnet 4.6 Thinking",200000,128000],["claude-sonnet-4-6-1m","Claude Sonnet 4.6 1M",1000000,128000],["claude-sonnet-4-6-thinking-1m","Claude Sonnet 4.6 Thinking 1M",1000000,128000]]],
+  ["gpt-5.2","GPT-5.2",[],[["MODEL_GPT_5_2_LOW","GPT-5.2 Low Thinking",384000,128000],["MODEL_GPT_5_2_MEDIUM","GPT-5.2 Medium Thinking",384000,128000],["MODEL_GPT_5_2_NONE","GPT-5.2 No Thinking",384000,128000],["MODEL_GPT_5_2_HIGH","GPT-5.2 High Thinking",384000,128000],["MODEL_GPT_5_2_XHIGH","GPT-5.2 XHigh Thinking",384000,128000]]],
+  ["claude-opus-4.5","Claude Opus 4.5",[],[["MODEL_CLAUDE_4_5_OPUS","Claude Opus 4.5",200000,64000],["MODEL_CLAUDE_4_5_OPUS_THINKING","Claude Opus 4.5 Thinking",200000,64000]]],
+  ["Claude Haiku 4.5","Claude Haiku 4.5",[],[["MODEL_PRIVATE_11","Claude Haiku 4.5",200000,64000]]],
+  ["claude-sonnet-4.5","Claude Sonnet 4.5",[],[["MODEL_PRIVATE_2","Claude Sonnet 4.5",200000,64000],["MODEL_PRIVATE_3","Claude Sonnet 4.5 Thinking",200000,64000]]],
+  ["GPT-4.1","GPT-4.1",[],[["MODEL_CHAT_GPT_4_1_2025_04_14","GPT-4.1",1047576,32768]]],
+  ["gpt-5.1","GPT-5.1",[],[["MODEL_PRIVATE_12","GPT-5.1 No Thinking",272000,128000],["MODEL_PRIVATE_13","GPT-5.1 Low Thinking",272000,128000],["MODEL_PRIVATE_14","GPT-5.1 Medium Thinking",272000,128000],["MODEL_PRIVATE_15","GPT-5.1 High Thinking",272000,128000]]],
+  ["gpt-5.3-codex","GPT-5.3-Codex",["codex"],[["gpt-5-3-codex-low","GPT-5.3-Codex Low",400000,128000],["gpt-5-3-codex-medium","GPT-5.3-Codex Medium",400000,128000],["gpt-5-3-codex-high","GPT-5.3-Codex High",400000,128000],["gpt-5-3-codex-xhigh","GPT-5.3-Codex X-High",400000,128000],["gpt-5-3-codex-low-priority","GPT-5.3-Codex Low Fast",400000,128000],["gpt-5-3-codex-medium-priority","GPT-5.3-Codex Medium Fast",400000,128000],["gpt-5-3-codex-high-priority","GPT-5.3-Codex High Fast",400000,128000],["gpt-5-3-codex-xhigh-priority","GPT-5.3-Codex XHigh Fast",400000,128000]]],
+  ["kimi-k2.6","Kimi K2.6",[],[["kimi-k2-6","Kimi K2.6",262144,8192]]],
+  ["kimi-k2.7","Kimi K2.7",[],[["kimi-k2-7","Kimi K2.7",262144,16000]]],
+  ["nemotron-3-ultra","Nemotron 3 Ultra",[],[["nemotron-3-ultra-none","Nemotron 3 Ultra None",1000000,32768],["nemotron-3-ultra-medium","Nemotron 3 Ultra Medium",1000000,32768],["nemotron-3-ultra-high","Nemotron 3 Ultra High",1000000,32768]]],
+  ["swe-1.6","SWE-1.6",[],[["swe-1-6","SWE-1.6",200000,128000]]],
+  ["swe-1.6-fast","SWE-1.6 Fast",[],[["swe-1-6-fast","SWE-1.6 Fast",200000,128000]]],
+  ["gemini-3.1-pro","Gemini 3.1 Pro",[],[["gemini-3-1-pro-low","Gemini 3.1 Pro Low Thinking",1048576,65535],["gemini-3-1-pro-high","Gemini 3.1 Pro High Thinking",1048576,65535]]],
+  ["gemini-3.0-flash","Gemini 3 Flash",[],[["MODEL_GOOGLE_GEMINI_3_0_FLASH_MINIMAL","Gemini 3 Flash Minimal",1048576,65535],["MODEL_GOOGLE_GEMINI_3_0_FLASH_LOW","Gemini 3 Flash Low",1048576,65535],["MODEL_GOOGLE_GEMINI_3_0_FLASH_MEDIUM","Gemini 3 Flash Medium",1048576,65535],["MODEL_GOOGLE_GEMINI_3_0_FLASH_HIGH","Gemini 3 Flash High",1048576,65535]]],
+  ["deepseek-v4-pro","DeepSeek V4 Pro",[],[["deepseek-v4-pro-high","DeepSeek V4 Pro High",1048576,384000],["deepseek-v4-pro-max","DeepSeek V4 Pro Max",1048576,384000]]]
+]
+
+const familiesOf = (rows) => rows.map(([uid, label, aliases, vs]) => ({ uid, label, aliases, models: vs.map(([id, name, context, output]) => ({ id, name, context, output })) }))
+
+// parseFamilies reads `devin models list --format json`.
+function parseFamilies(text) {
+  let list
+  try {
+    list = JSON.parse(text)
+  } catch {
+    return []
+  }
+  const out = []
+  for (const f of list?.families ?? []) {
+    if (!f?.family_uid) continue
+    const low = String(f.family_uid).toLowerCase()
+    if (low === "adaptive" || low === "fusion") continue
+    out.push({
+      uid: f.family_uid,
+      label: f.family_label || f.family_uid,
+      aliases: f.aliases ?? [],
+      models: (f.variants ?? [])
+        .filter((v) => v?.model_uid)
+        .map((v) => ({ id: v.model_uid, name: v.label || v.model_uid, context: v.max_context_tokens || 0, output: v.max_output_tokens || 0 })),
+    })
+  }
+  return out
+}
+
+const LEVEL_RANK = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+// the effort words Devin's variant ids end in (swe-2-high, …_HIGH,
+// gpt-6-sol-none), and the level each is
+const LEVELS = [["none", "none"], ["xhigh", "xhigh"], ["minimal", "minimal"], ["min", "minimal"], ["low", "low"], ["medium", "medium"], ["high", "high"], ["max", "max"]]
+// the words a variant id may end in after its effort, for a quicker run of
+// the same model at it (claude-opus-5-5-high-fast)
+const TIERS = [["fast", "Fast"], ["priority", "Priority"]]
+
+// levelOf is the effort an id says it runs at, "" when it says none.
+function levelOf(id) {
+  const low = id.toLowerCase()
+  for (const [word, level] of LEVELS) if (low.endsWith("-" + word) || low.endsWith("_" + word)) return level
+  return ""
+}
+
+// tierOf is the tier an id is in and its effort: claude-opus-5-5-high-fast
+// is ["fast", "high"], swe-2-high ["", "high"]; a tier word with no effort
+// before it (swe-1-6-fast) is no tier.
+function tierOf(id) {
+  const low = id.toLowerCase()
+  for (const [word] of TIERS)
+    for (const sep of ["-", "_"])
+      if (low.endsWith(sep + word)) {
+        const l = levelOf(low.slice(0, -(sep + word).length))
+        if (l) return [word, l]
+      }
+  return ["", levelOf(id)]
+}
+
+const named = (f, id) => f.uid === id || f.aliases.includes(id)
+
+// byLevel is the family's variant at each effort, in the tier, the first
+// at each.
+function byLevel(f, tier) {
+  const out = {}
+  for (const m of f.models) {
+    const [t, l] = tierOf(m.id)
+    if (t === tier && l && m.id !== f.uid && !out[l]) out[l] = m.id
+  }
+  return out
+}
+
+const efforts = (f, tier) => {
+  const by = byLevel(f, tier)
+  return LEVEL_RANK.filter((l) => by[l])
+}
+
+const tiers = (f) => TIERS.map(([w]) => w).filter((t) => Object.keys(byLevel(f, t)).length > 0)
+
+// defaultLevel is the effort of the variant the family's id asks for when
+// none is asked (its first), medium when that names none.
+function defaultLevel(f) {
+  if (f.models.length) {
+    const [t, l] = tierOf(f.models[0].id)
+    if (!t && l) return l
+  }
+  return "medium"
+}
+
+// nearest is the one of levels nearest the one asked for, a tie going up.
+function nearest(want, levels) {
+  const at = LEVEL_RANK.indexOf(want)
+  if (at < 0 || !levels.length || levels.includes(want)) return want
+  let best = want
+  let dist = LEVEL_RANK.length
+  for (const l of levels) {
+    const i = LEVEL_RANK.indexOf(l)
+    const d = Math.abs(i - at)
+    if (d < dist || (d === dist && i > at)) [best, dist] = [l, d]
+  }
+  return best
+}
+
+// variantFor is the model to ask the API for: a family's id follows its
+// newest model, which the API takes only as one of its variants — the one
+// at the effort asked for, or the nearest the family has; with none asked,
+// the family's default. A family's fast run is its fast variant at that
+// effort. Any other id (a variant's own) goes as it is.
+function variantFor(families, model, effort) {
+  for (const f of families) {
+    if (!named(f, model) || !f.models.length) continue
+    if (effort) {
+      const id = byLevel(f, "")[nearest(effort, efforts(f, ""))]
+      if (id) return id
+    }
+    return f.models[0].id
+  }
+  for (const f of families)
+    for (const tier of tiers(f)) {
+      if (!model.endsWith("-" + tier) || !named(f, model.slice(0, -(tier.length + 1)))) continue
+      const by = byLevel(f, tier)
+      const levels = efforts(f, tier)
+      return by[nearest(effort || defaultLevel(f), levels)] || by[levels[0]]
+    }
+  return model
+}
+
+// listed is Devin's list as it is offered: each family one model, with
+// the efforts its variants are at (picked as any model's effort is, and
+// turned into the variant by variantFor), its fast run likewise, and the
+// variants at no effort (glm-5-2-1m); a family's only variant is its id.
+function listed(families) {
+  const out = []
+  const seen = new Set()
+  const add = (m) => {
+    if (seen.has(m.id)) return
+    seen.add(m.id)
+    out.push(m)
+  }
+  for (const f of families) {
+    const context = f.models.find((m) => m.context)?.context ?? 0
+    const output = f.models.find((m) => m.output)?.output ?? 0
+    add({ id: f.uid, name: f.label, context, output, efforts: efforts(f, "") })
+    for (const t of tiers(f)) {
+      const id = f.uid + "-" + t
+      if (families.some((g) => named(g, id))) continue
+      add({ id, name: f.label + " " + TIERS.find(([w]) => w === t)[1], context, output, efforts: efforts(f, t) })
+    }
+    if (f.models.length === 1) continue
+    for (const m of f.models) {
+      if (m.id === f.uid || tierOf(m.id)[1]) continue
+      add({ id: m.id, name: m.name, context: m.context || context, output: m.output || output, efforts: [] })
+    }
+  }
+  return out
+}
+
+function configModel(m) {
+  return {
+    id: m.id,
+    name: m.name,
+    tool_call: true,
+    reasoning: m.efforts.length > 0,
+    attachment: true,
+    temperature: true,
+    modalities: { input: ["text", "image"], output: ["text"] },
+    limit: { context: m.context, output: m.output },
+    ...(m.efforts.length ? { variants: Object.fromEntries(m.efforts.map((e) => [e, { reasoningEffort: e }])) } : {}),
+  }
+}
+
+function runtimeModel(m) {
+  return {
+    id: m.id,
+    providerID: ID,
+    name: m.name,
+    api: { id: m.id, url: BASE, npm: CHAT },
+    status: "active",
+    headers: {},
+    options: {},
+    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    limit: { context: m.context, output: m.output },
+    capabilities: {
+      temperature: true,
+      reasoning: m.efforts.length > 0,
+      attachment: true,
+      toolcall: true,
+      input: { text: true, image: true, audio: false, video: false, pdf: false },
+      output: { text: true, image: false, audio: false, video: false, pdf: false },
+      interleaved: false,
+    },
+    release_date: "",
+    variants: Object.fromEntries(m.efforts.map((e) => [e, { reasoningEffort: e }])),
+  }
+}
+
+// ---- the devin CLI -----------------------------------------------------------------
+
+// cliPath finds the devin CLI, "" without one.
+function cliPath() {
+  const exe = process.platform === "win32" ? "devin.exe" : "devin"
+  for (const dir of (process.env.PATH ?? "").split(process.platform === "win32" ? ";" : ":"))
+    if (dir && isFile(join(dir, exe))) return join(dir, exe)
+  for (const p of [join(homedir(), ".local", "bin", "devin"), "/usr/local/bin/devin", "/opt/homebrew/bin/devin"]) if (isFile(p)) return p
+  return ""
+}
+
+function isFile(p) {
+  try {
+    return statSync(p).isFile()
+  } catch {
+    return false
+  }
+}
+
+// cliCredentialsPath is where the CLI keeps its own sign-in.
+function cliCredentialsPath() {
+  if (process.platform === "win32" && process.env.APPDATA) return join(process.env.APPDATA, "devin", "credentials.toml")
+  return join(process.env.XDG_DATA_HOME || join(homedir(), ".local", "share"), "devin", "credentials.toml")
+}
+
+const tomlString = (s) => '"' + String(s).replaceAll("\\", "\\\\").replaceAll('"', '\\"') + '"'
+
+// credentials is credentials.toml as `devin auth login` writes it.
+function credentials(key, server, webapp, api) {
+  return [
+    ["windsurf_api_key", key],
+    ["api_server_url", server || SERVER],
+    ["devin_webapp_host", webapp || "app.devin.ai"],
+    ["devin_api_url", api || "https://api.devin.ai"],
+  ]
+    .map(([k, v]) => `${k} = ${tomlString(v)}\n`)
+    .join("")
+}
+
+// readCredentials reads the keys of a credentials.toml the CLI wrote.
+function readCredentials(text) {
+  const out = {}
+  for (const line of text.split(/\r?\n/)) {
+    const m = /^\s*([A-Za-z0-9_]+)\s*=\s*(?:"((?:[^"\\]|\\.)*)"|'([^']*)')\s*$/.exec(line)
+    if (m) out[m[1]] = m[2] !== undefined ? m[2].replace(/\\(.)/g, "$1") : m[3]
+  }
+  return out
+}
+
+// homeFor is a data folder of this plugin's own, laid out as the CLI's,
+// with the account's credentials in it: the CLI run with it as its data
+// folder answers for that account, and its own sign-in is never touched.
+async function homeFor(key, server) {
+  const base = join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "opencode-devin-auth")
+  const home = join(base, createHash("sha256").update(key).digest("hex").slice(0, 16))
+  const file = join(home, "devin", "credentials.toml")
+  if (!existsSync(file)) {
+    await mkdir(join(home, "devin"), { recursive: true, mode: 0o700 })
+    await writeFile(file, credentials(key, server), { mode: 0o600 })
+  }
+  return home
+}
+
+// runCLI runs the devin CLI, for the account in home ("" for its own),
+// with its output; it asks Devin's servers, so it has 30 seconds.
+function runCLI(home, ...args) {
+  const path = cliPath()
+  if (!path) return Promise.reject(new Error("devin is not installed"))
+  const env = { ...process.env }
+  if (home) {
+    for (const k of Object.keys(env)) if (["XDG_DATA_HOME", "APPDATA"].includes(k.toUpperCase())) delete env[k]
+    env.XDG_DATA_HOME = home
+    env.APPDATA = home
+  }
+  return new Promise((resolve, reject) => {
+    const p = spawn(path, args, { env, stdio: ["ignore", "pipe", "ignore"] })
+    let out = ""
+    p.stdout.on("data", (b) => (out += b))
+    const timer = setTimeout(() => p.kill(), 30_000)
+    p.on("error", (e) => {
+      clearTimeout(timer)
+      reject(e)
+    })
+    p.on("close", (code) => {
+      clearTimeout(timer)
+      resolve({ out, code })
+    })
+  })
+}
+
+// signedOut says the CLI's report is one of nobody signed in: it says so,
+// or Devin's servers refused the account's token.
+const signedOut = (out) => ["Not logged in", "Authentication required", "Invalid token", "try logging out and logging in again"].some((s) => out.includes(s))
+
+// parseStatus reads `devin auth status`'s report: its User's Email (or
+// Name), its Account's Tier (or Plan).
+function parseStatus(out) {
+  if (!out.includes("Logged in")) return null
+  const field = (key) => {
+    for (const l of out.split("\n")) {
+      const t = l.trim()
+      if (t.startsWith(key + ":")) return t.slice(key.length + 1).trim()
+    }
+    return ""
+  }
+  return { user: field("Email") || field("Name"), plan: field("Tier") || field("Plan") }
+}
+
+// identity is who the CLI says is signed in in home: {user, plan}, null
+// when it says nobody is, undefined when it can't tell (no CLI, no answer).
+async function identity(home) {
+  try {
+    const { out } = await runCLI(home, "auth", "status")
+    const st = parseStatus(out)
+    if (st?.user) return st
+    if (signedOut(out)) return null
+  } catch {}
+  return undefined
+}
+
+// Each account's model list as the CLI last gave it, kept FRESH; one past
+// its time is served while it is read again, one that failed is asked
+// again after RETRY.
+const lists = new Map()
+
+async function familiesFor(key, server, wait = true) {
+  let c = lists.get(key)
+  if (!c) lists.set(key, (c = { families: null, at: 0, failed: 0, asking: null }))
+  const ask = () =>
+    (c.asking ??= (async () => {
+      try {
+        const { out } = await runCLI(await homeFor(key, server), "models", "list", "--format", "json")
+        const fams = parseFamilies(out)
+        if (!fams.length) throw new Error("devin models list: no models")
+        Object.assign(c, { families: fams, at: Date.now(), failed: 0 })
+      } catch {
+        c.failed = Date.now()
+      } finally {
+        c.asking = null
+      }
+    })())
+  if (c.families) {
+    if (Date.now() - c.at >= FRESH && Date.now() - c.failed >= RETRY && cliPath()) ask()
+    return c.families
+  }
+  if (cliPath() && Date.now() - c.failed >= RETRY) {
+    const p = ask()
+    if (wait) await p
+  }
+  return c.families ?? familiesOf(SNAPSHOT)
+}
+
+// ---- signing in ----------------------------------------------------------------------
+
+function page(ok, title, text) {
+  const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c])
+  return `<!doctype html><meta charset="utf-8"><title>${esc(title)}</title>
+<style>body{font:15px system-ui,sans-serif;display:grid;place-items:center;min-height:90vh;margin:0;color:#222;background:#fafafa}
+@media (prefers-color-scheme:dark){body{color:#eee;background:#161616}}main{text-align:center;max-width:28rem;padding:1rem}
+.d{font-size:2rem;color:${ok ? "#2a9d5c" : "#c0392b"}}</style>
+<main><div class="d">${ok ? "✓" : "✕"}</div><h1>${esc(title)}</h1><p>${esc(text)}</p></main>`
+}
+
+// exchange trades the callback's code for the session token `devin auth
+// login` keeps — already shaped "devin-session-token$<jwt>" — and the
+// hosts the account is on.
+async function exchange(code, verifier, redirect) {
+  const res = await fetch(SERVER + EXCHANGE, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json" },
+    body: JSON.stringify({ code, code_verifier: verifier, redirect_uri: redirect }),
+    signal: AbortSignal.timeout(30_000),
+  })
+  const text = await res.text()
+  if (!res.ok) throw new Error(`Devin's exchange: ${res.status} ${text.slice(0, 300)}`)
+  let r = {}
+  try {
+    r = JSON.parse(text)
+  } catch {}
+  const key = r.sessionToken || r.session_token
+  if (!key) throw new Error("Devin's exchange returned no session token")
+  return { key, webapp: r.devinWebappHost, api: r.devinApiUrl }
+}
+
+// success names a key's account as the CLI does, in a data folder of the
+// plugin's own; a CLI that says nobody is signed in with it fails it, and
+// without the CLI the account is just "Devin".
+async function success(key, server) {
+  const who = await identity(await homeFor(key, server))
+  if (who === null) throw new Error("Devin didn't take the sign-in: `devin auth status` says nobody is signed in with it")
+  const metadata = { email: who?.user || "Devin" }
+  if (who?.plan) metadata.plan = who.plan
+  if (server && server !== SERVER) metadata.server = server
+  return { type: "success", provider: ID, key, metadata }
+}
+
+// browserSignIn is `devin auth login`'s round, run by the plugin: PKCE
+// through app.devin.ai, back to a callback on 127.0.0.1.
+async function browserSignIn() {
+  const verifier = randomBytes(48).toString("base64url")
+  const state = randomBytes(24).toString("base64url")
+  const challenge = createHash("sha256").update(verifier).digest("base64url")
+  let over = false
+  let settle
+  const done = new Promise((r) => (settle = r))
+  const finish = (result) => {
+    if (over) return
+    over = true
+    settle(result)
+  }
+  let redirect = ""
+  const server = createServer(async (req, res) => {
+    const url = new URL(req.url ?? "/", "http://127.0.0.1")
+    const html = (code, body) => {
+      res.writeHead(code, { "Content-Type": "text/html; charset=utf-8" })
+      res.end(body)
+    }
+    if (url.pathname !== "/callback") return res.writeHead(404).end()
+    const q = url.searchParams
+    if (over) return html(200, page(false, "This sign-in is over", "Start it again."))
+    if (q.get("error")) {
+      const msg = q.get("error_description") || q.get("error")
+      finish({ type: "failed" })
+      return html(200, page(false, "Sign-in didn't finish", msg))
+    }
+    if (q.get("state") !== state || !q.get("code")) return html(200, page(false, "This link isn't from this sign-in", "Start it again."))
+    try {
+      const x = await exchange(q.get("code"), verifier, redirect)
+      const r = await success(x.key, SERVER)
+      finish(r)
+      html(200, page(true, "You're signed in", `${r.metadata.email} is signed in. You can close this tab.`))
+    } catch (e) {
+      finish({ type: "failed" })
+      html(200, page(false, "Sign-in didn't finish", e.message))
+    }
+  })
+  await new Promise((resolve, reject) => {
+    server.once("error", reject)
+    server.listen(0, "127.0.0.1", resolve)
+  })
+  redirect = `http://127.0.0.1:${server.address().port}/callback`
+  const timer = setTimeout(() => finish({ type: "failed" }), SIGN_IN_TIMEOUT)
+  done.then(() => {
+    clearTimeout(timer)
+    setTimeout(() => server.close(), 5_000).unref?.()
+  })
+  const q = new URLSearchParams({
+    redirect_uri: redirect,
+    state,
+    prompt: "select_account",
+    code_challenge: challenge,
+    code_challenge_method: "S256",
+    cli_pkce_marker: "1",
+  })
+  return {
+    url: `${AUTHORIZE}?${q}`,
+    instructions: "Sign in to Devin in the browser.",
+    method: "auto",
+    callback: () => done,
+  }
+}
+
+// cliSignIn takes the account the devin CLI is signed in to, reading its
+// credentials.toml and changing nothing.
+async function cliSignIn() {
+  const path = cliCredentialsPath()
+  return {
+    url: "",
+    instructions: `Uses the account in ${path}.`,
+    method: "auto",
+    callback: async () => {
+      try {
+        const c = readCredentials(await readFile(path, "utf8"))
+        if (!c.windsurf_api_key) return { type: "failed" }
+        return await success(c.windsurf_api_key, (c.api_server_url || SERVER).replace(/\/+$/, ""))
+      } catch {
+        return { type: "failed" }
+      }
+    },
+  }
+}
+
+// ---- protobuf, by hand ---------------------------------------------------------------
+
+const enc = new TextEncoder()
+const dec = new TextDecoder()
+
+// pb builds a protobuf message field by field.
+class PB {
+  constructor() {
+    this.parts = []
+  }
+  uvarint(n) {
+    const b = []
+    n = BigInt(n)
+    while (n >= 0x80n) {
+      b.push(Number(n & 0x7fn) | 0x80)
+      n >>= 7n
+    }
+    b.push(Number(n))
+    this.parts.push(Uint8Array.from(b))
+  }
+  varint(num, v) {
+    this.uvarint((num << 3) | 0)
+    this.uvarint(v)
+    return this
+  }
+  bytes(num, v) {
+    if (typeof v === "string") v = enc.encode(v)
+    else if (v instanceof PB) v = v.done()
+    this.uvarint((num << 3) | 2)
+    this.uvarint(v.length)
+    this.parts.push(v)
+    return this
+  }
+  str(num, v) {
+    return this.bytes(num, v)
+  }
+  double(num, v) {
+    this.uvarint((num << 3) | 1)
+    const b = new Uint8Array(8)
+    new DataView(b.buffer).setFloat64(0, v, true)
+    this.parts.push(b)
+    return this
+  }
+  done() {
+    const n = this.parts.reduce((s, p) => s + p.length, 0)
+    const out = new Uint8Array(n)
+    let at = 0
+    for (const p of this.parts) {
+      out.set(p, at)
+      at += p.length
+    }
+    return out
+  }
+}
+
+// fields reads a message's fields; a malformed tail is dropped.
+function fields(b) {
+  const out = []
+  let i = 0
+  const uvarint = () => {
+    let n = 0n
+    let shift = 0n
+    for (;;) {
+      if (i >= b.length) return null
+      const c = b[i++]
+      n |= BigInt(c & 0x7f) << shift
+      if (!(c & 0x80)) return n
+      shift += 7n
+    }
+  }
+  while (i < b.length) {
+    const key = uvarint()
+    if (key === null) break
+    const f = { num: Number(key >> 3n), wire: Number(key & 7n), n: 0, data: null }
+    if (f.wire === 0) {
+      const v = uvarint()
+      if (v === null) break
+      f.n = Number(v)
+    } else if (f.wire === 1) {
+      if (i + 8 > b.length) break
+      i += 8
+    } else if (f.wire === 2) {
+      const l = uvarint()
+      if (l === null || i + Number(l) > b.length) break
+      f.data = b.subarray(i, i + Number(l))
+      i += Number(l)
+    } else if (f.wire === 5) {
+      if (i + 4 > b.length) break
+      i += 4
+    } else break
+    out.push(f)
+  }
+  return out
+}
+
+// frame wraps a message as the one frame of a Connect stream.
+function frame(msg) {
+  const out = new Uint8Array(5 + msg.length)
+  new DataView(out.buffer).setUint32(1, msg.length)
+  out.set(msg, 5)
+  return out
+}
+
+// frames reads a Connect stream: each message, or its end with its JSON.
+async function* frames(body) {
+  let buf = new Uint8Array(0)
+  const reader = body.getReader()
+  try {
+    for (;;) {
+      while (buf.length >= 5) {
+        const n = new DataView(buf.buffer, buf.byteOffset).getUint32(1)
+        if (n > 64 << 20) throw new Error("a malformed stream")
+        if (buf.length < 5 + n) break
+        const flags = buf[0]
+        let data = buf.slice(5, 5 + n)
+        buf = buf.slice(5 + n)
+        if (flags & 1) data = new Uint8Array(gunzipSync(data))
+        yield { end: !!(flags & 2), data }
+      }
+      const { value, done } = await reader.read()
+      if (done) {
+        if (buf.length) throw new Error("unexpected EOF")
+        return
+      }
+      const next = new Uint8Array(buf.length + value.length)
+      next.set(buf)
+      next.set(value, buf.length)
+      buf = next
+    }
+  } finally {
+    reader.releaseLock()
+  }
+}
+
+// ---- the request ----------------------------------------------------------------------
+
+const USER = 1
+const ASSISTANT = 2
+const TOOL = 4
+// answers a call the conversation never answered
+const NO_RESULT = "Tool use was interrupted and did not produce a result."
+
+const textOf = (c) =>
+  typeof c === "string" ? c : Array.isArray(c) ? c.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("") : ""
+
+// effortOf is the effort a request names, as magpie reads it.
+function effortOf(s) {
+  const e = String(s ?? "").trim().toLowerCase()
+  if (e === "minimal" || e === "none") return "low"
+  if (["low", "medium", "high", "xhigh", "max"].includes(e)) return e
+  if (e === "ultra") return "max"
+  return ""
+}
+
+// argsOf is a call's arguments as JSON.
+function argsOf(s) {
+  if (s && typeof s === "object") return JSON.stringify(s)
+  try {
+    const v = JSON.parse(s || "{}")
+    return JSON.stringify(v && typeof v === "object" ? v : {})
+  } catch {
+    return "{}"
+  }
+}
+
+// toolDescriptions is what each tool says of itself, for the
+// instructions.
+function toolDescriptions(tools) {
+  const said = tools.filter((t) => t.description)
+  if (!said.length) return ""
+  return "<tool_descriptions>\n" + said.map((t) => `<tool name="${t.name}">\n${t.description.trim()}\n</tool>\n`).join("") + "</tool_descriptions>"
+}
+
+const joinNonEmpty = (...s) => s.filter(Boolean).join("\n\n")
+
+const osName = () => (process.platform === "win32" ? "windows" : process.platform)
+
+// build is the GetChatMessage request for a chat completion, to the model
+// uid.
+function build(chat, uid, key) {
+  const msgs = []
+  let pending = [] // calls the last reply made, not yet answered
+  const answer = () => {
+    for (const c of pending) msgs.push({ role: TOOL, callID: c.id, text: NO_RESULT })
+    pending = []
+  }
+  const system = []
+  for (const m of chat.messages ?? []) {
+    if (m.role === "system" || m.role === "developer") {
+      system.push(textOf(m.content))
+      continue
+    }
+    if (m.role === "assistant") {
+      const calls = (m.tool_calls ?? []).map((c) => ({ id: c.id, name: c.function?.name, args: argsOf(c.function?.arguments) }))
+      const text = typeof m.content === "string" ? m.content : Array.isArray(m.content) ? m.content.filter((p) => p?.type === "text" && p.text).map((p) => p.text).join("\n\n") : ""
+      if (!text && !calls.length) continue // a turn that only thought, or failed
+      answer()
+      msgs.push({ role: ASSISTANT, text, calls })
+      pending = calls
+      continue
+    }
+    if (m.role === "tool") {
+      // only a call just made is answered, and only once
+      const i = pending.findIndex((c) => c.id === m.tool_call_id)
+      if (i >= 0) {
+        let out = textOf(m.content) || "(no output)"
+        msgs.push({ role: TOOL, callID: pending[i].id, text: out })
+        pending.splice(i, 1)
+      }
+      continue
+    }
+    if (m.role !== "user") continue
+    const texts = []
+    const images = []
+    if (typeof m.content === "string") {
+      if (m.content) texts.push(m.content)
+    } else
+      for (const p of m.content ?? []) {
+        if (p?.type === "text" && p.text) texts.push(p.text)
+        else if (p?.type === "image_url") {
+          const u = typeof p.image_url === "string" ? p.image_url : p.image_url?.url ?? ""
+          const d = /^data:([^,]*),(.*)$/s.exec(u)
+          if (d && d[2]) images.push({ data: d[2], type: d[1].replace(/;base64$/, "") || "image/png" })
+        }
+      }
+    const text = texts.join("\n\n")
+    if (!text && !images.length) continue
+    answer()
+    msgs.push({ role: USER, text, images })
+  }
+  answer()
+  const last = msgs[msgs.length - 1]
+  if (!last || (last.role === ASSISTANT && !last.calls.length)) msgs.push({ role: USER, text: "Please proceed with the task." })
+
+  // the instructions go at the head of the first user message: Devin turns
+  // away some agents' own in its system field. The tools' descriptions go
+  // there too, each tool sent with only a pointer to its own: Devin
+  // answers "an internal error occurred" to some agents' tools as they
+  // describe themselves, and the same words in a message go through
+  let tools = (chat.tools ?? [])
+    .filter((t) => (!t?.type || t.type === "function") && t.function?.name)
+    .map((t) => ({ name: t.function.name, description: t.function.description ?? "", schema: t.function.parameters }))
+  if (chat.tool_choice === "none") tools = []
+  const instructions = joinNonEmpty(system.join("\n\n"), toolDescriptions(tools))
+  if (instructions) {
+    let at = msgs.findIndex((m) => m.role === USER)
+    if (at < 0) {
+      msgs.unshift({ role: USER, text: "" })
+      at = 0
+    }
+    msgs[at].text = joinNonEmpty(instructions, msgs[at].text)
+  }
+
+  const meta = new PB().str(1, "devin-cli").str(2, CLI_VERSION).str(3, key).str(4, "en").str(5, osName()).str(7, CLI_VERSION).str(12, "chisel").str(28, "chisel")
+  const out = new PB().bytes(1, meta)
+  for (const m of msgs) out.bytes(3, encodeMsg(m))
+  out.varint(7, 5)
+  const max = chat.max_completion_tokens || chat.max_tokens || 128000 // the server holds it to the model's own
+  const temp = typeof chat.temperature === "number" ? chat.temperature : 1
+  const topP = typeof chat.top_p === "number" ? chat.top_p : 0.95
+  out.bytes(8, new PB().varint(1, 1).varint(2, max).varint(3, 400).double(5, temp).varint(7, 40).double(8, topP))
+
+  // the caller's tools, and any the conversation used that it no longer
+  // offers
+  const offered = new Set()
+  const tool = (name, desc, schema) => {
+    if (!schema || typeof schema !== "object") schema = { type: "object", properties: {} }
+    offered.add(name)
+    out.bytes(10, new PB().str(1, name).str(2, desc || name).bytes(3, JSON.stringify(schema)))
+  }
+  for (const t of tools) tool(t.name, t.description ? `Described under <tool name="${t.name}"> in <tool_descriptions>, in the instructions.` : "", t.schema)
+  for (const m of msgs) for (const c of m.calls ?? []) if (!offered.has(c.name)) tool(c.name, "Tool")
+  return out.str(21, uid).done()
+}
+
+function encodeMsg(m) {
+  const b = new PB().str(1, randomUUID()).varint(2, m.role)
+  if (m.text) b.str(3, m.text)
+  for (const c of m.calls ?? []) b.bytes(6, new PB().str(1, c.id ?? "").str(2, c.name ?? "").bytes(3, c.args))
+  if (m.callID) b.str(7, m.callID)
+  for (const p of m.images ?? []) b.bytes(10, new PB().str(1, p.data).str(2, p.type))
+  return b.done()
+}
+
+// ---- the reply -----------------------------------------------------------------------
+
+// failure is the status and message for a Connect error: {"code",
+// "message"}, or at a stream's end {"error": {"code", "message"}}.
+function failure(status, text) {
+  let msg = String(text ?? "").trim()
+  let code = ""
+  try {
+    const e = JSON.parse(text)
+    if (e?.error && typeof e.error === "object") [code, msg] = [e.error.code ?? "", e.error.message ?? ""]
+    else if (e?.code) [code, msg] = [e.code, e.message ?? ""]
+    msg ||= code
+  } catch {}
+  msg ||= `HTTP ${status}`
+  const low = msg.toLowerCase()
+  if (code === "unauthenticated") return { status: 401, message: msg + " — sign in to Devin again" }
+  if (code === "resource_exhausted" || low.includes("quota") || low.includes("rate limit")) return { status: 429, message: "usage limit reached: " + msg }
+  // Devin turns away some system prompts outright; sent again, the same
+  // one is turned away again
+  if (low.includes("content policy")) return { status: 400, message: msg }
+  if (low.includes("too long") || low.includes("context length") || low.includes("too many tokens"))
+    return { status: 400, message: "input is too long for the model's context: " + msg }
+  if (code === "invalid_argument") return { status: 400, message: msg }
+  if (code === "unavailable") return { status: 503, message: msg }
+  if (code) return { status: 502, message: msg }
+  return { status, message: msg }
+}
+
+// events turns the reply's frames into chat completion pieces: text,
+// reasoning, each tool call opened with its id and name, its arguments in
+// pieces after, then the finish with the usage.
+async function* events(it) {
+  let tools = -1
+  let stop = 0
+  let said = 0
+  const usage = { input: 0, output: 0, cacheWrite: 0, cacheRead: 0 }
+  for (;;) {
+    let r
+    try {
+      r = await it.next()
+    } catch (e) {
+      yield { error: { status: 502, message: "Devin: the reply broke off: " + e.message } }
+      return
+    }
+    if (r.done) break
+    const f = r.value
+    if (f.end) {
+      const e = failure(200, dec.decode(f.data))
+      if (e.status >= 300) {
+        yield { error: { status: e.status, message: "Devin: " + e.message } }
+        return
+      }
+      break
+    }
+    for (const x of fields(f.data)) {
+      if (x.num === 3 && x.wire === 2 && x.data.length) {
+        said += x.data.length
+        yield { text: dec.decode(x.data) }
+      } else if (x.num === 9 && x.wire === 2 && x.data.length) {
+        said += x.data.length
+        yield { reasoning: dec.decode(x.data) }
+      } else if (x.num === 6 && x.wire === 2) {
+        let id = ""
+        let name = ""
+        let args = ""
+        for (const g of fields(x.data)) {
+          if (g.num === 1) id = dec.decode(g.data ?? new Uint8Array())
+          else if (g.num === 2) name = dec.decode(g.data ?? new Uint8Array())
+          else if (g.num === 3) args += dec.decode(g.data ?? new Uint8Array())
+        }
+        if (name) {
+          tools++
+          yield { tool: { index: tools, id: id || "call_" + randomBytes(12).toString("hex"), name } }
+        }
+        if (args && tools >= 0) yield { args: { index: tools, text: args } }
+      } else if (x.num === 5 && x.wire === 0) stop = x.n
+      else if (x.num === 7 && x.wire === 2) {
+        for (const g of fields(x.data)) {
+          if (g.wire !== 0 || !g.n) continue
+          if (g.num === 2) usage.input = g.n
+          else if (g.num === 3) usage.output = g.n
+          else if (g.num === 4) usage.cacheWrite = g.n
+          else if (g.num === 5) usage.cacheRead = g.n
+        }
+      }
+    }
+  }
+  if (!usage.output) usage.output = Math.floor((said + 3) / 4)
+  const prompt = usage.input + usage.cacheRead + usage.cacheWrite
+  yield {
+    stop: tools >= 0 || stop === 10 ? "tool_calls" : stop === 3 ? "length" : "stop",
+    usage: {
+      prompt_tokens: prompt,
+      completion_tokens: usage.output,
+      total_tokens: prompt + usage.output,
+      prompt_tokens_details: { cached_tokens: usage.cacheRead, cache_write_tokens: usage.cacheWrite },
+    },
+  }
+}
+
+const errorResponse = ({ status, message }) =>
+  new Response(JSON.stringify({ error: { message, type: "devin_error", code: status } }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  })
+
+// complete answers a chat completion through GetChatMessage.
+async function complete({ key, server, families }, chat, signal) {
+  const uid = variantFor(families, chat.model, effortOf(chat.reasoning_effort))
+  let res
+  try {
+    res = await fetch(server + CHAT_RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/connect+proto", "Connect-Protocol-Version": "1", Authorization: "Basic " + key },
+      body: frame(build(chat, uid, key)),
+      signal,
+    })
+  } catch (e) {
+    return errorResponse({ status: 502, message: "Devin: " + e.message })
+  }
+  if (!res.ok) {
+    const e = failure(res.status, (await res.text()).slice(0, 1 << 20))
+    return errorResponse({ status: e.status, message: "Devin: " + e.message })
+  }
+  // an error comes as the stream's end, before anything else: read that
+  // far so it is answered with its own status
+  const fr = frames(res.body)
+  let first
+  try {
+    first = await fr.next()
+  } catch (e) {
+    return errorResponse({ status: 502, message: "Devin: the reply broke off: " + e.message })
+  }
+  if (first.done) return errorResponse({ status: 502, message: "Devin: an empty reply" })
+  if (first.value.end) {
+    const e = failure(200, dec.decode(first.value.data))
+    return errorResponse(e.status < 300 ? { status: 502, message: "Devin: an empty reply" } : { status: e.status, message: "Devin: " + e.message })
+  }
+  let replay = first
+  const it = events({
+    next: () => {
+      if (replay) {
+        const r = replay
+        replay = null
+        return Promise.resolve(r)
+      }
+      return fr.next()
+    },
+  })
+  const id = "chatcmpl-" + randomBytes(12).toString("hex")
+  const created = Math.floor(Date.now() / 1000)
+
+  if (!chat.stream) {
+    const msg = { role: "assistant", content: "" }
+    let reasoning = ""
+    const calls = []
+    let stop = "stop"
+    let usage
+    for await (const e of it) {
+      if (e.error) return errorResponse(e.error)
+      if (e.text) msg.content += e.text
+      if (e.reasoning) reasoning += e.reasoning
+      if (e.tool) calls.push({ id: e.tool.id, type: "function", function: { name: e.tool.name, arguments: "" } })
+      if (e.args) calls[e.args.index].function.arguments += e.args.text
+      if (e.stop) [stop, usage] = [e.stop, e.usage]
+    }
+    if (reasoning) msg.reasoning_content = reasoning
+    if (calls.length) msg.tool_calls = calls
+    return Response.json({ id, object: "chat.completion", created, model: chat.model, choices: [{ index: 0, message: msg, finish_reason: stop }], usage })
+  }
+
+  const chunk = (delta, finish_reason = null, extra = {}) =>
+    enc.encode(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model: chat.model, choices: [{ index: 0, delta, finish_reason }], ...extra })}\n\n`)
+  let began = false
+  const stream = new ReadableStream({
+    async pull(ctl) {
+      if (!began) {
+        began = true
+        ctl.enqueue(chunk({ role: "assistant", content: "" }))
+      }
+      const r = await it.next()
+      if (r.done) {
+        ctl.enqueue(enc.encode("data: [DONE]\n\n"))
+        return ctl.close()
+      }
+      const e = r.value
+      if (e.text) ctl.enqueue(chunk({ content: e.text }))
+      else if (e.reasoning) ctl.enqueue(chunk({ reasoning_content: e.reasoning }))
+      else if (e.tool) ctl.enqueue(chunk({ tool_calls: [{ index: e.tool.index, id: e.tool.id, type: "function", function: { name: e.tool.name, arguments: "" } }] }))
+      else if (e.args) ctl.enqueue(chunk({ tool_calls: [{ index: e.args.index, function: { arguments: e.args.text } }] }))
+      else if (e.stop) ctl.enqueue(chunk({}, e.stop, { usage: e.usage }))
+      else if (e.error) {
+        ctl.enqueue(enc.encode(`data: ${JSON.stringify({ error: { message: e.error.message, code: e.error.status } })}\n\n`))
+        ctl.close()
+      }
+    },
+    cancel() {
+      it.return?.()
+    },
+  })
+  return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } })
+}
+
+// ---- the plugin ---------------------------------------------------------------------
+
+// serverOf is the API server an account's requests go to:
+// WINDSURF_API_SERVER_URL moves it, as it does the CLI's.
+const serverOf = (auth) => (process.env.WINDSURF_API_SERVER_URL || auth?.metadata?.server || SERVER).replace(/\/+$/, "")
+
+export async function DevinAuthPlugin() {
+  return {
+    auth: {
+      provider: ID,
+      async loader(getAuth) {
+        const auth = await getAuth()
+        if (auth?.type !== "api" || !auth.key) return {}
+        return {
+          baseURL: BASE,
+          apiKey: auth.key,
+          async fetch(input, init = {}) {
+            const now = await getAuth()
+            if (now?.type !== "api" || !now.key) return errorResponse({ status: 401, message: "Devin isn't signed in" })
+            const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+            if (!/\/chat\/completions$/.test(new URL(url).pathname)) return errorResponse({ status: 404, message: "Devin: only chat completions are served" })
+            let chat
+            try {
+              const b = init.body ?? (input instanceof Request ? await input.clone().text() : undefined)
+              chat = JSON.parse(typeof b === "string" ? b : dec.decode(b))
+            } catch {
+              return errorResponse({ status: 400, message: "Devin: a request that isn't JSON" })
+            }
+            const server = serverOf(now)
+            const families = await familiesFor(now.key, server)
+            return complete({ key: now.key, server, families }, chat, init.signal)
+          },
+        }
+      },
+      methods: [
+        { type: "oauth", label: "Devin (browser)", authorize: browserSignIn },
+        { type: "oauth", label: "Devin CLI's sign-in", authorize: cliSignIn },
+      ],
+    },
+    async config(config) {
+      config.provider ??= {}
+      const was = config.provider[ID] ?? {}
+      config.provider[ID] = {
+        name: "Devin",
+        npm: CHAT,
+        api: BASE,
+        ...was,
+        models: { ...Object.fromEntries(listed(familiesOf(SNAPSHOT)).map((m) => [m.id, configModel(m)])), ...(was.models ?? {}) },
+      }
+    },
+    // the account's list, as the devin CLI gives it
+    provider: {
+      id: ID,
+      async models(provider, { auth } = {}) {
+        if (auth?.type !== "api" || !auth.key || !cliPath()) return provider.models
+        const families = await familiesFor(auth.key, serverOf(auth))
+        return Object.fromEntries(listed(families).map((m) => [m.id, runtimeModel(m)]))
+      },
+    },
+  }
+}
+
+// for tests
+export const _internal = { build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readCredentials, credentials, fields, frame, PB, events, frames }
