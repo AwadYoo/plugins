@@ -961,7 +961,12 @@ export async function ZedAuthPlugin({ client } = {}) {
           try {
             l = { at: Date.now(), models: await fetchModels(s) }
             lists.set(s.userId, l)
-          } catch {
+          } catch (e) {
+            // Zed refusing the account's own sign-in while its list was
+            // read: the built-in marked the account then (zedFetchModels →
+            // ZedToken → zedLapse), so magpie is told as an answer's
+            // X-Magpie-Sign-In would tell it
+            if (e instanceof SignInExpired) throw Object.assign(e, { signIn: "expired" })
             if (!l) return provider.models
           }
         }
