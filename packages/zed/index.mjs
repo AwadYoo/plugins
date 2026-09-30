@@ -123,8 +123,11 @@ function failedStatus(code) {
 // refusal is the status and message for a request Zed turned away: its
 // {code, message, upstream_status}, a 402 as the plan it is.
 function refusal(status, body) {
-  if (status === 402) return [402, "Zed: payment required — this account's plan doesn't include Zed's hosted models, or its allowance is used up (see zed.dev/account)"]
-  if (status === 401) return [401, "Zed: the sign-in was refused — sign in again"]
+  if (status === 402) return [402, "payment required — this account's plan doesn't include Zed's hosted models, or its allowance is used up (see zed.dev/account)"]
+  // a model token refused right after it was minted: the account's own
+  // sign-in just worked, so this isn't the sign-in lapsing (a 401 would
+  // have magpie mark it so, which the built-in never did here)
+  if (status === 401) return [403, "the sign-in was refused — sign in again"]
   const j = parse(body) ?? {}
   let code = status
   const up = Number(j.upstream_status)
@@ -136,7 +139,7 @@ function refusal(status, body) {
   if (code < 400 || code > 599) code = 502
   let msg = failure(status, body)
   if (Number(j.retry_after) > 0) msg += ` (retry after ${Number(j.retry_after)}s)`
-  return [code, "Zed: " + msg]
+  return [code, msg]
 }
 
 // stale says a model request was turned away for its model token, which a
@@ -302,7 +305,7 @@ function entry(m) {
     temperature: true,
     modalities: { input: img ? ["text", "image"] : ["text"], output: ["text"] },
     cost: { input: 0, output: 0 },
-    limit: { context: m.max_token_count || 200_000, output: m.max_output_tokens || 32_000 },
+    limit: { context: m.max_token_count || 0, output: m.max_output_tokens || 0 },
     variants: Object.fromEntries(effortsOf(m).map((e) => [e, variant(m.provider, e)])),
   }
 }
@@ -574,18 +577,18 @@ function streamed(wire, res) {
         for await (const l of lines(res.body, wrapped)) {
           if (l.ended) ended = true
           else if (l.failed) {
-            fail(failedStatus(l.failed.code), "Zed: " + (l.failed.message || l.failed.code))
+            fail(failedStatus(l.failed.code), l.failed.message || l.failed.code)
             ctl.close()
             return
           } else put(sse(wire, l.event))
         }
         // Zed ends every whole reply with stream_ended
-        if (wrapped && !ended) fail(502, "Zed: the reply ended before it was complete")
+        if (wrapped && !ended) fail(502, "the reply ended before it was complete")
         else if (wire === "chat") put("data: [DONE]\n\n")
         ctl.close()
       } catch (e) {
         try {
-          fail(502, "Zed: " + (e?.message ?? e))
+          fail(502, String(e?.message ?? e).replace(/^Zed: /, ""))
           ctl.close()
         } catch {}
       }
@@ -698,24 +701,24 @@ async function whole(wire, res) {
   try {
     for await (const l of lines(res.body, wrapped)) {
       if (l.ended) ended = true
-      else if (l.failed) return errorResponse(wire, failedStatus(l.failed.code), "Zed: " + (l.failed.message || l.failed.code))
+      else if (l.failed) return errorResponse(wire, failedStatus(l.failed.code), l.failed.message || l.failed.code)
       else events.push(l.event)
     }
   } catch (e) {
-    return errorResponse(wire, 502, "Zed: " + (e?.message ?? e))
+    return errorResponse(wire, 502, String(e?.message ?? e).replace(/^Zed: /, ""))
   }
-  if (wrapped && !ended) return errorResponse(wire, 502, "Zed: the reply ended before it was complete")
+  if (wrapped && !ended) return errorResponse(wire, 502, "the reply ended before it was complete")
   const out = WHOLE[wire](events)
-  if (!out) return errorResponse(wire, 502, "Zed: the reply ended before it was complete")
+  if (!out) return errorResponse(wire, 502, "the reply ended before it was complete")
   return new Response(JSON.stringify(out), { status: 200, headers: { "content-type": "application/json" } })
 }
 
 // complete sends one request through Zed's /completions.
 async function complete(s, url, init) {
   const w = wireOf(url)
-  if (!w) return new Response(JSON.stringify({ error: { message: "Zed: nothing is served at " + new URL(url).pathname } }), { status: 404, headers: { "content-type": "application/json" } })
+  if (!w) return new Response(JSON.stringify({ error: { message: "nothing is served at " + new URL(url).pathname } }), { status: 404, headers: { "content-type": "application/json" } })
   const req = parse(await bodyText(init?.body))
-  if (!req || typeof req !== "object") return errorResponse(w.wire, 400, "Zed: an unreadable request")
+  if (!req || typeof req !== "object") return errorResponse(w.wire, 400, "an unreadable request")
   const id = w.model ?? String(req.model ?? "")
   const vendor = vendors.get(id) ?? WIRE_VENDOR[w.wire]
   const { req: pr, stream = w.stream } = providerRequest(w.wire, req, id)
@@ -726,7 +729,7 @@ async function complete(s, url, init) {
     try {
       tok = await modelToken(s, t > 0)
     } catch (e) {
-      return errorResponse(w.wire, /sign in again/.test(e?.message ?? "") ? 401 : 502, "Zed: " + String(e?.message ?? e).replace(/^Zed: /, ""))
+      return errorResponse(w.wire, /sign in again/.test(e?.message ?? "") ? 401 : 502, String(e?.message ?? e).replace(/^Zed: /, ""))
     }
     res = await fetch(CLOUD + "/completions", {
       method: "POST",
@@ -762,6 +765,14 @@ async function complete(s, url, init) {
 // billing period, not how much of the allowance is spent, so there are no
 // windows — the plan's name, when the period ends, and a plan Zed won't
 // serve (overdue invoices) as the error it is.
+// jsonError is what Go's encoding/json says of a /users/me reply it can't
+// read into zed.Me.
+function jsonError(text, v) {
+  if (v !== undefined) return `json: cannot unmarshal ${Array.isArray(v) ? "array" : typeof v === "string" ? "string" : typeof v === "number" ? "number" : "bool"} into Go value of type zed.Me`
+  const c = String(text ?? "").trimStart()[0]
+  return c === undefined ? "unexpected end of JSON input" : `invalid character '${c}' looking for beginning of value`
+}
+
 const RFC3339 = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$/i
 
 async function usage(auth, save) {
@@ -769,7 +780,10 @@ async function usage(auth, save) {
   if (!s) return { error: "no such Zed account" }
   let me
   try {
-    me = parse(await cloud("GET", "/client/users/me", s, undefined, 15_000)) ?? {}
+    const text = await cloud("GET", "/client/users/me", s, undefined, 15_000)
+    me = parse(text)
+    if (me === null) me = {}
+    else if (typeof me !== "object" || Array.isArray(me)) return { error: "Zed: an unreadable account: " + jsonError(text, me) }
   } catch (e) {
     if (e?.status === 401) return { error: `${s.who}: the Zed sign-in has expired — sign in again` }
     return { error: e?.message ?? String(e) }
@@ -783,7 +797,6 @@ async function usage(auth, save) {
   const end = me.plan?.subscription_period?.ended_at
   if (typeof end === "string" && RFC3339.test(end) && !isNaN(Date.parse(end))) out.until = end
   if (me.plan?.has_overdue_invoices) out.error = "Zed: this account has an overdue invoice, so its models are paused (see zed.dev/account)"
-  else if (plan === "zed_free" || plan === "") out.plan = "No plan"
   return out
 }
 
@@ -847,4 +860,4 @@ export async function ZedAuthPlugin({ client } = {}) {
 }
 
 // for tests
-export const _internal = { stateOf, parseModels, providerRequest, wireOf, refusal, failedStatus, decrypt, padded, signedInWith, complete, vendors, tokens, lists, orgOf, who, planName, usage }
+export const _internal = { stateOf, parseModels, entry, providerRequest, wireOf, refusal, failedStatus, decrypt, padded, signedInWith, complete, vendors, tokens, lists, orgOf, who, planName, usage }
