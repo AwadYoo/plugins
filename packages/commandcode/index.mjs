@@ -667,6 +667,10 @@ const generateHeaders = (key) => ({
   Authorization: `Bearer ${key}`,
 })
 
+// QUOTA_WORDS are magpie's quotaWords (internal/gateway/fallback.go): a
+// message already in them isn't said again as out of credits.
+const QUOTA_WORDS = /quota|insufficient|balance|credit|billing|exceeded|rate.?limit|usage.?limit|limit.?reached|hit your .*limit|limit.{0,24}resets|too many requests|overloaded|余额|额度|欠费|限流|频率|套餐|用量|上限/i
+
 // failure is the status and message for a failure, from Command Code's
 // {"error":{"type","message"}} or its text: a model the plan hasn't is a
 // 403, credits run out a 402, a window's limit a 429.
@@ -674,9 +678,12 @@ function failure(status, text) {
   let msg = ""
   try {
     const j = JSON.parse(text)
-    msg = [j?.error?.message, j?.message, typeof j?.error === "string" ? j.error : ""].find((s) => s && String(s).trim()) ?? ""
+    const err = j?.error && typeof j.error === "object" ? JSON.stringify(j.error) : j?.error
+    msg = [j?.error?.message, j?.message, err].find((s) => s != null && String(s).trim()) ?? ""
   } catch {}
-  msg = String(msg || text || "").trim() || `HTTP ${status}`
+  // an empty body is its status's name, as Go's http.StatusText says it:
+  // an empty 429 reads "Too Many Requests", which quotaWords knows
+  msg = String(msg || text || "").trim() || statusText(status)
   if (msg.length > 600) msg = msg.slice(0, 600)
   const low = msg.toLowerCase()
   if (msg.includes("MODEL_NOT_IN_PLAN:")) {
@@ -686,7 +693,7 @@ function failure(status, text) {
   else if (low.includes("premium_credits_exhausted") || low.includes("insufficient credits")) {
     status = 402
     msg = msg.replace("PREMIUM_CREDITS_EXHAUSTED:", "").trim()
-    if (!/credit|quota|balance|limit/i.test(msg)) msg = "out of credits: " + msg
+    if (!QUOTA_WORDS.test(msg)) msg = "out of credits: " + msg
   } else if (msg.includes("RATE_LIMITED") || low.includes("usage limit") || low.includes("window_limit")) {
     if (status < 400 || status === 500) status = 429
   }
