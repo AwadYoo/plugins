@@ -8,12 +8,17 @@ subscription and makes its requests. The packages work in OpenCode and in
 | Package | Signs in to | Provider id |
 |---|---|---|
 | [commandcode](packages/commandcode) | Command Code plans (Pro, GOAT, Max, Ultra, Go, Teams Pro) | `commandcode-plan` |
+| [cursor](packages/cursor) | Cursor subscriptions (Pro, Pro+, Ultra, Teams), on the API cursor-agent talks to | `cursor` |
+| [devin](packages/devin) | Devin subscription (the devin CLI's account) | `devin` |
 | [factory](packages/factory) | Factory (Droid) subscription | `factory` |
 | [grok](packages/grok) | Grok (SuperGrok / X Premium+), through the Grok Build CLI's sign-in | `grok` |
+| [kiro](packages/kiro) | Kiro (Free, Pro, Pro+, Power), with Kiro's sign-in, kiro-cli's or the IDE's, or an API key | `kiro` |
 | [mimo](packages/mimo) | Xiaomi MiMo, with a Xiaomi account | `mimo-app` |
+| [qoder](packages/qoder) | Qoder subscription, with Qoder's device sign-in | `qoder` |
 | [workbuddy](packages/workbuddy) | WorkBuddy (China build, CodeBuddy plan) | `workbuddy` |
 | [workbuddy](packages/workbuddy) | WorkBuddy (international build) | `workbuddy-ai` |
 | [zcode](packages/zcode) | ZCode: Z.ai / BigModel (智谱) GLM Coding Plan, team seats, Start Plan | `zcode` |
+| [zed](packages/zed) | Zed (Pro, Pro Trial, Student, Business): Anthropic, OpenAI, Google and xAI models hosted by Zed | `zed` |
 
 ## Use
 
@@ -24,8 +29,8 @@ magpie plugin add @magpie-community/opencode-<name>-auth
 magpie plugin login <provider id>
 ```
 
-The same actions are in the app: Settings → Plugins, then Add provider →
-From plugins.
+In the app, the Plugins tab lists these packages: install one there, then
+sign in.
 
 OpenCode, in `opencode.json`:
 

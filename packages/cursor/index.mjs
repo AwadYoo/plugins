@@ -1,0 +1,1417 @@
+// Cursor subscriptions as an OpenCode provider plugin, served through the
+// API cursor-agent talks to. Ported from magpie's built-in Cursor account
+// (internal/provider/cursor*.go, internal/gateway/cursor.go).
+//
+// An account is a Cursor access token, got one of three ways:
+// - the sign-in cursor-agent does (cursor.com/loginDeepControl with a PKCE
+//   challenge, then /auth/poll until the browser has signed in);
+// - the token cursor-agent itself keeps (the Mac keychain, else its
+//   auth.json), read each time and never written;
+// - a Cursor API key, exchanged for a token as the CLI does with
+//   CURSOR_API_KEY.
+//
+// Requests go to AgentService/Run, a Connect stream both ways over HTTP/2.
+// Cursor keeps a conversation on its client: each message of the prompt is
+// an AI SDK message in JSON, a blob named by its sha256, which the server
+// asks the client for as it reads them. So each request goes whole, as such
+// a conversation, the caller's system prompt at its head; the Run only
+// resumes it. The caller's tools are MCP tools, which the model calls
+// through Cursor's CallDynamicTool: the server hands each call to the
+// client to run, and once it has said how many a step made, the stream is
+// closed and the calls go back to OpenCode as a chat completion's tool
+// calls. Nothing else the server asks the client to run (a shell, a file
+// read) is run.
+//
+// OpenCode speaks chat completions to it (@ai-sdk/openai-compatible); the
+// fetch here answers them.
+import http2 from "node:http2"
+import { gunzipSync } from "node:zlib"
+import { createHash, randomBytes, randomUUID } from "node:crypto"
+import { execFile } from "node:child_process"
+import { readFile, stat, readdir, realpath } from "node:fs/promises"
+import { homedir, platform, tmpdir } from "node:os"
+import { basename, dirname, join } from "node:path"
+
+const ID = "cursor"
+const API = "https://api2.cursor.sh"
+const WEBSITE = "https://cursor.com"
+const AGENT = "https://agentn.global.api5.cursor.sh" // when the server config can't say
+const CHAT = "@ai-sdk/openai-compatible"
+const VERSION_FALLBACK = "2026.09.23-86fc751" // the CLI version said when no install names one
+const DEFAULT_CONTEXT = 200_000 // what Cursor gives a model it doesn't name as a 1M one
+const MODELS_KEEP = 10 * 60 * 1000
+const CALL = "CallDynamicTool" // how the model calls an MCP tool
+const NO_RESULT = "Tool use was interrupted and did not produce a result."
+const CLI_MARK = "cursor-agent" // an oauth sign-in's refresh when the token is cursor-agent's own
+
+const GOOS = { win32: "windows" }[platform()] ?? platform()
+const EMPTY = Buffer.alloc(0)
+const enc = new TextEncoder()
+
+// ---- cursor-agent ---------------------------------------------------------------
+
+const exists = (p) => stat(p).then((s) => !s.isDirectory(), () => false)
+
+function run(file, args, { timeout = 10_000, env } = {}) {
+  return new Promise((resolve) => {
+    execFile(file, args, { timeout, env: env ?? process.env, maxBuffer: 8 << 20 }, (err, stdout) =>
+      resolve({ ok: !err, out: String(stdout ?? "") }))
+  })
+}
+
+// cursorExecutable finds the cursor-agent CLI, or Cursor's `agent` by that
+// name.
+async function cursorExecutable() {
+  const dirs = (process.env.PATH ?? "").split(GOOS === "windows" ? ";" : ":").filter(Boolean)
+  for (const name of ["cursor-agent", "agent"]) {
+    for (const d of dirs) {
+      const p = join(d, GOOS === "windows" ? name + ".exe" : name)
+      if (!(await exists(p))) continue
+      if (name === "cursor-agent") return p
+      if ((await realpath(p).catch(() => "")).includes("cursor-agent")) return p
+    }
+  }
+  const home = homedir()
+  for (const p of [join(home, ".local", "bin", "cursor-agent"), "/usr/local/bin/cursor-agent", "/opt/homebrew/bin/cursor-agent"])
+    if (await exists(p)) return p
+  return ""
+}
+
+const VERSION_RE = /^\d{4}\.\d{2}\.\d{2}-[0-9a-f]+$/
+
+// clientVersion is the cursor-agent the API is told it is talking to,
+// "cli-<version>": the installed one, as the API turns away a version it no
+// longer supports.
+let versionSaid = ""
+async function clientVersion() {
+  if (versionSaid) return versionSaid
+  let v = ""
+  const exe = await cursorExecutable()
+  if (exe) {
+    const d = basename(dirname(await realpath(exe).catch(() => exe)))
+    if (VERSION_RE.test(d)) v = d
+  }
+  if (!v) {
+    const dirs = [join(homedir(), ".local", "share", "cursor-agent", "versions")]
+    if (GOOS === "windows") dirs.push(join(process.env.LOCALAPPDATA ?? "", "cursor-agent", "versions"))
+    for (const dir of dirs)
+      for (const n of await readdir(dir).catch(() => [])) if (VERSION_RE.test(n) && n > v) v = n
+  }
+  versionSaid = "cli-" + (v || VERSION_FALLBACK)
+  return versionSaid
+}
+
+// authFile is where cursor-agent keeps its sign-in off a Mac's keychain.
+function authFile() {
+  const home = homedir()
+  if (GOOS === "windows") return join(process.env.APPDATA || join(home, "AppData", "Roaming"), "Cursor", "auth.json")
+  if (GOOS === "darwin") return join(home, ".cursor", "auth.json")
+  return join(process.env.XDG_CONFIG_HOME || join(home, ".config"), "cursor", "auth.json")
+}
+
+// cliToken is the access token cursor-agent signed in with; read, never
+// written.
+async function cliToken() {
+  if (GOOS === "darwin") {
+    const r = await run("security", ["find-generic-password", "-s", "cursor-access-token", "-a", "cursor-user", "-w"])
+    if (r.ok && r.out.trim()) return r.out.trim()
+  }
+  try {
+    return JSON.parse(await readFile(authFile(), "utf8"))?.accessToken ?? ""
+  } catch {
+    return ""
+  }
+}
+
+// expiry is when a JWT runs out, in ms; 0 when it doesn't say.
+function expiry(tok) {
+  const parts = String(tok ?? "").split(".")
+  if (parts.length !== 3) return 0
+  try {
+    const exp = JSON.parse(Buffer.from(parts[1], "base64url").toString("utf8"))?.exp
+    return typeof exp === "number" && exp > 0 ? exp * 1000 : 0
+  } catch {
+    return 0
+  }
+}
+
+const SOON = 5 * 60 * 1000
+
+class AuthError extends Error {
+  constructor(msg) {
+    super(msg)
+    this.status = 401
+  }
+}
+
+// cliTokenNow is cursor-agent's token; one about to run out is renewed by
+// cursor-agent, which does that whenever it runs.
+let cliRefresh = null
+async function cliTokenNow() {
+  let tok = await cliToken()
+  const exp = expiry(tok)
+  if (tok && (!exp || exp - Date.now() > SOON)) return tok
+  const exe = await cursorExecutable()
+  if (exe) {
+    cliRefresh ??= run(exe, ["status"], { timeout: 30_000 }).finally(() => (cliRefresh = null))
+    await cliRefresh
+    tok = await cliToken()
+  }
+  if (!tok) throw new AuthError("Cursor isn't signed in: run `cursor-agent login`, or sign in again")
+  const e = expiry(tok)
+  if (e && e <= Date.now()) throw new AuthError("Cursor's sign-in has run out: run `cursor-agent login`, or sign in again")
+  return tok
+}
+
+// ---- the account -----------------------------------------------------------------
+
+async function headersFor(tok) {
+  return {
+    "Content-Type": "application/json",
+    "Connect-Protocol-Version": "1",
+    ...(tok ? { Authorization: `Bearer ${tok}` } : {}),
+    "x-cursor-client-version": await clientVersion(),
+    "x-cursor-client-type": "cli",
+    "x-ghost-mode": "true",
+  }
+}
+
+// unary is a Connect call in JSON.
+async function unary(base, path, tok, body = {}, timeout = 15_000) {
+  const res = await fetch(base + "/" + path, {
+    method: "POST",
+    headers: await headersFor(tok),
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeout),
+  })
+  const text = await res.text()
+  if (!res.ok) {
+    const f = failure(res.status, text)
+    const e = new Error(f.message)
+    e.status = f.status
+    throw e
+  }
+  return JSON.parse(text || "{}")
+}
+
+// whoIs is the account's email and plan, as `cursor-agent about` says them.
+async function whoIs(tok) {
+  const [me, plan] = await Promise.allSettled([
+    unary(API, "aiserver.v1.DashboardService/GetMe", tok),
+    unary(API, "aiserver.v1.DashboardService/GetPlanInfo", tok),
+  ])
+  return {
+    email: me.status === "fulfilled" ? String(me.value?.email ?? "").trim() : "",
+    plan: plan.status === "fulfilled" ? String(plan.value?.planInfo?.planName ?? "").trim() : "",
+  }
+}
+
+// exchanged are API keys' tokens, by the key's hash.
+const exchanged = new Map()
+
+// keyToken is the access token for a Cursor API key, as the CLI gets it
+// for CURSOR_API_KEY: /auth/exchange_user_api_key, again when it runs out.
+async function keyToken(key) {
+  const h = createHash("sha256").update(key).digest("hex")
+  const had = exchanged.get(h)
+  if (had && (!had.exp || had.exp - Date.now() > SOON)) return had.tok
+  const res = await fetch(API + "/auth/exchange_user_api_key", {
+    method: "POST",
+    headers: { ...(await headersFor(key)), "Connect-Protocol-Version": undefined },
+    body: "{}",
+    signal: AbortSignal.timeout(15_000),
+  }).catch((e) => {
+    throw Object.assign(new Error("Cursor: couldn't reach the API: " + e.message), { status: 502 })
+  })
+  if (res.status >= 500) throw Object.assign(new Error(`Cursor: exchange_user_api_key: HTTP ${res.status}`), { status: 502 })
+  const j = res.ok ? await res.json().catch(() => null) : null
+  if (!j?.accessToken) throw new AuthError("Cursor didn't take this API key")
+  exchanged.set(h, { tok: j.accessToken, exp: expiry(j.accessToken) })
+  return j.accessToken
+}
+
+// tokenOf is the token to call Cursor's API with, for a sign-in.
+async function tokenOf(auth) {
+  if (auth?.type === "api" && auth.key) return keyToken(auth.key)
+  if (auth?.type !== "oauth") throw new AuthError("Cursor isn't signed in")
+  if (auth.refresh === CLI_MARK) return cliTokenNow()
+  const exp = auth.expires || expiry(auth.access)
+  if (!auth.access) throw new AuthError("Cursor isn't signed in")
+  // Cursor's sign-in has nothing to renew it with: cursor-agent itself
+  // signs in again when it runs out (about two months)
+  if (exp && exp <= Date.now()) throw new AuthError("Cursor's sign-in has run out; sign in to Cursor again")
+  return auth.access
+}
+
+// browserSignIn is cursor-agent's `login`: the page signs in, and
+// /auth/poll hands the tokens over once it has.
+async function browserSignIn() {
+  const verifier = randomBytes(32).toString("base64url")
+  const challenge = createHash("sha256").update(verifier).digest("base64url")
+  const uuid = randomUUID()
+  const url = new URL("/loginDeepControl", WEBSITE)
+  url.searchParams.set("challenge", challenge)
+  url.searchParams.set("uuid", uuid)
+  url.searchParams.set("mode", "login")
+  url.searchParams.set("redirectTarget", "cli")
+  return {
+    url: url.toString(),
+    instructions: "Sign in to Cursor in the browser; this finishes by itself.",
+    method: "auto",
+    async callback() {
+      const headers = { "Content-Type": "application/json", "x-cursor-client-version": await clientVersion(), "x-cursor-client-type": "cli" }
+      let errors = 0
+      for (let r = 0; r < 150; r++) {
+        const wait = Math.min(1000 * 1.2 ** r, 10_000)
+        let res
+        try {
+          res = await fetch(`${API}/auth/poll?uuid=${uuid}&verifier=${verifier}`, { headers, signal: AbortSignal.timeout(15_000) })
+        } catch {
+          if (++errors >= 3) return { type: "failed" }
+          await sleep(wait)
+          continue
+        }
+        if (res.status === 404) {
+          errors = 0
+          await sleep(wait)
+          continue
+        }
+        if (!res.ok) {
+          if (res.status === 403 || ++errors >= 3) return { type: "failed" }
+          await sleep(wait)
+          continue
+        }
+        const j = await res.json().catch(() => null)
+        if (!j?.accessToken || !("refreshToken" in j)) return { type: "failed" }
+        const who = await whoIs(j.accessToken)
+        return {
+          type: "success",
+          access: j.accessToken,
+          refresh: j.refreshToken || "none",
+          expires: expiry(j.accessToken) || Date.now() + 30 * 24 * 3600 * 1000,
+          ...(who.email ? { accountId: who.email } : {}),
+          ...(who.plan ? { plan: who.plan } : {}),
+        }
+      }
+      return { type: "failed" }
+    },
+  }
+}
+
+// cliSignIn takes the account cursor-agent is signed in to; its token is
+// read each time from where cursor-agent keeps it.
+async function cliSignIn() {
+  return {
+    url: "",
+    instructions: "Uses the account `cursor-agent login` signed in to.",
+    method: "auto",
+    async callback() {
+      const tok = await cliToken()
+      const exp = expiry(tok)
+      if (!tok || (exp && exp <= Date.now())) return { type: "failed" }
+      const who = await whoIs(tok)
+      if (!who.email) return { type: "failed" }
+      return { type: "success", access: "", refresh: CLI_MARK, expires: 0, accountId: who.email, ...(who.plan ? { plan: who.plan } : {}) }
+    },
+  }
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+
+// ---- models ----------------------------------------------------------------------
+//
+// Cursor lists a model once for each effort and speed it serves it at
+// ("grok-4.7-low", "grok-4.7-low-fast", … "grok-4.7-xhigh-fast"), and a
+// Claude with thinking apart from one without. One model a family is
+// offered, with the efforts there are, and the request asks for the id the
+// effort picks. Fast stays a model of its own.
+
+// the effort words of Cursor's ids, the levels they are and the words
+// Cursor's names say them in; extra-high before high
+const EFFORTS = [
+  ["extra-high", "xhigh", "Extra High"], ["xhigh", "xhigh", "Extra High"], ["minimal", "minimal", "Minimal"],
+  ["none", "none", "None"], ["low", "low", "Low"], ["medium", "medium", "Medium"], ["high", "high", "High"], ["max", "max", "Max"],
+]
+const LEVEL_RANK = ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+const EFFORT_RANK = ["none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"]
+
+const cut = (s, suffix) => (s.endsWith(suffix) && s.length > suffix.length ? s.slice(0, -suffix.length) : null)
+
+// splitID is a Cursor id taken apart: its family, and the effort ("" for
+// none named) it is at. Thinking comes before the effort or after it; in
+// the family it goes after, as does fast.
+function splitID(id) {
+  let s = id
+  let fast = false
+  let thinking = false
+  let effort = ""
+  let b
+  if ((b = cut(s, "-fast")) !== null) [s, fast] = [b, true]
+  if ((b = cut(s, "-thinking")) !== null) [s, thinking] = [b, true]
+  for (const [word, level] of EFFORTS) {
+    if ((b = cut(s, "-" + word)) !== null) {
+      ;[s, effort] = [b, level]
+      break
+    }
+  }
+  if (!thinking && (b = cut(s, "-thinking")) !== null) [s, thinking] = [b, true]
+  if (thinking) s += "-thinking"
+  if (fast) s += "-fast"
+  return [s, effort]
+}
+
+const labelOf = (level) => EFFORTS.find((e) => e[1] === level)?.[2] ?? ""
+
+// withoutWords is name with the first run of these words taken out, and
+// whether it had them.
+function withoutWords(name, words) {
+  const ns = name.split(/\s+/).filter(Boolean)
+  const ws = words.split(/\s+/).filter(Boolean)
+  if (!ws.length) return [name, false]
+  for (let i = 0; i + ws.length <= ns.length; i++)
+    if (ws.every((w, j) => ns[i + j] === w)) return [[...ns.slice(0, i), ...ns.slice(i + ws.length)].join(" "), true]
+  return [name, false]
+}
+
+function families(raw) {
+  const out = []
+  const by = new Map()
+  for (const m of raw) {
+    const [id, effort] = splitID(m.id)
+    let f = by.get(id)
+    if (!f) {
+      f = { id, variants: [], efforts: [] }
+      by.set(id, f)
+      out.push(f)
+    }
+    f.variants.push(m)
+    f.efforts.push(effort)
+  }
+  return out
+}
+
+// byEffort is the id for each effort, "" the one Cursor picks by default:
+// the one without an effort in its id, else the one whose name doesn't say
+// its effort, else medium, else the first.
+function byEffort(f) {
+  const out = {}
+  let def = f.efforts.indexOf("")
+  f.variants.forEach((v, i) => {
+    const e = f.efforts[i]
+    if (!(e in out)) out[e] = v.id
+    if (def < 0 && e !== "" && !withoutWords(v.name, labelOf(e))[1]) def = i
+  })
+  if (def < 0) def = Math.max(0, f.efforts.indexOf("medium"))
+  out[""] = f.variants[def].id
+  return out
+}
+
+function familyModel(f) {
+  const def = byEffort(f)[""]
+  const m = { id: f.id, name: f.id, context: 0, efforts: [] }
+  f.variants.forEach((v, i) => {
+    if (v.id === def) m.name = withoutWords(v.name, labelOf(f.efforts[i]))[0]
+    if (v.context > 0 && (!m.context || v.context < m.context)) m.context = v.context
+  })
+  for (const l of LEVEL_RANK) if (f.efforts.includes(l)) m.efforts.push(l)
+  return m
+}
+
+// contextOf is how much of a conversation Cursor lets a model hold: what
+// the name says ("Claude Opus 5.5 1M"), else Cursor's default.
+function contextOf(name) {
+  const m = /\b(\d+)M\b/.exec(name)
+  return m ? Number(m[1]) * 1_000_000 : DEFAULT_CONTEXT
+}
+
+const CAPACITY = /\(\s*\d+M\s*\)|\b\d+M\b/g
+
+// withoutCapacity takes the context out of each name, which is shown apart;
+// a name that would then be another model's keeps it.
+function withoutCapacity(ms) {
+  const strip = (n) => n.replace(CAPACITY, " ").split(/\s+/).filter(Boolean).join(" ")
+  const names = new Map()
+  const add = (n) => names.set(n.toLowerCase(), (names.get(n.toLowerCase()) ?? 0) + 1)
+  for (const m of ms) {
+    add(m.name)
+    const s = strip(m.name)
+    if (s !== m.name) add(s)
+  }
+  return ms.map((m) => {
+    const s = strip(m.name)
+    return s === m.name || !s || names.get(s.toLowerCase()) > 1 ? m : { ...m, name: s }
+  })
+}
+
+// offered is Cursor's list as it is offered: each family one model.
+function offered(raw) {
+  return withoutCapacity(families(raw).map((f) => (f.variants.length === 1 ? { ...f.variants[0], efforts: [] } : familyModel(f))))
+}
+
+function variantsIn(raw, model) {
+  const f = families(raw).find((f) => f.id === model && f.variants.length > 1)
+  return f ? byEffort(f) : null
+}
+
+function baseIn(raw, id) {
+  const [family, effort] = splitID(id)
+  if (family === id) return null
+  const f = families(raw).find((f) => f.id === family && f.variants.length > 1 && f.variants.some((m) => m.id === id))
+  return f ? [family, effort] : null
+}
+
+function fitEffort(want, levels) {
+  if (want === "ultra" && !levels.includes(want)) want = "max"
+  if (!levels.length || levels.includes(want)) return want
+  const at = EFFORT_RANK.indexOf(want)
+  if (at < 0) return want
+  let best = want
+  let dist = EFFORT_RANK.length
+  for (const l of levels) {
+    const i = EFFORT_RANK.indexOf(l)
+    if (i < 0 || l === "none") continue
+    const d = Math.abs(i - at)
+    if (d < dist || (d === dist && i > at)) [best, dist] = [l, d]
+  }
+  return best
+}
+
+// modelID is Cursor's id for a model offered, at the effort asked for: the
+// family's variant at it; else, for an effort between the ones it has, the
+// one Cursor picks by default; else the nearest. Fast, when asked, is from
+// the family's fast one. An id of Cursor's own at an effort is at the
+// effort asked for where Cursor has that id; else it goes as it is.
+function modelID(raw, model, effort, fast) {
+  const base = baseIn(raw, model)
+  if (base) {
+    let [b, at] = base
+    effort ||= at
+    if (fast && !b.endsWith("-fast") && variantsIn(raw, b + "-fast")) b += "-fast"
+    const vs = variantsIn(raw, b)
+    return vs && effort && vs[effort] ? vs[effort] : model
+  }
+  if (fast && !model.endsWith("-fast") && variantsIn(raw, model + "-fast")) model += "-fast"
+  const vs = variantsIn(raw, model)
+  if (!vs) return model
+  if (!effort) return vs[""]
+  if (vs[effort]) return vs[effort]
+  const levels = []
+  let unnamed = true // the default has no effort of its own
+  for (const l of EFFORT_RANK) {
+    if (vs[l]) {
+      levels.push(l)
+      unnamed &&= vs[l] !== vs[""]
+    }
+  }
+  if (!levels.length) return vs[""]
+  const at = EFFORT_RANK.indexOf(effort)
+  if (unnamed && at > EFFORT_RANK.indexOf(levels[0]) && at < EFFORT_RANK.indexOf(levels.at(-1))) return vs[""]
+  return vs[fitEffort(effort, levels)]
+}
+
+// usable is the account's list, as `cursor-agent models` has it: its ids,
+// names and the id each is run by; kept a while, by token.
+const lists = new Map()
+async function usable(tok) {
+  const h = createHash("sha256").update(tok).digest("hex")
+  const had = lists.get(h)
+  if (had && Date.now() - had.at < MODELS_KEEP) return had.raw
+  const j = await unary(API, "agent.v1.AgentService/GetUsableModels", tok, {}, 30_000)
+  const raw = []
+  for (const m of j?.models ?? []) {
+    const id = m.displayModelId || m.modelId
+    if (!id) continue
+    // some names come with zero-width spaces and doubled ones
+    let name = String(m.displayName || id).replaceAll("​", "").split(/\s+/).filter(Boolean).join(" ")
+    name = name.replace(/\(default\)$/, "").trim().replace(/\(current\)$/, "").trim()
+    raw.push({ id, name, context: contextOf(name), run: m.modelId || id })
+  }
+  if (!raw.length) throw new Error("Cursor listed no models")
+  lists.set(h, { at: Date.now(), raw })
+  return raw
+}
+
+function runtimeModel(m) {
+  return {
+    id: m.id,
+    providerID: ID,
+    name: m.name,
+    api: { id: m.id, url: AGENT, npm: CHAT },
+    status: "active",
+    headers: {},
+    options: {},
+    cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    limit: { context: m.context || DEFAULT_CONTEXT, output: 0 },
+    capabilities: {
+      temperature: false,
+      reasoning: m.efforts.length > 0,
+      attachment: true,
+      toolcall: true,
+      input: { text: true, image: true, audio: false, video: false, pdf: false },
+      output: { text: true, image: false, audio: false, video: false, pdf: false },
+      interleaved: false,
+    },
+    release_date: "",
+    variants: Object.fromEntries(m.efforts.map((e) => [e, { reasoningEffort: e }])),
+  }
+}
+
+// ---- protobuf, by hand ------------------------------------------------------------
+
+class PB {
+  parts = []
+  push(b) {
+    this.parts.push(b)
+    return this
+  }
+  uv(v) {
+    const out = []
+    while (v >= 0x80) {
+      out.push((v % 128) | 0x80)
+      v = Math.floor(v / 128)
+    }
+    out.push(v)
+    return this.push(Uint8Array.from(out))
+  }
+  tag(num, wire) {
+    return this.uv(num * 8 + wire)
+  }
+  varint(num, v) {
+    return this.tag(num, 0).uv(v)
+  }
+  bytes(num, v) {
+    const b = v instanceof PB ? v.done() : v ?? EMPTY
+    return this.tag(num, 2).uv(b.length).push(b)
+  }
+  str(num, s) {
+    return this.bytes(num, Buffer.from(s, "utf8"))
+  }
+  double(num, v) {
+    const b = Buffer.alloc(8)
+    b.writeDoubleLE(v)
+    return this.tag(num, 1).push(b)
+  }
+  done() {
+    return Buffer.concat(this.parts)
+  }
+}
+const pb = () => new PB()
+
+// fields reads a message's fields; a malformed tail is dropped.
+function fields(b) {
+  b = Buffer.isBuffer(b) ? b : Buffer.from(b ?? EMPTY)
+  const out = []
+  let i = 0
+  const uv = () => {
+    let v = 0
+    let m = 1
+    while (i < b.length) {
+      const c = b[i++]
+      v += (c & 0x7f) * m
+      if (c < 0x80) return v
+      m *= 128
+    }
+    return -1
+  }
+  while (i < b.length) {
+    const key = uv()
+    if (key < 0) break
+    const f = { num: Math.floor(key / 8), wire: key % 8, n: 0, data: EMPTY }
+    switch (f.wire) {
+      case 0: {
+        const v = uv()
+        if (v < 0) return out
+        f.n = v
+        break
+      }
+      case 1:
+        if (i + 8 > b.length) return out
+        f.data = b.subarray(i, i + 8)
+        f.n = Number(b.readBigUInt64LE(i))
+        i += 8
+        break
+      case 2: {
+        const l = uv()
+        if (l < 0 || i + l > b.length) return out
+        f.data = b.subarray(i, i + l)
+        i += l
+        break
+      }
+      case 5:
+        if (i + 4 > b.length) return out
+        f.n = b.readUInt32LE(i)
+        i += 4
+        break
+      default:
+        return out
+    }
+    out.push(f)
+  }
+  return out
+}
+
+const field = (fs, num) => fs.find((f) => f.num === num)
+const pbStr = (fs, num) => field(fs, num)?.data.toString("utf8") ?? ""
+const pbNum = (fs, num) => field(fs, num)?.n ?? 0
+
+// pbValue is a google.protobuf.Value.
+function pbValue(v) {
+  if (v === null || v === undefined) return pb().varint(1, 0)
+  if (typeof v === "number") return pb().double(2, v)
+  if (typeof v === "string") return pb().str(3, v)
+  if (typeof v === "boolean") return pb().varint(4, v ? 1 : 0)
+  if (Array.isArray(v)) {
+    const l = pb()
+    for (const e of v) l.bytes(1, pbValue(e))
+    return pb().bytes(6, l)
+  }
+  if (typeof v === "object") {
+    const st = pb()
+    for (const k of Object.keys(v).sort()) st.bytes(1, pb().str(1, k).bytes(2, pbValue(v[k])))
+    return pb().bytes(5, st)
+  }
+  return pb().varint(1, 0)
+}
+
+// pbAny reads a google.protobuf.Value.
+function pbAny(b) {
+  for (const f of fields(b)) {
+    switch (f.num) {
+      case 1:
+        return null
+      case 2:
+        return f.data.length === 8 ? f.data.readDoubleLE(0) : 0
+      case 3:
+        return f.data.toString("utf8")
+      case 4:
+        return f.n !== 0
+      case 5: {
+        const m = {}
+        for (const e of fields(f.data)) {
+          if (e.num !== 1) continue
+          const kv = fields(e.data)
+          const v = field(kv, 2)
+          m[pbStr(kv, 1)] = v ? pbAny(v.data) : null
+        }
+        return m
+      }
+      case 6:
+        return fields(f.data).filter((e) => e.num === 1).map((e) => pbAny(e.data))
+    }
+  }
+  return null
+}
+
+// frame wraps a message as one frame of a Connect stream.
+function frame(msg) {
+  const head = Buffer.alloc(5)
+  head.writeUInt32BE(msg.length, 1)
+  return Buffer.concat([head, msg])
+}
+
+// frames reads a Connect stream's frames: a message, or the stream's end
+// with its JSON.
+async function* frames(body) {
+  let buf = EMPTY
+  for await (const chunk of body) {
+    buf = buf.length ? Buffer.concat([buf, chunk]) : Buffer.from(chunk)
+    while (buf.length >= 5) {
+      const n = buf.readUInt32BE(1)
+      if (n > 64 << 20) throw new Error("a malformed stream")
+      if (buf.length < 5 + n) break
+      const flags = buf[0]
+      let data = buf.subarray(5, 5 + n)
+      buf = buf.subarray(5 + n)
+      if (flags & 1) data = gunzipSync(data)
+      yield { end: (flags & 2) !== 0, data }
+    }
+  }
+  if (buf.length) throw new Error("unexpected EOF")
+}
+
+// ---- failures -----------------------------------------------------------------------
+
+const regional = (msg) => msg.toLowerCase().includes("region")
+
+// failure is the status and message for Cursor's Connect error, whose
+// details say it best: {"code", "message", "details": [{"debug": {"error",
+// "details": {"title", "detail"}}}]}, or the same under "error" at a
+// stream's end.
+function failure(status, text) {
+  let e
+  try {
+    e = JSON.parse(typeof text === "string" ? text : Buffer.from(text).toString("utf8"))
+  } catch {
+    return statusOf(status, "", String(text ?? "").trim())
+  }
+  const f = e?.error && typeof e.error === "object" ? e.error : e ?? {}
+  let msg = f.message ?? ""
+  for (const d of f.details ?? []) {
+    const t = `${d?.debug?.details?.title ?? ""}: ${d?.debug?.details?.detail ?? ""}`.trim()
+    if (t !== ":") msg = t.replace(/^[:\s]+|[:\s]+$/g, "")
+  }
+  if (!msg || msg === "Error") msg = f.code ?? ""
+  if (!f.code && status >= 200 && status < 300) return { status, message: msg } // a stream that ended well
+  return statusOf(status, f.code ?? "", msg)
+}
+
+// statusOf is the status and words for Cursor's error of this code and
+// message. A region the team isn't served in says so, not to sign in.
+function statusOf(status, code, msg) {
+  msg ||= `HTTP ${status}`
+  const low = msg.toLowerCase()
+  const out = (status, message) => ({ status, message: "Cursor: " + message })
+  if (regional(msg)) return out(403, msg + " — Cursor serves your team only in some regions and turned this request away; signing in again won't change that")
+  if (code === "permission_denied") return out(403, msg)
+  if (code === "unauthenticated" || status === 401 || low.includes("expired")) return out(401, msg + " — sign in to Cursor again")
+  if (code === "resource_exhausted" || low.includes("quota") || low.includes("rate limit") || low.includes("usage limit"))
+    return out(429, "usage limit reached: " + msg)
+  if (low.includes("too long") || low.includes("context length") || low.includes("too many tokens"))
+    return out(400, "input is too long for the model's context: " + msg)
+  if (code === "invalid_argument") return out(400, msg)
+  if (code === "unavailable") return out(503, msg)
+  if (code) return out(502, msg)
+  return out(status, msg)
+}
+
+// ---- the conversation -------------------------------------------------------------
+
+const textOf = (c) =>
+  typeof c === "string" ? c : Array.isArray(c) ? c.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("") : ""
+
+function parseArgs(s) {
+  if (s && typeof s === "object") return s
+  try {
+    const v = JSON.parse(s || "{}")
+    return v && typeof v === "object" ? v : {}
+  } catch {
+    return {}
+  }
+}
+
+// tools are the caller's tools the model may call: none for tool_choice
+// "none", the one named when one is.
+function toolsOf(chat) {
+  const choice = chat.tool_choice
+  const only = typeof choice === "object" ? choice?.function?.name : ""
+  if (choice === "none") return []
+  return (chat.tools ?? [])
+    .filter((t) => t?.type === "function" && t.function?.name && (!only || t.function.name === only))
+    .map((t) => {
+      const schema = t.function.parameters ?? { type: "object", properties: {} }
+      return { name: t.function.name, description: t.function.description ?? "", schema, schemaText: JSON.stringify(schema) }
+    })
+}
+
+// catalog lists the caller's tools for the model. It sees MCP tools only
+// through Cursor's GetDynamicTools and CallDynamicTool, and Cursor names
+// them in a prompt of its own, which this conversation goes without:
+// without the list the model says it has no such tool.
+function catalog(tools) {
+  if (!tools.length) return ""
+  let s = `\n\n<dynamic_tool_catalog>\nThe tools below are available in the MCP namespace "magpie". Call one with \`${CALL}\` (namespace "magpie", toolName, arguments). Their schemas are given here, so there is no need to call \`GetDynamicTools\` first.\n`
+  for (const t of tools) s += `<tool name="${t.name}">\n${t.description}\ninput schema: ${t.schemaText}\n</tool>\n`
+  return s + "</dynamic_tool_catalog>"
+}
+
+// callID is a call's id as Cursor gave it, before the line in it was sent
+// to the caller as __.
+const callID = (id) => (id.startsWith("call_") ? id.replace("__fc_", "\nfc_") : id)
+
+function result(id, text, isError) {
+  let res = text
+  try {
+    res = JSON.parse(text)
+  } catch {}
+  return {
+    type: "tool-result",
+    toolCallId: callID(id),
+    toolName: CALL,
+    result: res,
+    experimental_content: [{ type: "text", text }],
+    ...(isError ? { isError: true } : {}),
+  }
+}
+
+// messages is the conversation as AI SDK messages, in JSON: the system
+// prompt with the caller's tools listed, then each turn. A tool result
+// answers a call of the reply before it; a call left unanswered is
+// answered for, as the API wants every call to have its result. With it,
+// the user's last words and a guess at the prompt's size.
+function conversation(chat, tools) {
+  const out = []
+  const add = (m) => out.push(Buffer.from(JSON.stringify(m)))
+  let size = 0
+  const system = []
+  let last = "."
+  for (const m of chat.messages ?? [])
+    if (m.role === "system" || m.role === "developer") system.push(textOf(m.content))
+  const sys = system.filter(Boolean).join("\n\n") + catalog(tools)
+  size += sys.length
+  if (sys) add({ role: "system", content: sys })
+  let pending = []
+  let results = []
+  const answer = () => {
+    for (const id of pending) results.push(result(id, NO_RESULT, true))
+    pending = []
+    if (results.length) add({ role: "tool", content: results })
+    results = []
+  }
+  for (const m of chat.messages ?? []) {
+    if (m.role === "system" || m.role === "developer") continue
+    if (m.role === "tool") {
+      const id = m.tool_call_id ?? ""
+      const i = pending.indexOf(id)
+      if (i >= 0) {
+        pending.splice(i, 1)
+        const text = textOf(m.content)
+        size += text.length
+        results.push(result(id, text, false))
+      }
+      continue
+    }
+    if (m.role === "assistant") {
+      answer()
+      const content = []
+      const text = textOf(m.content)
+      if (text) content.push({ type: "text", text })
+      size += text.length
+      for (const c of m.tool_calls ?? []) {
+        if (c?.type && c.type !== "function") continue
+        const args = parseArgs(c.function?.arguments)
+        size += (c.function?.arguments ?? "").length + (c.function?.name ?? "").length
+        content.push({ type: "tool-call", toolCallId: callID(c.id), toolName: CALL, args: { namespace: "magpie", toolName: c.function?.name, arguments: args } })
+        pending.push(c.id)
+      }
+      if (content.length) add({ role: "assistant", content })
+      continue
+    }
+    // the user's
+    const content = []
+    const parts = typeof m.content === "string" ? [{ type: "text", text: m.content }] : m.content ?? []
+    let first = ""
+    for (const p of parts) {
+      if (p?.type === "text" && p.text) {
+        content.push({ type: "text", text: p.text })
+        size += p.text.length
+        first ||= p.text
+      } else if (p?.type === "image_url") {
+        const u = typeof p.image_url === "string" ? p.image_url : p.image_url?.url ?? ""
+        const d = /^data:([^;,]+);base64,(.*)$/s.exec(u)
+        if (d) content.push({ type: "image", mimeType: d[1], image: { __type: "Uint8Array", hex: Buffer.from(d[2], "base64").toString("hex") } })
+        else content.push({ type: "text", text: `[attachment image: ${u}]` })
+      } else if (p?.type === "file") {
+        content.push({ type: "text", text: `[attachment ${p.file?.filename ?? "file"}]` })
+      }
+    }
+    answer()
+    if (first) last = first
+    if (content.length) add({ role: "user", content })
+  }
+  answer()
+  for (const t of tools) size += t.name.length + t.description.length + t.schemaText.length
+  return { msgs: out, last, estimate: Math.floor(size / 4) }
+}
+
+// ---- the request ---------------------------------------------------------------------
+
+// toolDef is an McpToolDefinition.
+function toolDef(t) {
+  const d = pb().str(1, t.name)
+  if (t.description) d.str(2, t.description)
+  d.bytes(3, pbValue(t.schema))
+  return d.str(4, "magpie").str(5, t.name).str(6, t.schemaText).done()
+}
+
+const env = () => pb().str(1, GOOS).str(2, tmpdir()).str(10, "UTC")
+
+// buildRun is the Run's first message, an AgentClientMessage with its
+// run_request, and the blobs it names. The conversation state is the
+// messages and one turn, which the server wants there to sample at all.
+function buildRun(msgs, lastUser, tools, model) {
+  const blobs = new Map()
+  const put = (b) => {
+    const id = createHash("sha256").update(b).digest()
+    blobs.set(id.toString("hex"), b)
+    return id
+  }
+  const state = pb()
+  for (const m of msgs) state.bytes(1, put(m))
+  const mid = randomUUID()
+  const user = pb().str(1, lastUser).str(2, mid).varint(4, 1).done() // mode: agent
+  const turn = pb().bytes(1, pb().bytes(1, put(user)).str(10, mid)).done()
+  state.bytes(8, put(turn)).varint(10, 1).str(22, "cli")
+  const defs = tools.map(toolDef)
+  const rc = pb().bytes(4, env())
+  const mcp = pb()
+  for (const d of defs) {
+    rc.bytes(7, d)
+    mcp.bytes(1, d)
+  }
+  const action = pb().bytes(2, pb().bytes(2, rc)) // resume_action
+  const rr = pb()
+    .bytes(1, state)
+    .bytes(2, action)
+    .bytes(3, pb().str(1, model).str(3, model).str(4, model))
+    .bytes(4, mcp)
+    .str(5, randomUUID())
+    .bytes(9, pb().str(1, model))
+    .varint(19, 1) // inline images
+  return { first: pb().bytes(1, rr).done(), blobs }
+}
+
+// ---- the agent API ---------------------------------------------------------------------
+
+// endpoints are the agent API picked for each token (by its hash). As
+// cursor-agent does, it is what ServerConfigService/GetServerConfig names —
+// a team may be served in one region only, and the global API turns it
+// away — asked once a token, and again when fresh is set; the global one
+// while it can't be had.
+const endpoints = new Map()
+async function agentURL(tok, fresh) {
+  const key = createHash("sha256").update(tok).digest("hex")
+  const had = endpoints.get(key)
+  if (!fresh && had && (had.listed || Date.now() - had.at < 60_000)) return had.url
+  let url = AGENT
+  let listed = false
+  try {
+    const cfg = await unary(API, "aiserver.v1.ServerConfigService/GetServerConfig", tok, {}, 10_000)
+    for (const raw of [cfg?.agentUrlConfig?.agentUrl, cfg?.agentUrlConfig?.agentnUrl]) {
+      try {
+        const u = new URL(raw)
+        if ((u.protocol === "https:" || u.protocol === "http:") && u.host) {
+          url = raw.replace(/\/+$/, "")
+          listed = true
+          break
+        }
+      } catch {}
+    }
+  } catch {}
+  endpoints.set(key, { url, at: Date.now(), listed })
+  return url
+}
+
+// open starts a Run at base: the session, the stream, and the response's
+// status, or an error the request never got past.
+function open(base, headers, signal) {
+  return new Promise((resolve) => {
+    const u = new URL(base)
+    const session = http2.connect(u.origin)
+    let done = false
+    const fail = (e) => {
+      if (done) return
+      done = true
+      session.destroy()
+      resolve({ error: { status: 502, message: "Cursor: " + (e?.message ?? String(e)) } })
+    }
+    session.on("error", fail)
+    const req = session.request({
+      ":method": "POST",
+      ":path": u.pathname.replace(/\/+$/, "") + "/agent.v1.AgentService/Run",
+      ...headers,
+    })
+    req.on("error", fail)
+    req.once("response", (h) => {
+      if (done) return
+      done = true
+      resolve({ session, req, status: Number(h[":status"]) })
+    })
+    signal?.addEventListener("abort", () => fail(new Error("the request was cancelled")), { once: true })
+  })
+}
+
+// runOnce is one Run of the chat on the agent API at base: an async
+// iterator of the answer's pieces, or the error it failed with before any.
+async function runOnce({ tok, base, id, tools, conv, signal }) {
+  const { first, blobs } = buildRun(conv.msgs, conv.last, tools, id)
+  const o = await open(
+    base,
+    {
+      "content-type": "application/connect+proto",
+      "connect-protocol-version": "1",
+      authorization: `Bearer ${tok}`,
+      "x-cursor-client-version": await clientVersion(),
+      "x-cursor-client-type": "cli", // else Cursor adds a prompt of its own
+      "x-ghost-mode": "true", // privacy mode: nothing kept for training
+      "x-request-id": randomUUID(),
+      // none of Cursor's own tools, only the caller's
+      "x-cursor-agent-allowed-tools": "mcp_tool_call,get_mcp_tools_tool_call",
+    },
+    signal,
+  )
+  if (o.error) return o
+  const { session, req } = o
+  let closed = false
+  const send = (msg) => {
+    if (!closed && !req.destroyed && req.writable) req.write(frame(msg))
+  }
+  const heartbeat = setInterval(() => send(pb().bytes(7, EMPTY).done()), 5000) // the client is still there, as the CLI says
+  const close = () => {
+    if (closed) return
+    closed = true
+    clearInterval(heartbeat)
+    try {
+      req.close(http2.constants.NGHTTP2_CANCEL)
+    } catch {}
+    session.close()
+    setTimeout(() => session.destroy(), 1000).unref?.()
+  }
+  signal?.addEventListener("abort", close, { once: true })
+  send(first)
+  if (o.status < 200 || o.status > 299) {
+    const chunks = []
+    try {
+      for await (const c of req) chunks.push(c)
+    } catch {}
+    close()
+    return { error: failure(o.status, Buffer.concat(chunks).toString("utf8").slice(0, 1 << 20)) }
+  }
+  const it = decode(frames(req), { send, blobs, tools, estimate: conv.estimate })
+  const wrapped = (async function* () {
+    try {
+      yield* it
+    } finally {
+      close()
+    }
+  })()
+  // an error comes before anything of the answer: out of quota, a model the
+  // plan doesn't have — answered with its own status
+  const head = await wrapped.next()
+  if (head.done) return { error: { status: 502, message: "Cursor: an empty reply" } }
+  if (head.value.error) {
+    await wrapped.return()
+    return { error: head.value.error }
+  }
+  return {
+    events: (async function* () {
+      yield head.value
+      yield* wrapped
+    })(),
+  }
+}
+
+// decode follows the server's messages into the answer's pieces until the
+// turn ends, or the model has made its tool calls.
+async function* decode(stream, { send, blobs, tools, estimate }) {
+  let calls = 0
+  let listed = 0
+  let said = 0
+  let usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  const finish = () => {
+    if (!usage.output) usage.output = Math.floor((said + 3) / 4)
+    if (!usage.input) usage.input = estimate
+    const prompt = usage.input + usage.cacheRead + usage.cacheWrite
+    return {
+      stop: calls > 0 ? "tool_calls" : "stop",
+      usage: {
+        prompt_tokens: prompt,
+        completion_tokens: usage.output,
+        total_tokens: prompt + usage.output,
+        prompt_tokens_details: { cached_tokens: usage.cacheRead, cache_write_tokens: usage.cacheWrite },
+      },
+    }
+  }
+  const closeExec = (id) => send(pb().bytes(5, pb().bytes(1, pb().varint(1, id))).done())
+  try {
+    for await (const f of stream) {
+      if (f.end) {
+        const e = failure(200, f.data)
+        if (e.status < 200 || e.status > 299) yield { error: e }
+        else if (said === 0 && calls === 0) yield { error: { status: 502, message: "Cursor: an empty reply" } }
+        else yield finish()
+        return
+      }
+      for (const m of fields(f.data)) {
+        switch (m.num) {
+          case 1: // interaction_update
+            for (const u of fields(m.data)) {
+              const uf = fields(u.data)
+              switch (u.num) {
+                case 1: {
+                  // text
+                  const t = pbStr(uf, 1)
+                  if (t) {
+                    said += t.length
+                    yield { text: t }
+                  }
+                  break
+                }
+                case 4: {
+                  // thinking
+                  const t = pbStr(uf, 1)
+                  if (t) {
+                    said += t.length
+                    yield { reasoning: t }
+                  }
+                  break
+                }
+                case 14: // turn ended, with what it used
+                  usage = { input: pbNum(uf, 1), output: pbNum(uf, 2), cacheRead: pbNum(uf, 3), cacheWrite: pbNum(uf, 4) }
+                  if (calls === 0) {
+                    yield finish()
+                    return
+                  }
+                  break
+                case 27: // how many tool calls the step makes, sent before them
+                  listed = pbNum(uf, 1)
+                  if (listed > 0 && calls >= listed) {
+                    yield finish()
+                    return
+                  }
+                  break
+              }
+            }
+            break
+          case 2: {
+            // exec_server_message: the server asks the client to run something
+            const call = exec(m.data, tools, send, closeExec)
+            if (call) {
+              said += call.args.length
+              yield { tool: { index: calls++, ...call } }
+            }
+            if (listed > 0 && calls >= listed) {
+              // every call made: the caller runs them
+              yield finish()
+              return
+            }
+            break
+          }
+          case 4: {
+            // kv_server_message: a blob wanted, or one to keep
+            const kv = fields(m.data)
+            const id = pbNum(kv, 1)
+            for (const k of kv) {
+              if (k.num === 2) {
+                const want = field(fields(k.data), 1)?.data.toString("hex") ?? ""
+                const b = blobs.get(want)
+                const res = b ? pb().bytes(1, b) : pb().bytes(2, pb().str(1, "blob not found"))
+                send(pb().bytes(3, pb().varint(1, id).bytes(2, res)).done())
+              } else if (k.num === 3) {
+                // the server's own record of the turn, not needed
+                send(pb().bytes(3, pb().varint(1, id).bytes(3, EMPTY)).done())
+              }
+            }
+            break
+          }
+        }
+      }
+    }
+    if (calls > 0) {
+      yield finish()
+      return
+    }
+    yield { error: { status: 502, message: "Cursor: the reply broke off: EOF" } }
+  } catch (e) {
+    if (calls > 0 && /EOF/.test(e?.message ?? "")) {
+      yield finish()
+      return
+    }
+    yield { error: { status: 502, message: "Cursor: the reply broke off: " + (e?.message ?? e) } }
+  }
+}
+
+// exec answers what the server asks the client to run: a call of the
+// caller's tools is returned, the list of them is given, and anything else
+// is refused.
+function exec(msg, tools, send, closeExec) {
+  const es = fields(msg)
+  const id = pbNum(es, 1)
+  const execID = pbStr(es, 15)
+  const answer = (num, res) => {
+    send(pb().bytes(2, pb().varint(1, id).str(15, execID).bytes(num, res)).done())
+    closeExec(id)
+  }
+  for (const e of es) {
+    switch (e.num) {
+      case 11: {
+        // mcp_args: a call of the caller's tools
+        const a = fields(e.data)
+        const args = {}
+        for (const kv of a) {
+          if (kv.num !== 2) continue
+          const ef = fields(kv.data)
+          const v = field(ef, 2)
+          args[pbStr(ef, 1)] = v ? pbAny(v.data) : null
+        }
+        const name = pbStr(a, 5) || pbStr(a, 1).replace(/^magpie-/, "")
+        // an OpenAI model's id is its call's and its item's, a line apart,
+        // which no caller would take as an id: the line goes as __
+        const cid = pbStr(a, 3).replaceAll("\n", "__") || "call_" + randomBytes(12).toString("hex")
+        return { id: cid, name, args: JSON.stringify(args) }
+      }
+      case 36: {
+        // mcp_state_exec_args: the tools there are
+        const srv = pb().str(1, "magpie").str(2, "magpie").str(7, "connected")
+        for (const t of tools) srv.bytes(5, toolDef(t))
+        answer(36, pb().bytes(1, pb().bytes(1, srv)))
+        return null
+      }
+      case 10: // request_context_args
+        answer(10, pb().bytes(1, pb().bytes(1, pb().bytes(4, env()))))
+        return null
+    }
+  }
+  // a shell, a file read or an edit of Cursor's own: never run
+  send(pb().bytes(5, pb().bytes(2, pb().varint(1, id).str(2, "not available"))).done())
+  closeExec(id)
+  return null
+}
+
+// ---- chat completions ------------------------------------------------------------------
+
+const errorResponse = ({ status, message }) =>
+  new Response(JSON.stringify({ error: { message, type: "cursor_error", code: status } }), {
+    status,
+    headers: { "Content-Type": "application/json" },
+  })
+
+// answer runs a chat completion on Cursor and answers it as one, streamed
+// or not.
+async function answer(auth, chat, signal) {
+  let tok
+  try {
+    tok = await tokenOf(auth)
+  } catch (e) {
+    return errorResponse({ status: e.status ?? 401, message: e.message.startsWith("Cursor") ? e.message : "Cursor: " + e.message })
+  }
+  const model = String(chat.model ?? "")
+  let raw = []
+  try {
+    raw = await usable(tok)
+  } catch {}
+  const fast = chat.service_tier === "priority" || chat.service_tier === "fast"
+  let id = modelID(raw, model, chat.reasoning_effort ?? "", fast)
+  id = raw.find((m) => m.id === id)?.run ?? id
+  if (id === "auto") id = "default" // Cursor's pick, which its API calls default
+  const tools = toolsOf(chat)
+  const conv = conversation(chat, tools)
+  const base = await agentURL(tok, false)
+  let r = await runOnce({ tok, base, id, tools, conv, signal })
+  if (r.error && regional(r.error.message)) {
+    // the team moved, or the config was kept from before: once more with
+    // what the config says now
+    const fresh = await agentURL(tok, true)
+    if (fresh !== base) r = await runOnce({ tok, base: fresh, id, tools, conv, signal })
+  }
+  if (r.error) return errorResponse(r.error)
+  const it = r.events
+  const cid = "chatcmpl-" + randomBytes(12).toString("hex")
+  const created = Math.floor(Date.now() / 1000)
+
+  if (!chat.stream) {
+    const msg = { role: "assistant", content: "" }
+    let reasoning = ""
+    const calls = []
+    let stop = "stop"
+    let usage
+    for await (const e of it) {
+      if (e.error) return errorResponse(e.error)
+      if (e.text) msg.content += e.text
+      if (e.reasoning) reasoning += e.reasoning
+      if (e.tool) calls.push({ id: e.tool.id, type: "function", function: { name: e.tool.name, arguments: e.tool.args } })
+      if (e.stop) [stop, usage] = [e.stop, e.usage]
+    }
+    if (reasoning) msg.reasoning_content = reasoning
+    if (calls.length) msg.tool_calls = calls
+    return Response.json({ id: cid, object: "chat.completion", created, model, choices: [{ index: 0, message: msg, finish_reason: stop }], ...(usage ? { usage } : {}) })
+  }
+
+  const chunk = (delta, finish_reason = null, extra = {}) =>
+    enc.encode(`data: ${JSON.stringify({ id: cid, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason }], ...extra })}\n\n`)
+  let began = false
+  const stream = new ReadableStream({
+    async pull(ctl) {
+      const r = await it.next()
+      if (!began) {
+        began = true
+        ctl.enqueue(chunk({ role: "assistant", content: "" }))
+      }
+      if (r.done) {
+        ctl.enqueue(enc.encode("data: [DONE]\n\n"))
+        return ctl.close()
+      }
+      const e = r.value
+      if (e.text) ctl.enqueue(chunk({ content: e.text }))
+      else if (e.reasoning) ctl.enqueue(chunk({ reasoning_content: e.reasoning }))
+      else if (e.tool) ctl.enqueue(chunk({ tool_calls: [{ index: e.tool.index, id: e.tool.id, type: "function", function: { name: e.tool.name, arguments: e.tool.args } }] }))
+      else if (e.stop) ctl.enqueue(chunk({}, e.stop, e.usage ? { usage: e.usage } : {}))
+      else if (e.error) {
+        ctl.enqueue(enc.encode(`data: ${JSON.stringify({ error: { message: e.error.message, code: e.error.status } })}\n\n`))
+        ctl.close()
+      }
+    },
+    cancel() {
+      it.return?.()
+    },
+  })
+  return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } })
+}
+
+// ---- the plugin ---------------------------------------------------------------------------
+
+export async function CursorAuthPlugin() {
+  return {
+    auth: {
+      provider: ID,
+      async loader(getAuth) {
+        const auth = await getAuth()
+        if (!auth || (auth.type !== "oauth" && auth.type !== "api")) return {}
+        return {
+          baseURL: AGENT,
+          apiKey: "cursor",
+          // every chat completion run on Cursor's agent API, with the
+          // sign-in as it is now
+          async fetch(input, init = {}) {
+            const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
+            if (!/\/chat\/completions$/.test(new URL(url).pathname))
+              return errorResponse({ status: 404, message: "Cursor: only chat completions are served" })
+            let chat
+            try {
+              const b = init.body ?? (input instanceof Request ? await input.clone().text() : undefined)
+              chat = JSON.parse(typeof b === "string" ? b : new TextDecoder().decode(b))
+            } catch {
+              return errorResponse({ status: 400, message: "Cursor: a request that isn't JSON" })
+            }
+            return answer((await getAuth()) ?? auth, chat, init.signal ?? (input instanceof Request ? input.signal : undefined))
+          },
+        }
+      },
+      methods: [
+        { type: "oauth", label: "Cursor (browser)", authorize: browserSignIn },
+        { type: "oauth", label: "cursor-agent's sign-in", authorize: cliSignIn },
+        { type: "api", label: "Cursor API key (cursor.com/dashboard → Integrations)" },
+      ],
+    },
+    async config(config) {
+      config.provider ??= {}
+      const was = config.provider[ID] ?? {}
+      config.provider[ID] = {
+        name: "Cursor",
+        npm: CHAT,
+        api: AGENT,
+        ...was,
+        models: {
+          auto: { name: "Auto", limit: { context: DEFAULT_CONTEXT, output: 0 }, attachment: true, tool_call: true },
+          ...(was.models ?? {}),
+        },
+      }
+    },
+    // the account's list, each family of Cursor's ids one model with the
+    // efforts there are
+    provider: {
+      id: ID,
+      async models(provider, { auth } = {}) {
+        if (!auth) return provider.models
+        try {
+          const tok = await tokenOf(auth)
+          return Object.fromEntries(offered(await usable(tok)).map((m) => [m.id, runtimeModel(m)]))
+        } catch {
+          return provider.models
+        }
+      },
+    },
+  }
+}
+
+// for tests
+export const _internal = { splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
