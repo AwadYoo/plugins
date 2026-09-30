@@ -117,3 +117,34 @@ test("the server's times", () => {
   expect(_internal.serverTime("2026-10-05T12:00:00Z")).toBe("2026-10-05T12:00:00.000Z")
   expect(_internal.serverTime("soon")).toBeUndefined()
 })
+
+// the loader's fetch, as OpenCode's engine calls it
+async function loaderFetch(auth, serve) {
+  const sent = []
+  globalThis.fetch = async (url, init = {}) => {
+    const u = new URL(String(url))
+    if (u.pathname.endsWith("/route/chat/completions")) sent.push(typeof init.body === "string" ? init.body : init.body)
+    return serve(u.pathname, init)
+  }
+  const hooks = await MimoAuthPlugin({ client: { auth: { set: async ({ body }) => (auth = body) } } })
+  const l = await hooks.auth.loader(async () => auth)
+  return { fetch: l.fetch, sent }
+}
+
+test("a chat body in bytes has mimo-auto asked as mimo-pro, as a string one does", async () => {
+  const { fetch, sent } = await loaderFetch(account(), () => json({ ok: true }))
+  const req = JSON.stringify({ model: "mimo-auto", messages: [] })
+  await fetch(BASE + "/route/chat/completions", { method: "POST", body: new TextEncoder().encode(req) })
+  await fetch(BASE + "/route/chat/completions", { method: "POST", body: Buffer.from(req) })
+  expect(sent.map((b) => JSON.parse(b).model)).toEqual(["mimo-pro", "mimo-pro"])
+})
+
+test("a sign-in Xiaomi no longer takes is a 401 in the built-in's words, not a thrown fetch", async () => {
+  const { fetch } = await loaderFetch(account(0), (path) => {
+    if (path === "/api/user/xiaomi/me") return new Response("<html>sign in</html>", { status: 200 })
+    return new Response("", { status: 401 })
+  })
+  const res = await fetch(BASE + "/route/chat/completions", { method: "POST", body: JSON.stringify({ model: "mimo-pro", messages: [] }) })
+  expect(res.status).toBe(401)
+  expect((await res.json()).error.message).toBe("42: the Xiaomi MiMo sign-in has expired — sign in again")
+})

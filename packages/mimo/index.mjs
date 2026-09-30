@@ -457,6 +457,9 @@ export const MimoAuthPlugin = async ({ client }) => {
             const req = input instanceof Request ? input : null
             const url = req ? req.url : String(input)
             let body = init.body ?? (req ? await req.text() : undefined)
+            // a body handed over as bytes is read as the string it is
+            if (body instanceof ArrayBuffer) body = new TextDecoder().decode(body)
+            else if (ArrayBuffer.isView(body)) body = new TextDecoder().decode(new Uint8Array(body.buffer, body.byteOffset, body.byteLength))
             // mimo-auto, the app's default, is asked as the model it stands for
             if (typeof body === "string" && body.includes('"mimo-auto"')) {
               try {
@@ -474,12 +477,21 @@ export const MimoAuthPlugin = async ({ client }) => {
               headers.set("X-Client-Version", APP_VERSION)
               return fetch(url, { ...init, method: init.method ?? req?.method ?? "POST", headers, body })
             }
-            const res = await send(false)
-            // a session gone stale, or a redirect to Xiaomi's sign-in page
-            const stale = res.status === 401 || (res.status === 200 && /text\/html/i.test(res.headers.get("content-type") ?? ""))
-            if (!stale || (body != null && typeof body !== "string")) return res
-            await res.arrayBuffer().catch(() => {})
-            return send(true)
+            try {
+              const res = await send(false)
+              // a session gone stale, or a redirect to Xiaomi's sign-in page
+              const stale = res.status === 401 || (res.status === 200 && /text\/html/i.test(res.headers.get("content-type") ?? ""))
+              if (!stale || (body != null && typeof body !== "string")) return res
+              await res.arrayBuffer().catch(() => {})
+              return await send(true)
+            } catch (e) {
+              // the passToken no longer signs the account on: the account's
+              // own 401, in the built-in's words (mimoLapse)
+              if (!(e instanceof Lapsed)) throw e
+              const who = fromAuth(await getAuth())?.creds.userId ?? a.creds.userId
+              const message = `${who}: the Xiaomi MiMo sign-in has expired — sign in again`
+              return new Response(JSON.stringify({ error: { message, type: "authentication_error", code: null } }), { status: 401, headers: { "content-type": "application/json" } })
+            }
           },
         }
       },
