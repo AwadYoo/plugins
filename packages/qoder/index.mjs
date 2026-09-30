@@ -727,6 +727,116 @@ async function bodyText(input, init) {
   return typeof b === "string" ? b : new TextDecoder().decode(b)
 }
 
+// ---- usage --------------------------------------------------------------------
+//
+// The account's allowance as magpie's built-in Qoder account shows it
+// (internal/provider/qoder_usage.go): the account pages' usage, asked with
+// the device token (not the job token the chat runs on), which is rotated
+// with its own refresh token once Qoder refuses it.
+
+class UsageStatus extends Error {
+  constructor(status) {
+    super(`qoder usage: upstream HTTP ${status}`)
+    this.status = status
+  }
+}
+
+// fetchUsage is the usage envelope, {displayMode, qoderUsage}.
+async function fetchUsage(deviceToken) {
+  if (!String(deviceToken ?? "").trim()) throw new Error("qoder usage: missing device token")
+  let res
+  try {
+    res = await fetch(OPENAPI + "/sash/api/v2/me/usage", {
+      headers: { Accept: "application/json", Authorization: `Bearer ${deviceToken}`, "Cosy-ClientType": "10", "User-Agent": "Qoder" },
+      signal: AbortSignal.timeout(20_000),
+    })
+  } catch (e) {
+    throw new Error(`qoder usage: request failed: ${e?.message ?? e}`)
+  }
+  if (res.status !== 200) throw new UsageStatus(res.status)
+  let env
+  try {
+    env = JSON.parse(await res.text())
+  } catch (e) {
+    throw new Error(`qoder usage: decode response: ${e?.message ?? e}`)
+  }
+  if (env?.displayMode !== "qoder" && env?.displayMode !== "enterprise") throw new Error("qoder usage: unknown display mode")
+  if (env.displayMode === "qoder" && (env.qoderUsage === undefined || env.qoderUsage === null)) throw new Error("qoder usage: missing quota data")
+  return env
+}
+
+// refreshDevice trades the device refresh token for a new pair; it rotates
+// too, so the caller saves it.
+async function refreshDevice(refresh) {
+  if (!String(refresh ?? "").trim()) throw new Error("qoder device token refresh: missing refresh token; sign in again")
+  let r
+  try {
+    r = await openapi("/api/v1/deviceToken/refresh", { method: "POST", body: { refresh_token: refresh } })
+  } catch (e) {
+    throw new Error(`qoder device token refresh: request failed: ${e?.message ?? e}`)
+  }
+  if (r.status !== 200) {
+    const err = `qoder device token refresh: upstream HTTP ${r.status}`
+    // the device token serves only the account pages (usage); chat runs on
+    // the job token, so a refused one doesn't lapse the account
+    if (r.status === 401 || r.status === 403)
+      throw new Error(`Qoder usage is unavailable: Qoder refused the account-page sign-in (chat still works) — sign in again to see usage (${err})`)
+    throw new Error(err)
+  }
+  const token = r.json?.token || r.json?.device_token || ""
+  if (!String(token).trim() || !String(r.json?.refresh_token ?? "").trim()) throw new Error("qoder device token refresh: incomplete token pair")
+  return { token, refresh: r.json.refresh_token }
+}
+
+// gfmt is a number as Go's %g writes it.
+function gfmt(n) {
+  const [m, e] = n.toExponential().split("e")
+  const x = Number(e)
+  if (x < -4 || x >= 6) return `${m}e${x < 0 ? "-" : "+"}${String(Math.abs(x)).padStart(2, "0")}`
+  return String(n)
+}
+
+const RFC3339 = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$/i
+
+// when is a time Qoder gives: an RFC 3339 string, else seconds or
+// milliseconds, as a number or its text.
+function when(v) {
+  if (typeof v === "string" && RFC3339.test(v) && !isNaN(Date.parse(v))) return new Date(v).toISOString()
+  const n = typeof v === "number" ? v : typeof v === "string" && v.trim() !== "" ? Number(v.trim()) : NaN
+  if (!isFinite(n) || n <= 0) return undefined
+  return new Date(Math.trunc(n < 1e12 ? n * 1000 : n)).toISOString()
+}
+
+// parseUsage is the plan and each pool of credits the envelope tells.
+function parseUsage(env) {
+  if (env.displayMode === "enterprise") return { plan: "Enterprise" }
+  const u = env.qoderUsage
+  if (env.displayMode !== "qoder" || !u || typeof u !== "object" || Array.isArray(u)) return { error: "Qoder: missing quota data" }
+  const field = (a, b) => (u[a] !== undefined ? u[a] : u[b])
+  const out = { windows: [] }
+  const plan = field("userType", "user_type")
+  if (typeof plan === "string") out.plan = plan
+  const until = when(field("expiresAt", "expires_at"))
+  if (until) out.until = until
+  const num = (v) => v === undefined || v === null || typeof v === "number"
+  const str = (v) => v === undefined || v === null || typeof v === "string"
+  const add = (b, name) => {
+    if (b === null || typeof b !== "object" || Array.isArray(b)) return
+    if (![b.total, b.cap, b.used, b.remaining].every(num) || !str(b.name) || !str(b.unit)) return
+    const total = b.total ?? b.cap
+    if (total == null || total <= 0 || (b.used == null && b.remaining == null)) return
+    const used = b.used != null ? b.used : total - b.remaining
+    if (used < 0) return
+    out.windows.push({ name: b.name || name, used: Math.min(100, (100 * used) / total), display: `${gfmt(used)} / ${gfmt(total)} ${b.unit || "credits"}` })
+  }
+  add(field("userQuota", "user_quota"), "Credits")
+  add(field("addOnQuota", "add_on_quota"), "Add-on credits")
+  add(field("orgResourcePackage", "org_resource_package"), "Shared credits")
+  const dedicated = field("dedicatedResourcePackages", "dedicated_resource_packages")
+  for (const b of Array.isArray(dedicated) ? dedicated : []) add(b, "Dedicated credits")
+  return out
+}
+
 export async function QoderAuthPlugin({ client }) {
   // serializes checking, rotating and saving tokens: a refresh token is
   // spent once, so two refreshes would spend it twice
@@ -759,6 +869,34 @@ export async function QoderAuthPlugin({ client }) {
       listings.set(cred.uid, l)
     }
     return l
+  }
+
+  // deviceToken is a device token newer than the one Qoder just refused:
+  // the one saved since, else a rotated one, saved.
+  const deviceToken = (getAuth, attempted) =>
+    locked(async () => {
+      const a = await getAuth()
+      if (a?.deviceToken !== attempted) return a?.deviceToken
+      const dt = await refreshDevice(a.deviceRefresh)
+      await client.auth.set({ path: { id: ID }, body: { ...a, deviceToken: dt.token, deviceRefresh: dt.refresh } })
+      return dt.token
+    })
+
+  // usage is the account's allowance, magpie's own hook
+  const usage = async (getAuth) => {
+    try {
+      const cred = await fresh(getAuth)
+      let env
+      try {
+        env = await fetchUsage(cred.deviceToken)
+      } catch (e) {
+        if (!(e instanceof UsageStatus) || (e.status !== 401 && e.status !== 403)) throw e
+        env = await fetchUsage(await deviceToken(getAuth, cred.deviceToken))
+      }
+      return parseUsage(env)
+    } catch (e) {
+      return { error: e?.message ?? String(e) }
+    }
   }
 
   const signedInError = (e) =>
@@ -817,6 +955,7 @@ export async function QoderAuthPlugin({ client }) {
         }
       },
       methods: [{ type: "oauth", label: "Sign in with Qoder", authorize: deviceSignIn }],
+      usage,
     },
     async config(config) {
       config.provider ??= {}
@@ -848,3 +987,6 @@ export async function QoderAuthPlugin({ client }) {
     },
   }
 }
+
+// for tests
+export const _internal = { parseUsage, gfmt, when }
