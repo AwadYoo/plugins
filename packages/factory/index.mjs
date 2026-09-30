@@ -1,0 +1,545 @@
+// Factory (Droid) subscriptions for OpenCode and magpie: WorkOS's device
+// flow under droid's client, as `droid` signs in, and each model request
+// sent to Factory's API with the headers droid sends. Ported from magpie's
+// built-in Factory account (internal/provider/factory*.go).
+
+const PROVIDER = "factory"
+
+const WORKOS = "https://api.workos.com/user_management"
+const API = "https://api.factory.ai"
+const API_EU = "https://api.eu.factory.ai"
+// droid's WorkOS client, production
+const CLIENT_ID = "client_01HNM792M5G5G1A2THWPXKFMXB"
+// the droid release the requests say they are
+const VERSION = "0.229.0"
+// how long before an access token lapses it is renewed (droid: a minute)
+const REFRESH_LEAD = 2 * 60 * 1000
+// how long an account whose whoami failed waits before asking again
+const ASK_AGAIN = 10 * 60 * 1000
+
+const ANTHROPIC = { npm: "@ai-sdk/anthropic", api: API + "/api/llm/a/v1" }
+const RESPONSES = { npm: "@ai-sdk/openai", api: API + "/api/llm/o/v1" }
+const CHAT = { npm: "@ai-sdk/openai-compatible", api: API + "/api/llm/o/v1" }
+
+const E5 = ["low", "medium", "high", "xhigh", "max"]
+const E6 = ["none", "low", "medium", "high", "xhigh", "max"]
+const E4 = ["low", "medium", "high", "xhigh"]
+
+// The models droid's /model picker offers, less Gemini's (sent on a route of
+// Factory's own) and auto (droid picks it client side): id, name, the wire
+// droid sends it on, the vendor it names in x-api-provider, context, output,
+// reasoning efforts, images.
+const MODELS = [
+  ["claude-fable-5.1", "Fable 5.1", ANTHROPIC, "anthropic", 867000, 128000, E5, true],
+  ["claude-fable-5", "Fable 5", ANTHROPIC, "anthropic", 867000, 128000, E5, true],
+  ["claude-opus-5-5", "Opus 5.5", ANTHROPIC, "anthropic", 872000, 128000, E5, true],
+  ["claude-opus-5", "Opus 5", ANTHROPIC, "anthropic", 867000, 128000, E5, true],
+  ["claude-opus-4-8", "Opus 4.8", ANTHROPIC, "anthropic", 867000, 128000, E5, true],
+  ["claude-sonnet-5-5", "Sonnet 5.5", ANTHROPIC, "anthropic", 872000, 128000, E5, true],
+  ["claude-sonnet-5", "Sonnet 5", ANTHROPIC, "anthropic", 872000, 128000, E5, true],
+  ["claude-sonnet-4-6", "Sonnet 4.6", ANTHROPIC, "anthropic", 931000, 64000, ["low", "medium", "high", "max"], true],
+  ["claude-haiku-4-5-20251001", "Haiku 4.5", ANTHROPIC, "anthropic", 0, 0, ["low", "medium", "high"], true],
+  ["gpt-6-sol", "GPT-6 Sol", RESPONSES, "openai", 1050000, 128000, E6, true],
+  ["gpt-6-astra", "GPT-6 Astra", RESPONSES, "openai", 1050000, 128000, E5, true],
+  ["gpt-6-luna", "GPT-6 Luna", RESPONSES, "openai", 1050000, 128000, E6, true],
+  ["gpt-5.6-sol", "GPT-5.6 Sol", RESPONSES, "openai", 1050000, 128000, E6, true],
+  ["gpt-5.6-terra", "GPT-5.6 Terra", RESPONSES, "openai", 1050000, 128000, E6, true],
+  ["gpt-5.6-luna", "GPT-5.6 Luna", RESPONSES, "openai", 1050000, 128000, E6, true],
+  ["gpt-5.5", "GPT-5.5", RESPONSES, "openai", 1050000, 128000, E4, true],
+  ["gpt-5.4", "GPT-5.4", RESPONSES, "openai", 1050000, 128000, E4, true],
+  ["gpt-5.3-codex", "GPT-5.3-Codex", RESPONSES, "openai", 400000, 128000, E4, true],
+  ["grok-4.7", "Grok 4.7", RESPONSES, "xai", 500000, 63356, E4, true],
+  ["grok-4.6", "Grok 4.6", RESPONSES, "xai", 200000, 63356, E4, true],
+  ["glm-5.3", "GLM-5.3", CHAT, "fireworks", 1040000, 131072, ["low", "high", "max"], false],
+  ["glm-5.3-flash", "GLM-5.3-Flash", CHAT, "fireworks", 1048576, 131072, ["low", "high", "max"], false],
+  ["glm-5.2", "GLM-5.2", CHAT, "baseten", 1040000, 131072, ["high", "max"], false],
+  ["kimi-k3", "Kimi K3", CHAT, "fireworks", 262144, 65536, ["low", "high", "max"], true],
+  ["deepseek-v4.1-flash", "DeepSeek V4.1 Flash", CHAT, "fireworks", 1040000, 131072, ["low", "high", "max"], true],
+  ["qwen3.8-max", "Qwen3.8 Max", CHAT, "fireworks", 262144, 131072, ["low", "medium", "xhigh"], false],
+  ["minimax-m3", "MiniMax M3", CHAT, "fireworks", 512000, 64000, ["high"], true],
+  ["minimax-m2.7", "MiniMax M2.7", ANTHROPIC, "fireworks", 196600, 64000, ["high"], false],
+  ["mistral-medium-3.5", "Mistral Medium 3.5", CHAT, "mistral", 256000, 64000, ["high"], true],
+  ["nemotron-3-ultra", "Nemotron 3 Ultra", CHAT, "baseten", 202000, 65536, ["high"], false],
+].map(([id, name, wire, upstream, context, output, efforts, images]) => ({ id, name, wire, upstream, context, output, efforts, images }))
+
+const byId = new Map(MODELS.map((m) => [m.id, m]))
+
+// variant is what the AI SDK package a model is on is given for an effort.
+function variant(npm, effort) {
+  if (npm === ANTHROPIC.npm) return { effort }
+  return { reasoningEffort: effort }
+}
+
+function configModels() {
+  const out = {}
+  for (const m of MODELS) {
+    out[m.id] = {
+      id: m.id,
+      name: m.name,
+      provider: { npm: m.wire.npm, api: m.wire.api },
+      reasoning: m.efforts.length > 0,
+      attachment: m.images,
+      tool_call: true,
+      temperature: true,
+      modalities: { input: m.images ? ["text", "image"] : ["text"], output: ["text"] },
+      cost: { input: 0, output: 0 },
+      limit: { context: m.context, output: m.output },
+      variants: Object.fromEntries(m.efforts.map((e) => [e, variant(m.wire.npm, e)])),
+    }
+  }
+  return out
+}
+
+// ---- tokens -----------------------------------------------------------------
+
+class FactoryStatus extends Error {
+  constructor(code, message) {
+    super(message)
+    this.code = code
+  }
+}
+
+// refused is WorkOS turning the refresh token away for good: any 4xx but a
+// rate limit, as droid reads it.
+const refused = (e) => e instanceof FactoryStatus && e.code >= 400 && e.code < 500 && e.code !== 429
+
+function claims(jwt) {
+  try {
+    const part = String(jwt ?? "").split(".")[1]
+    return JSON.parse(Buffer.from(part.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8")) ?? {}
+  } catch {
+    return {}
+  }
+}
+
+const claim = (c, k) => (typeof c[k] === "string" ? c[k] : "")
+
+// expiry is when an access token lapses, from its exp; 0 when it doesn't say.
+function expiry(access) {
+  const exp = claims(access).exp
+  return typeof exp === "number" && exp > 0 ? Math.floor(exp) * 1000 : 0
+}
+
+function apiError(text, fallback) {
+  try {
+    const j = JSON.parse(text)
+    const m = j?.error?.message ?? j?.error_description ?? j?.message ?? j?.detail ?? (typeof j?.error === "string" ? j.error : "")
+    if (m) return String(m)
+  } catch {}
+  return text.trim().slice(0, 300) || fallback
+}
+
+// workos posts a form to WorkOS: the answer and its status.
+async function workos(path, form, signal) {
+  const res = await fetch(WORKOS + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+    body: new URLSearchParams(form).toString(),
+    signal: signal ?? AbortSignal.timeout(30_000),
+  })
+  return { text: await res.text(), status: res.status }
+}
+
+// authenticate asks WorkOS for tokens. A 400 carrying an OAuth error is an
+// answer, not a failure: the device flow's polls are told to wait so.
+async function authenticate(form, signal) {
+  const { text, status } = await workos("/authenticate", form, signal)
+  let t = {}
+  try {
+    t = JSON.parse(text) ?? {}
+  } catch {}
+  t.status = status
+  if (status !== 200 && !t.error) throw new FactoryStatus(status, "Factory sign-in: " + apiError(text, String(status)))
+  return t
+}
+
+// renew trades a refresh token for a new pair, in the WorkOS org when one is
+// named (droid's way of putting a token that names no org in one); droid's
+// routine refresh names none, and WorkOS keeps the org.
+async function renew(refresh, org) {
+  const form = { grant_type: "refresh_token", refresh_token: refresh, client_id: CLIENT_ID }
+  if (org) form.organization_id = org
+  const t = await authenticate(form, AbortSignal.timeout(20_000))
+  if (t.error) throw new FactoryStatus(t.status, "Factory: " + `${t.error} ${t.error_description ?? ""}`.trim())
+  if (!t.access_token) throw new Error("Factory: the refresh gave no access token")
+  return t
+}
+
+// ---- Factory's API ------------------------------------------------------------
+
+// base is the Factory API the account's org is served from.
+const base = (c) => (c.region === "eu" ? API_EU : API)
+
+// llmBase is where the account's model requests go: the org's own host when
+// whoami named one, else its region's API.
+function llmBase(c) {
+  if (c.premBaseHost) {
+    const p = c.premBaseHost.replace(/\/+$/, "")
+    return p.includes("://") ? p : "https://" + p
+  }
+  return base(c)
+}
+
+// factoryHeaders are what droid sends on every call to Factory's API.
+function factoryHeaders(h, c) {
+  h.set("Authorization", "Bearer " + c.access)
+  h.set("X-Factory-Client", "cli")
+  h.set("X-Client-Version", VERSION)
+  h.set("User-Agent", "factory-cli/" + VERSION)
+  if (c.activeOrganizationId) h.set("X-Factory-Org-Id", c.activeOrganizationId)
+  else h.delete("X-Factory-Org-Id")
+}
+
+async function factoryGet(c, path) {
+  const h = new Headers({ Accept: "application/json" })
+  factoryHeaders(h, c)
+  const res = await fetch(base(c) + path, { headers: h, signal: AbortSignal.timeout(30_000) })
+  const text = await res.text()
+  if (res.status !== 200) throw new FactoryStatus(res.status, "Factory: " + apiError(text, String(res.status)))
+  return JSON.parse(text)
+}
+
+// firstOrg is the first WorkOS org /api/cli/org says the account is in, ""
+// for none. droid asks it with the bearer token alone.
+async function firstOrg(c) {
+  const r = await factoryGet({ ...c, activeOrganizationId: "" }, "/api/cli/org")
+  return r?.workosOrgIds?.[0] ?? ""
+}
+
+// whoami asks Factory whose the token is with the headers droid's whoami
+// sends: the token, X-Factory-Whoami-Extended, and the active org when there
+// is one — nothing else.
+async function whoami(c, signal) {
+  const h = { Authorization: "Bearer " + c.access, "X-Factory-Whoami-Extended": "true" }
+  if (c.activeOrganizationId) h["X-Factory-Org-Id"] = c.activeOrganizationId
+  const res = await fetch(base(c) + "/api/cli/whoami", { headers: h, signal: signal ?? AbortSignal.timeout(10_000) })
+  const text = await res.text()
+  if (res.status !== 200) throw new FactoryStatus(res.status, "Factory: " + apiError(text, String(res.status)))
+  return JSON.parse(text) ?? {}
+}
+
+// reconcile asks whoami, as droid does for each token it holds, and keeps the
+// org, region and host it names: true when any changed. An active org whoami
+// refuses is left off and whoami asked again without it.
+async function reconcile(c) {
+  const signal = AbortSignal.timeout(10_000)
+  let who
+  try {
+    who = await whoami(c, signal)
+  } catch (e) {
+    if (!(c.activeOrganizationId && e instanceof FactoryStatus && e.code === 403)) return false
+    try {
+      who = await whoami({ ...c, activeOrganizationId: "" }, signal)
+    } catch {
+      return false
+    }
+  }
+  if (!who?.orgId) return false
+  const changed = c.activeOrganizationId !== who.orgId || (c.region ?? "") !== (who.region ?? "") || (c.premBaseHost ?? "") !== (who.premBaseHostV2 ?? "")
+  c.activeOrganizationId = who.orgId
+  c.region = who.region ?? ""
+  c.premBaseHost = who.premBaseHostV2 ?? ""
+  return changed
+}
+
+// orgRefused is Factory's 403 for an X-Factory-Org-Id the user can't reach:
+// "Requested active organization is not accessible by this user".
+const orgRefused = (status, text) => status === 403 && text.toLowerCase().includes("active organization is not accessible")
+
+// explain is what the user can do about a 403 Factory still answers once
+// the request carries what droid sends.
+function explain(status, text) {
+  if (status !== 403) return ""
+  if (orgRefused(status, text)) return "the Factory account's organization changed; sign in to it again"
+  return "Factory refused this account the request; check that `droid`, signed in to the same account and organization, can use this model (an organization's model policy or the plan may not allow it), and if it can, sign in to the Factory account again"
+}
+
+// ---- sign-in ----------------------------------------------------------------
+
+// signedInWith is the account WorkOS just signed in, as droid keeps it: a
+// token that names no org (the JWT's external_org_id or org_id) is put in
+// the first org /api/cli/org lists, and whoami, asked without an org header,
+// gives Factory's own id for the org the token is in (the active org droid
+// then sends as X-Factory-Org-Id) and where Factory serves it from. droid
+// carries on without either when they fail.
+async function signedInWith(t) {
+  const cl = claims(t.access_token)
+  const c = {
+    access: t.access_token,
+    refresh: t.refresh_token ?? "",
+    expires: expiry(t.access_token),
+    orgId: t.organization_id || claim(cl, "org_id"),
+    email: t.user?.email || claim(cl, "email"),
+    userId: t.user?.id || claim(cl, "sub"),
+    activeOrganizationId: "",
+    region: "",
+    premBaseHost: "",
+  }
+  if (!c.orgId && !claim(cl, "external_org_id")) {
+    let org = ""
+    try {
+      org = await firstOrg(c)
+    } catch {}
+    if (org) {
+      const r = await renew(c.refresh, org)
+      c.access = r.access_token
+      c.expires = expiry(r.access_token)
+      c.orgId = org
+      if (r.refresh_token) c.refresh = r.refresh_token
+    }
+  }
+  try {
+    const who = await whoami(c)
+    c.activeOrganizationId = who.orgId ?? ""
+    c.region = who.region ?? ""
+    c.premBaseHost = who.premBaseHostV2 ?? ""
+    c.email ||= who.email ?? ""
+    c.userId ||= who.userId ?? ""
+  } catch (e) {
+    if (!c.email && !c.userId) throw e
+  }
+  const user = c.email || c.userId
+  if (!user) throw new Error("signed in, but Factory didn't say whose account it is; try again")
+  return { ...c, accountId: user }
+}
+
+async function deviceSignIn() {
+  const { text, status } = await workos("/authorize/device", { client_id: CLIENT_ID })
+  if (status !== 200) throw new FactoryStatus(status, "Factory sign-in: " + apiError(text, String(status)))
+  const dc = JSON.parse(text)
+  if (!dc.device_code || !dc.user_code) throw new Error("Factory's sign-in gave no device code")
+  let interval = Math.max(dc.interval ?? 0, 1) * 1000
+  // WorkOS answers expired_token once the code lapses; stop a little after
+  // that regardless, so a lost poll can't run forever
+  const until = Date.now() + (Math.max(dc.expires_in ?? 0, 300) + 30) * 1000
+  return {
+    url: dc.verification_uri_complete || dc.verification_uri,
+    instructions: `Confirm the code ${dc.user_code} on Factory's page`,
+    method: "auto",
+    async callback() {
+      for (;;) {
+        await new Promise((r) => setTimeout(r, interval))
+        if (Date.now() > until) throw new Error("the code expired; start again")
+        let t
+        try {
+          t = await authenticate({
+            grant_type: "urn:ietf:params:oauth:grant-type:device_code",
+            device_code: dc.device_code,
+            client_id: CLIENT_ID,
+          })
+        } catch {
+          continue // a hiccup: ask again
+        }
+        if (t.error === "authorization_pending") continue
+        if (t.error === "slow_down") {
+          interval += 1000
+          continue
+        }
+        if (t.error === "expired_token") throw new Error("the code expired; start again")
+        if (t.error === "access_denied") throw new Error("the sign-in was declined")
+        if (t.error || !t.access_token) throw new Error("Factory: " + (`${t.error ?? ""} ${t.error_description ?? ""}`.trim() || "no token came back"))
+        const c = await signedInWith(t)
+        return { type: "success", ...c }
+      }
+    },
+  }
+}
+
+// ---- the plugin ---------------------------------------------------------------
+
+function bodyModel(body) {
+  try {
+    if (body == null) return ""
+    const s = typeof body === "string" ? body : body instanceof ArrayBuffer || ArrayBuffer.isView(body) ? Buffer.from(body).toString("utf8") : ""
+    return JSON.parse(s)?.model ?? ""
+  } catch {
+    return ""
+  }
+}
+
+export const FactoryAuthPlugin = async ({ client }) => {
+  // the session id this process's requests carry
+  const session = crypto.randomUUID()
+  // serializes checking, rotating and saving tokens: WorkOS rotates the
+  // refresh token, so two refreshes would spend it twice
+  let lock = Promise.resolve()
+  const locked = (fn) => {
+    const run = lock.then(fn, fn)
+    lock = run.catch(() => {})
+    return run
+  }
+  // when the account last asked whoami for its org, so one whoami can't
+  // answer doesn't ask before every request
+  let asked = 0
+
+  return {
+    config: async (config) => {
+      config.provider ??= {}
+      const was = config.provider[PROVIDER] ?? {}
+      config.provider[PROVIDER] = {
+        name: "Factory",
+        npm: CHAT.npm,
+        api: CHAT.api,
+        ...was,
+        models: { ...configModels(), ...(was.models ?? {}) },
+      }
+    },
+    auth: {
+      provider: PROVIDER,
+      methods: [
+        {
+          type: "oauth",
+          label: "Sign in with Factory (device code)",
+          authorize: deviceSignIn,
+        },
+      ],
+      async loader(getAuth) {
+        const first = await getAuth()
+        if (first?.type !== "oauth") return {}
+
+        const save = async (c) => {
+          const { type: _t, ...rest } = c
+          await client.auth.set({ path: { id: PROVIDER }, body: { ...rest, type: "oauth" } })
+        }
+        const current = async () => {
+          const a = await getAuth()
+          if (a?.type !== "oauth" || !a.access) throw new Error("Factory: not signed in")
+          return { ...a }
+        }
+
+        // orgOf fills in the active org when there is none: droid asks
+        // whoami as soon as it holds a token and sends the orgId it answers
+        // as X-Factory-Org-Id on every request after.
+        const orgOf = async (c) => {
+          if (c.activeOrganizationId || Date.now() - asked < ASK_AGAIN) return c
+          asked = Date.now()
+          if (await reconcile(c)) await save(c)
+          return c
+        }
+
+        // fresh is a live token, renewed near its end.
+        const fresh = () =>
+          locked(async () => {
+            const c = await current()
+            if ((c.expires > 0 && Date.now() < c.expires - REFRESH_LEAD) || !c.refresh) return orgOf(c)
+            let t
+            try {
+              t = await renew(c.refresh, "")
+            } catch (e) {
+              // a hiccup while the token still runs: go on with it
+              if (!refused(e) && c.expires > 0 && Date.now() < c.expires) return orgOf(c)
+              if (refused(e)) throw new Error(`${c.accountId || "the account"}'s Factory sign-in has expired — sign in again (${e.message})`)
+              throw e
+            }
+            c.access = t.access_token
+            c.expires = expiry(t.access_token)
+            if (t.refresh_token) c.refresh = t.refresh_token
+            // droid asks whoami again for each new token, keeping the org it names
+            await reconcile(c)
+            asked = Date.now()
+            await save(c)
+            return c
+          })
+
+        // mendOrg answers Factory refusing a request: an active org it
+        // can't reach is left off and whoami asked again without it; with
+        // no header sent, the token is put in the first org /api/cli/org
+        // lists. Any other 403 to an account that sent no org asks whoami
+        // for one. True when the request is worth sending again.
+        const mendOrg = (status, text) =>
+          locked(async () => {
+            if (status !== 403) return false
+            const isOrg = orgRefused(status, text)
+            const c = await current()
+            if (c.activeOrganizationId) {
+              if (!isOrg) return false // the org was sent: the refusal is about something else
+              const was = c.activeOrganizationId
+              c.activeOrganizationId = ""
+              if ((await reconcile(c)) && c.activeOrganizationId === was) c.activeOrganizationId = "" // whoami names the org refused: send none
+              asked = Date.now()
+              await save(c)
+              return true
+            }
+            if (!isOrg) {
+              asked = Date.now()
+              if ((await reconcile(c)) && c.activeOrganizationId) {
+                await save(c)
+                return true
+              }
+              return false
+            }
+            if (!c.refresh) return false
+            let org = ""
+            try {
+              org = await firstOrg(c)
+            } catch {}
+            if (!org) return false
+            let t
+            try {
+              t = await renew(c.refresh, org)
+            } catch {
+              return false
+            }
+            c.access = t.access_token
+            c.expires = expiry(t.access_token)
+            c.orgId = org
+            if (t.refresh_token) c.refresh = t.refresh_token
+            await save(c)
+            return true
+          })
+
+        const send = async (input, init, body) => {
+          const c = await fresh()
+          let url = input instanceof Request ? input.url : String(input)
+          // an EU org is served from Factory's EU region, an on-prem one
+          // from its own host: the request goes there
+          const to = llmBase(c)
+          if (to !== API && url.startsWith(API)) url = to + url.slice(API.length)
+          const h = new Headers(init?.headers ?? (input instanceof Request ? input.headers : undefined))
+          h.delete("x-api-key")
+          factoryHeaders(h, c)
+          const model = byId.get(bodyModel(body))
+          const path = new URL(url).pathname
+          const upstream = model ? model.upstream : path.includes("/llm/o/") ? "openai" : "anthropic"
+          h.set("x-api-provider", upstream)
+          h.set("x-session-id", session)
+          h.set("x-assistant-message-id", crypto.randomUUID())
+          h.set("x-provider-routing-source", "registry_default")
+          if (upstream === "openai") h.set("OpenAI-Platform", "org-bHuLtG1fGmYk5YaOihAAXFBw")
+          // droid's Anthropic client is made with the key "placeholder",
+          // which Anthropic's SDK sends beside the bearer token
+          if (path.includes("/llm/a/")) h.set("X-Api-Key", "placeholder")
+          return fetch(url, { ...init, method: init?.method ?? (input instanceof Request ? input.method : "POST"), headers: h, body })
+        }
+
+        return {
+          apiKey: "placeholder",
+          async fetch(input, init) {
+            let body = init?.body
+            if (body == null && input instanceof Request && input.body) body = new Uint8Array(await input.arrayBuffer())
+            if (body instanceof ReadableStream) body = new Uint8Array(await new Response(body).arrayBuffer())
+            let res = await send(input, init, body)
+            if (res.status !== 403) return res
+            let text = await res.text()
+            if (await mendOrg(res.status, text).catch(() => false)) {
+              res = await send(input, init, body)
+              if (res.status !== 403) return res
+              text = await res.text()
+            }
+            const why = explain(res.status, text)
+            const msg = `${apiError(text, "Forbidden")}: ${why}`
+            const headers = new Headers(res.headers)
+            headers.set("content-type", "application/json")
+            headers.delete("content-length")
+            headers.delete("content-encoding")
+            return new Response(JSON.stringify({ type: "error", error: { type: "permission_error", message: msg } }), {
+              status: res.status,
+              statusText: res.statusText,
+              headers,
+            })
+          },
+        }
+      },
+    },
+  }
+}
