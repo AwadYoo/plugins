@@ -342,6 +342,65 @@ async function current(site, client, auth) {
   return a
 }
 
+// ---- allowance ----------------------------------------------------------------
+
+// STATUS_TEXT is Go's http.StatusText for the answers WorkBuddy gives.
+const STATUS_TEXT = { 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found", 405: "Method Not Allowed",
+  408: "Request Timeout", 429: "Too Many Requests", 500: "Internal Server Error", 502: "Bad Gateway", 503: "Service Unavailable",
+  504: "Gateway Timeout" }
+
+// meter asks the billing API as magpie's built-in did, its errors said
+// the same: WorkBuddy's message, else its code, else the HTTP status.
+async function meter(site, a, path) {
+  const res = await fetch(site.endpoint + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Accept: "application/json", "User-Agent": "WorkBuddy/" + UA_VERSION,
+      Authorization: "Bearer " + a.access, "X-User-Id": a.uid ?? "", "X-Domain": domainOf(site, a), "X-Product": "SaaS",
+      "X-IDE-Type": "WorkBuddy" },
+    body: "{}",
+    signal: AbortSignal.timeout(20000),
+  })
+  let env = {}
+  try {
+    env = JSON.parse(await res.text()) ?? {}
+  } catch {}
+  const code = Number.parseInt(env.code, 10) || 0
+  if (!res.ok) {
+    if (code) throw new Error(env.msg || `error ${code}`)
+    if (env.msg) throw new Error(env.msg)
+    throw new Error(STATUS_TEXT[res.status] ?? "")
+  }
+  if (code) throw new Error(env.msg || `error ${code}`)
+  return env.data ?? null
+}
+
+// capacity is a capacity the billing API sends, as a string ("438.88")
+// or now and then a number; empty is 0.
+function capacity(v) {
+  if (v == null || v === "") return 0
+  if (typeof v === "number") return v
+  const s = String(v)
+  const n = Number(s)
+  if (s.trim() !== s || Number.isNaN(n)) throw new Error(`strconv.ParseFloat: parsing ${JSON.stringify(s)}: invalid syntax`)
+  return n
+}
+
+// compact is a count as magpie says one: whole, else to two places.
+const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""))
+
+// usageOf is the account's credits, from its resource summary: the plan's
+// credits used against what the cycle grants, as magpie's built-in said.
+function usageOf(sum, plan) {
+  const out = { plan: plan || (sum?.IsPaidUser ? "Pro" : "Free"), windows: [] }
+  let total = 0, used = 0
+  for (const p of sum?.Packages ?? []) {
+    total += capacity(p?.CycleTotalCapacity)
+    used += capacity(p?.CycleUsedCapacity)
+  }
+  if (total > 0) out.windows.push({ name: "Credits", used: (100 * used) / total, display: `${compact(used)} / ${compact(total)}` })
+  return out
+}
+
 // ---- models -----------------------------------------------------------------
 
 // variants are the reasoning levels as OpenCode gives them to the AI SDK.
@@ -484,6 +543,18 @@ function makePlugin(site) {
           },
         }
       },
+      // the account's credits, as magpie's built-in showed them
+      async usage(getAuth) {
+        const auth = await getAuth()
+        if (auth?.type !== "oauth" || !(auth.access || auth.source)) return { error: "not signed in" }
+        try {
+          const a = await current(site, client, auth)
+          // the meter has no /v2 prefix, on either site
+          return usageOf(await meter(site, a, "/billing/meter/get-user-resource-summary"), auth.plan)
+        } catch (e) {
+          return { error: e?.message ?? String(e) }
+        }
+      },
       methods: [
         {
           type: "oauth",
@@ -502,3 +573,6 @@ function makePlugin(site) {
 
 export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
+
+// for tests
+export const _internal = { usageOf, desktopHeld }
