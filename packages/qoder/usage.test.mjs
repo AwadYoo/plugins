@@ -65,6 +65,7 @@ test("a refused device token is rotated, saved, and the usage read with it", asy
       { name: "Shared credits", used: 50, display: "10 / 20 credits" },
       { name: "Team", used: 20, display: "2 / 10 credits" },
     ],
+    signIn: "kept",
   })
   expect(p.seen).toEqual(["/sash/api/v2/me/usage", "/api/v1/deviceToken/refresh", "/sash/api/v2/me/usage"])
   expect(p.auth()).toMatchObject({ deviceToken: "dt-new", deviceRefresh: "drt-new", access: "jt-one", refresh: "rt-one" })
@@ -75,25 +76,26 @@ test("a refused device refresh says usage is unavailable, chat still working", a
   expect(await p.usage()).toEqual({
     error:
       "Qoder usage is unavailable: Qoder refused the account-page sign-in (chat still works) — sign in again to see usage (qoder device token refresh: upstream HTTP 403)",
+    signIn: "kept",
   })
   expect(p.auth().deviceToken).toBe("dt-old")
 })
 
 test("another failure is Qoder's status", async () => {
   const p = await plugin(() => new Response("", { status: 500 }))
-  expect(await p.usage()).toEqual({ error: "qoder usage: upstream HTTP 500" })
+  expect(await p.usage()).toEqual({ error: "qoder usage: upstream HTTP 500", signIn: "kept" })
 })
 
 test("an enterprise account has a plan and no windows", async () => {
   const p = await plugin(() => json({ displayMode: "enterprise" }))
-  expect(await p.usage()).toEqual({ plan: "Enterprise" })
+  expect(await p.usage()).toEqual({ plan: "Enterprise", signIn: "kept" })
 })
 
 test("an unknown display mode, or no quota, is an error", async () => {
   let p = await plugin(() => json({ displayMode: "team" }))
-  expect(await p.usage()).toEqual({ error: "qoder usage: unknown display mode" })
+  expect(await p.usage()).toEqual({ error: "qoder usage: unknown display mode", signIn: "kept" })
   p = await plugin(() => json({ displayMode: "qoder", qoderUsage: null }))
-  expect(await p.usage()).toEqual({ error: "qoder usage: missing quota data" })
+  expect(await p.usage()).toEqual({ error: "qoder usage: missing quota data", signIn: "kept" })
 })
 
 test("snake_case fields, an expiry, units, and pools too thin to show", () => {
@@ -229,4 +231,62 @@ test("a model Qoder lists free (is_free, or a price_factor of 0) is marked free"
   const ms = await hooks.provider.models({ models: {} }, { auth })
   expect(Object.fromEntries(Object.entries(ms).map(([k, m]) => [k, m.free]))).toEqual({ qmodel: false, fmodel: true, pmodel: true, cmodel: false })
   expect(_internal.modelInfo({ key: "x", isFree: true }).free).toBe(true)
+})
+
+// a usage read on an account whose job token is due, the refresh answered by refresh()
+async function dueUsage(refresh, read) {
+  let auth = { ...account(), expires: 0 }
+  globalThis.fetch = async (url) => {
+    const path = new URL(String(url)).pathname
+    if (path === "/api/v1/jobToken/refresh") return refresh()
+    if (path === "/sash/api/v2/me/usage") return read()
+    return new Response("", { status: 404 })
+  }
+  const hooks = await QoderAuthPlugin({ client: { auth: { set: async ({ body }) => (auth = body) } } })
+  return hooks.auth.usage(async () => auth)
+}
+
+const RENEWED = () => json({ token: "jt-new", refresh_token: "rt-new", expire_time: Date.now() + 3_600_000 })
+
+test("a usage read marks the sign-in only on a refused job refresh and clears it only on a renewed one, as the built-in's", async () => {
+  // a clean read cleared nothing in the built-in
+  expect((await dueUsage(RENEWED, () => json(USAGE))).signIn).toBe("renewed")
+  expect((await (await plugin(() => json(USAGE))).usage()).signIn).toBe("kept")
+  // renewed, the mark came off whatever the read then met
+  expect(await dueUsage(RENEWED, () => new Response("", { status: 500 }))).toEqual({ error: "qoder usage: upstream HTTP 500", signIn: "renewed" })
+  for (const status of [401, 403]) {
+    const u = await dueUsage(() => new Response("", { status }), () => json(USAGE))
+    expect(u).toEqual({ error: `one@x's Qoder sign-in has expired — sign in again (qoder job token refresh: status ${status})`, signIn: "expired" })
+  }
+  expect((await dueUsage(() => new Response("", { status: 500 }), () => json(USAGE))).signIn).toBe("kept")
+})
+
+// a chat on an account whose job token is due, renewed, Qoder answering reply()
+async function renewedChat(reply) {
+  const auth = { ...account(), machineId: "m1", expires: 0 }
+  globalThis.fetch = async (url) => {
+    const path = new URL(String(url)).pathname
+    if (path === "/api/v1/jobToken/refresh") return RENEWED()
+    if (path.endsWith("/model/list")) return json(LISTING)
+    return reply()
+  }
+  const hooks = await QoderAuthPlugin({ client: { auth: { set: async () => {} } } })
+  const l = await hooks.auth.loader(async () => auth)
+  return l.fetch(API_CHAT, ASK)
+}
+
+const OK = () =>
+  new Response(`data: ${JSON.stringify({ statusCodeValue: 200, body: JSON.stringify({ choices: [{ delta: { content: "hi" }, finish_reason: "stop" }] }) })}\n\n`, {
+    headers: { "Content-Type": "text/event-stream" },
+  })
+
+test("an answer that went through keeps the mark, as the built-in's did; after a renewed job token, every answer clears it", async () => {
+  const { fetch } = await chat(LISTING, OK)
+  let res = await fetch(API_CHAT, ASK)
+  expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([200, "kept"])
+  expect((await res.json()).choices[0].message.content).toBe("hi")
+  for (const [reply, status] of [[OK, 200], [() => new Response("", { status: 500 }), 500], [() => new Response("", { status: 401 }), 401]]) {
+    res = await renewedChat(reply)
+    expect([res.status, res.headers.get("X-Magpie-Sign-In")]).toEqual([status, "renewed"])
+  }
 })

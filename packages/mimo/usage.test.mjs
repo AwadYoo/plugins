@@ -44,13 +44,14 @@ test("the plan, its end and renewal, and the week's allowance", async () => {
     until: "2026-10-31T16:00:00.000Z", // 2026-11-01 00:00 in UTC+8
     renew: "auto",
     windows: [{ name: "7 days", used: 30, span: 604800, resetsAt: "2026-10-04T16:00:00.000Z" }],
+    signIn: "kept",
   })
   expect(p.seen).toEqual(["/api/user/xiaomi/subscription/self", "/api/user/usage"])
 })
 
 test("no plan is the free offer, with no allowance shown", async () => {
   const p = await plugin(account(), (path) => (path === "/api/user/usage" ? json({ code: 0, data: { percent: 100, resetDate: null } }) : json({ code: 0, data: { current: null } })))
-  expect(await p.usage()).toEqual({ plan: "Free" })
+  expect(await p.usage()).toEqual({ plan: "Free", signIn: "kept" })
 })
 
 test("a plan named by its tier, else its code; a one-time plan doesn't renew", async () => {
@@ -58,14 +59,14 @@ test("a plan named by its tier, else its code; a one-time plan doesn't renew", a
     const p = await plugin(account(), (path) => (path === "/api/user/usage" ? json({ code: 0, data: {} }) : json({ code: 0, data: { current } })))
     return p.usage()
   }
-  expect(await sub({ title: " ", planTier: 4, renewalMode: "ONE_TIME", endTime: "2026-11-01 08:30:00" })()).toEqual({ plan: "Ultra", until: "2026-11-01T00:30:00.000Z", renew: "off" })
-  expect(await sub({ planTier: 9, planCode: "mimo_x" })()).toEqual({ plan: "mimo_x" })
-  expect(await sub({})()).toEqual({ plan: "MiMo" })
+  expect(await sub({ title: " ", planTier: 4, renewalMode: "ONE_TIME", endTime: "2026-11-01 08:30:00" })()).toEqual({ plan: "Ultra", until: "2026-11-01T00:30:00.000Z", renew: "off", signIn: "kept" })
+  expect(await sub({ planTier: 9, planCode: "mimo_x" })()).toEqual({ plan: "mimo_x", signIn: "kept" })
+  expect(await sub({})()).toEqual({ plan: "MiMo", signIn: "kept" })
 })
 
 test("the allowance unread leaves the plan alone; a refused sign-in says so", async () => {
   let p = await plugin(account(), (path) => (path === "/api/user/usage" ? json({ code: 500, msg: "busy" }) : json(SELF)))
-  expect(await p.usage()).toEqual({ plan: "MiMo 高阶", until: "2026-10-31T16:00:00.000Z", renew: "auto" })
+  expect(await p.usage()).toEqual({ plan: "MiMo 高阶", until: "2026-10-31T16:00:00.000Z", renew: "auto", signIn: "kept" })
 
   // the session turned away, and the passToken no longer signs it on
   p = await plugin(account(), (path) => {
@@ -73,7 +74,7 @@ test("the allowance unread leaves the plan alone; a refused sign-in says so", as
     if (path === "/api/user/xiaomi/me") return new Response("<html>sign in</html>", { status: 200 })
     return new Response("", { status: 404 })
   })
-  expect(await p.usage()).toEqual({ error: "42: the Xiaomi MiMo sign-in has expired — sign in again" })
+  expect(await p.usage()).toEqual({ error: "42: the Xiaomi MiMo sign-in has expired — sign in again", signIn: "expired" })
 })
 
 test("two accounts signing on at once each keep their own session", async () => {
@@ -106,9 +107,9 @@ test("two accounts signing on at once each keep their own session", async () => 
 
 test("a failure is the page's and the server's word", async () => {
   let p = await plugin(account(), () => json({ code: 10001, msg: "no such user" }))
-  expect(await p.usage()).toEqual({ error: "Xiaomi MiMo /user/xiaomi/subscription/self: code 10001 no such user" })
+  expect(await p.usage()).toEqual({ error: "Xiaomi MiMo /user/xiaomi/subscription/self: code 10001 no such user", signIn: "kept" })
   p = await plugin(account(), () => json({ message: "down" }, 503))
-  expect(await p.usage()).toEqual({ error: "Xiaomi MiMo /user/xiaomi/subscription/self: down" })
+  expect(await p.usage()).toEqual({ error: "Xiaomi MiMo /user/xiaomi/subscription/self: down", signIn: "kept" })
 })
 
 test("the server's times", () => {
@@ -175,7 +176,16 @@ test("a success takes the mark off only when the account was signed on again", a
   )
   res = await p.fetch(BASE + "/route/chat/completions", { method: "POST", body: "{}" })
   expect(res.status).toBe(200)
-  expect(res.headers.get("X-Magpie-Sign-In")).toBe(null)
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("renewed")
+})
+
+test("a failure after signing on again still takes the mark off, as mimoFresh did before the request", async () => {
+  const p = await loaderFetch(account(0), (path) =>
+    path === "/api/user/xiaomi/me" ? new Response(JSON.stringify({ code: 0, data: { userId: "42" } }), { headers: { "set-cookie": "serviceToken=st-2; Path=/" } }) : json({ error: { message: "stale" } }, 401),
+  )
+  const res = await p.fetch(BASE + "/route/chat/completions", { method: "POST", body: "{}" })
+  expect(res.status).toBe(401)
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("renewed")
 })
 
 test("a sign-on that can't reach the server is a thrown fetch (magpie's 502) in the built-in's words, the account unmarked", async () => {
@@ -184,4 +194,32 @@ test("a sign-on that can't reach the server is a thrown fetch (magpie's 502) in 
     throw new Error("connection refused")
   })
   await expect(fetch(BASE + "/route/chat/completions", { method: "POST", body: "{}" })).rejects.toThrow(/^Xiaomi MiMo sign-in: connection refused$/)
+})
+
+// the built-in's mimoFresh took the lapse mark off when it signed the
+// account on again, and mimoLapse put it on; whichever came last stands
+const signOn = () => new Response(JSON.stringify({ code: 0, data: { userId: "42" } }), { headers: { "set-cookie": "serviceToken=st-2; Path=/" } })
+
+test("a read that signed the account on again says so, whatever the pages then answer", async () => {
+  let p = await plugin(account(0), (path) => (path === "/api/user/xiaomi/me" ? signOn() : path === "/api/user/usage" ? json(USAGE) : json(SELF)))
+  expect((await p.usage()).signIn).toBe("renewed")
+  p = await plugin(account(0), (path) => (path === "/api/user/xiaomi/me" ? signOn() : json({ message: "down" }, 503)))
+  expect(await p.usage()).toEqual({ error: "Xiaomi MiMo /user/xiaomi/subscription/self: down", signIn: "renewed" })
+  // a stale session turned away, signed on again, then the allowance unread
+  let n = 0
+  p = await plugin(account(), (path) => {
+    if (path === "/api/user/xiaomi/me") return signOn()
+    if (path === "/api/user/xiaomi/subscription/self") return n++ ? json(SELF) : new Response("", { status: 401 })
+    return json({ code: 500, msg: "busy" })
+  })
+  expect(await p.usage()).toEqual({ plan: "MiMo 高阶", until: "2026-10-31T16:00:00.000Z", renew: "auto", signIn: "renewed" })
+})
+
+test("the allowance's page refused after the plan's read marks the account", async () => {
+  const p = await plugin(account(), (path) => {
+    if (path === "/api/user/xiaomi/me") return new Response("<html>sign in</html>", { status: 200 })
+    if (path === "/api/user/usage") return new Response("", { status: 401 })
+    return json(SELF)
+  })
+  expect(await p.usage()).toEqual({ plan: "MiMo 高阶", until: "2026-10-31T16:00:00.000Z", renew: "auto", error: "42: the Xiaomi MiMo sign-in has expired — sign in again", signIn: "expired" })
 })

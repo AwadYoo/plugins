@@ -37,11 +37,13 @@ test("Grok's 401 is passed on once, the account kept", async () => {
   expect(await res.json()).toEqual({ error: "token revoked" })
 })
 
-test("other answers go as they came", async () => {
+// nor cleared one: an answer that went through leaves the mark as it is
+test("other answers go as they came, the account kept", async () => {
   for (const status of [200, 403, 429]) {
     const { res, sent } = await chat(() => new Response("x", { status }))
     expect(sent).toBe(1)
     expect(res.status).toBe(status)
-    expect(res.headers.get("X-Magpie-Sign-In")).toBeNull()
+    expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
+    expect(await res.text()).toBe("x")
   }
 })

@@ -45,7 +45,7 @@ const usageOf = async (plugin, auth, client = {}) => (await plugin({ client })).
 test("a paid WorkBuddy account's credits", async () => {
   const calls = serve({ "/billing/meter/get-user-resource-summary": () => ok(PAID) })
   const auth = { type: "oauth", access: "two-access", refresh: "r", expires: later(), uid: "u2", domain: "" }
-  expect(await usageOf(WorkBuddyAuthPlugin, auth)).toEqual({ plan: "Pro", windows: [{ name: "Credits", used: 25, display: "2500 / 10000" }] })
+  expect(await usageOf(WorkBuddyAuthPlugin, auth)).toEqual({ signIn: "kept", plan: "Pro", windows: [{ name: "Credits", used: 25, display: "2500 / 10000" }] })
   const c = calls[0]
   expect(c.url.origin).toBe("https://copilot.tencent.com")
   expect(c.init.method).toBe("POST")
@@ -59,7 +59,7 @@ test("a free WorkBuddy AI account, at its own site and domain", async () => {
   const calls = serve({ "/billing/meter/get-user-resource-summary": () =>
     ok({ IsPaidUser: false, Packages: [{ CycleTotalCapacity: "1000", CycleUsedCapacity: "100" }] }) })
   const auth = { type: "oauth", access: "ai-access", expires: later(), uid: "ai2", domain: "www.codebuddy.ai" }
-  expect(await usageOf(WorkBuddyAIAuthPlugin, auth)).toEqual({ plan: "Free", windows: [{ name: "Credits", used: 10, display: "100 / 1000" }] })
+  expect(await usageOf(WorkBuddyAIAuthPlugin, auth)).toEqual({ signIn: "kept", plan: "Free", windows: [{ name: "Credits", used: 10, display: "100 / 1000" }] })
   expect(calls[0].url.origin).toBe("https://www.workbuddy.ai")
   expect(calls[0].headers.get("x-domain")).toBe("www.codebuddy.ai")
 })
@@ -76,12 +76,12 @@ test("counts and plans as Go says them", () => {
 test("WorkBuddy's refusals are the card's error", async () => {
   const auth = { type: "oauth", access: "a", expires: later(), uid: "u" }
   serve({ "/billing/meter/get-user-resource-summary": () => new Response("", { status: 401 }) })
-  expect(await usageOf(WorkBuddyAuthPlugin, auth)).toEqual({ error: "Unauthorized" })
+  expect(await usageOf(WorkBuddyAuthPlugin, auth)).toEqual({ signIn: "kept", error: "Unauthorized" })
   serve({ "/billing/meter/get-user-resource-summary": () => new Response(JSON.stringify({ code: 10085, msg: "" }), { status: 403 }) })
-  expect(await usageOf(WorkBuddyAuthPlugin, auth)).toEqual({ error: "error 10085" })
+  expect(await usageOf(WorkBuddyAuthPlugin, auth)).toEqual({ signIn: "kept", error: "error 10085" })
   serve({ "/billing/meter/get-user-resource-summary": () => new Response(JSON.stringify({ code: 11001, msg: "token expired" })) })
-  expect(await usageOf(WorkBuddyAuthPlugin, auth)).toEqual({ error: "token expired" })
-  expect(await usageOf(WorkBuddyAuthPlugin, null)).toEqual({ error: "not signed in" })
+  expect(await usageOf(WorkBuddyAuthPlugin, auth)).toEqual({ signIn: "kept", error: "token expired" })
+  expect(await usageOf(WorkBuddyAuthPlugin, null)).toEqual({ signIn: "kept", error: "not signed in" })
 })
 
 // Go's http.StatusText has words for every status WorkBuddy may give, and
@@ -90,7 +90,7 @@ test("any refused status is an error with words", async () => {
   const auth = { type: "oauth", access: "a", expires: later(), uid: "u" }
   for (const [status, said] of [[409, "Conflict"], [402, "Payment Required"], [422, "Unprocessable Entity"], [501, "Not Implemented"], [520, "HTTP 520"], [302, "Found"]]) {
     serve({ "/billing/meter/get-user-resource-summary": () => new Response("", { status }) })
-    expect([status, await usageOf(WorkBuddyAuthPlugin, auth)]).toEqual([status, { error: said }])
+    expect([status, await usageOf(WorkBuddyAuthPlugin, auth)]).toEqual([status, { error: said, signIn: "kept" }])
   }
 })
 
@@ -103,6 +103,8 @@ test("a token near its end is renewed and saved, as the loader does", async () =
   const auth = { type: "oauth", access: "old-access", refresh: "old-refresh", expires: Date.now() + 1000, uid: "u2" }
   const out = await usageOf(WorkBuddyAuthPlugin, auth, { auth: { set: async (x) => sets.push(x) } })
   expect(out.windows[0].used).toBe(25)
+  // the built-in's renewal took no mark off: the read keeps the sign-in
+  expect(out.signIn).toBe("kept")
   expect(calls[0].headers.get("x-refresh-token")).toBe("old-refresh")
   expect(calls[1].headers.get("authorization")).toBe("Bearer new-access")
   expect(sets.length).toBe(1)
@@ -125,7 +127,7 @@ test("the desktop's sign-in is renewed in memory only", async () => {
   })
   const auth = { type: "oauth", access: "", refresh: "", expires: 0, source: "desktop", uid: "u1" }
   const client = { auth: { set: async (x) => sets.push(x) } }
-  expect(await usageOf(WorkBuddyAuthPlugin, auth, client)).toEqual({ plan: "Pro", windows: [{ name: "Credits", used: 25, display: "2500 / 10000" }] })
+  expect(await usageOf(WorkBuddyAuthPlugin, auth, client)).toEqual({ signIn: "kept", plan: "Pro", windows: [{ name: "Credits", used: 25, display: "2500 / 10000" }] })
   expect(calls[1].headers.get("authorization")).toBe("Bearer desk-new")
   expect(calls[1].headers.get("x-domain")).toBe("www.codebuddy.cn")
   expect(sets).toEqual([]) // never saved,

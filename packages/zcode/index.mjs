@@ -1096,9 +1096,8 @@ export async function ZCodeAuthPlugin({ client }) {
             h.set("x-api-key", key)
             h.set("Authorization", "Bearer " + key)
             const res = await fetch(url, { ...opts, headers: h })
-            // the plan's 401 goes on as it came: the built-in never
-            // marked a ZCode account lapsed
-            if (res.status !== 401) return res
+            // the plan's answer goes on as it came, the account kept: the
+            // built-in never marked a ZCode account lapsed nor cleared one
             const kept = new Headers(res.headers)
             kept.delete("content-length")
             kept.delete("content-encoding")
@@ -1107,17 +1106,20 @@ export async function ZCodeAuthPlugin({ client }) {
           },
         }
       },
-      // the plan's allowance, as magpie's built-in showed it
+      // the plan's allowance, as magpie's built-in showed it. Each read
+      // keeps the sign-in (signIn): the built-in's marked no account lapsed,
+      // its expired Start Plan sign-in among them, and cleared none
       async usage(getAuth, provider) {
         const auth = await getAuth()
         const s = stateOf(auth)
-        if (!s) return { error: "not signed in" }
+        if (!s) return { error: "not signed in", signIn: "kept" }
         // every card starts from the plan the sign-in saved, as magpie's
         // built-in did: a reply without a level, a team detail that
         // failed or an error keeps it
         const saved = (out) => {
           const plan = s.plan || auth?.plan
           if (plan && !out.plan) out.plan = plan
+          out.signIn = "kept"
           return out
         }
         try {

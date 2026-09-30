@@ -578,10 +578,15 @@ export const FactoryAuthPlugin = async ({ client }) => {
       })
 
     // usage is the account's limits, asked once more when Factory refused
-    // an org that was put right
+    // an org that was put right. signIn is what the read did to the
+    // built-in's lapse mark: a renewal took it off whatever came after, a
+    // refused one put it on, a read that renewed nothing left it be (a
+    // clean read too)
     const usage = async () => {
+      let signIn = "kept"
+      const onRenew = () => (signIn = "renewed")
       const limits = async () => {
-        const c = await fresh()
+        const c = await fresh(onRenew)
         const h = new Headers({ Accept: "application/json" })
         factoryHeaders(h, c)
         const res = await fetch(base(c) + "/api/billing/limits", { headers: h, signal: AbortSignal.timeout(15_000) })
@@ -594,13 +599,14 @@ export const FactoryAuthPlugin = async ({ client }) => {
         try {
           l = await limits()
         } catch (e) {
-          if (!(e instanceof FactoryStatus && e.body !== undefined && (await mendOrg(e.code, e.body).catch(() => false)))) throw e
+          if (!(e instanceof FactoryStatus && e.body !== undefined && (await mendOrg(e.code, e.body, onRenew).catch(() => false)))) throw e
           l = await limits()
         }
-        if (!l?.limits?.standard) return { error: "Factory: the account reported no limits" }
-        return { windows: limitWindows(l) }
+        if (!l?.limits?.standard) return { error: "Factory: the account reported no limits", signIn }
+        return { windows: limitWindows(l), signIn }
       } catch (e) {
-        return { error: e?.message ?? String(e) }
+        if (e?.lapsed) signIn = "expired"
+        return { error: e?.message ?? String(e), signIn }
       }
     }
 
@@ -670,11 +676,12 @@ export const FactoryAuthPlugin = async ({ client }) => {
             if (body instanceof ReadableStream) body = new Uint8Array(await new Response(body).arrayBuffer())
             const url = input instanceof Request ? input.url : String(input)
             // the built-in takes an account's lapse off when it renews the
-            // token, and never for an answer: a 401 of Factory's leaves it
-            // be, and so does a success with no renewal on the way
+            // token, whatever the request then meets, and never for an
+            // answer: a 401 of Factory's leaves it be, and so does a success
+            // with no renewal on the way
             let renewed = false
             const onRenew = () => (renewed = true)
-            const answer = (res) => (renewed && res.status >= 200 && res.status < 300 ? res : said(res, "kept"))
+            const answer = (res) => said(res, renewed ? "renewed" : "kept")
             let res
             try {
               res = await send(input, init, body, onRenew)

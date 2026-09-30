@@ -572,6 +572,10 @@ const errorResponse = (wire, status, message, signIn = status === 401 ? "kept" :
     headers: { "content-type": "application/json", ...(signIn ? { "x-magpie-sign-in": signIn } : {}) },
   })
 
+// KEPT is on an answer that went through: the built-in took the mark off
+// only when the account was signed in again, never on a request.
+const KEPT = { "x-magpie-sign-in": "kept" }
+
 // said tells whether one of the provider's own events says anything —
 // text, reasoning, a call, a finish — rather than only framing the reply,
 // as magpie's decoders tell a reply begun from its lead (message_start,
@@ -718,7 +722,7 @@ async function streamed(wire, res) {
       res.body?.cancel?.().catch(() => {})
     },
   })
-  return new Response(body, { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } })
+  return new Response(body, { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache", ...KEPT } })
 }
 
 // ---- whole replies, for a caller that didn't ask for a stream ------------------
@@ -838,7 +842,7 @@ async function whole(wire, res) {
   if (wrapped && !ended) return errorResponse(wire, 502, "the reply ended before it was complete")
   const out = WHOLE[wire](events)
   if (!out) return errorResponse(wire, 502, "the reply ended before it was complete")
-  return new Response(JSON.stringify(out), { status: 200, headers: { "content-type": "application/json" } })
+  return new Response(JSON.stringify(out), { status: 200, headers: { "content-type": "application/json", ...KEPT } })
 }
 
 // complete sends one request through Zed's /completions.
@@ -906,19 +910,21 @@ const RFC3339 = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$/i
 
 async function usage(auth, save) {
   const s = stateOf(auth)
-  if (!s) return { error: "no such Zed account" }
+  // the built-in's read marked the account only when Zed refused its
+  // sign-in, and took the mark off never: a clean read keeps it
+  if (!s) return { error: "no such Zed account", signIn: "kept" }
   let me
   try {
     const text = await cloud("GET", "/client/users/me", s, undefined, 15_000)
     me = parse(text)
     if (me === null) me = {}
-    else if (typeof me !== "object" || Array.isArray(me)) return { error: "Zed: an unreadable account: " + jsonError(text, me) }
+    else if (typeof me !== "object" || Array.isArray(me)) return { error: "Zed: an unreadable account: " + jsonError(text, me), signIn: "kept" }
   } catch (e) {
-    if (e?.status === 401) return { error: `${s.who}: the Zed sign-in has expired — sign in again` }
-    return { error: e?.message ?? String(e) }
+    if (e?.status === 401) return { error: `${s.who}: the Zed sign-in has expired — sign in again`, signIn: "expired" }
+    return { error: e?.message ?? String(e), signIn: "kept" }
   }
   const plan = planOf(me, s.org || orgOf(me))
-  const out = { plan: planName(plan) }
+  const out = { plan: planName(plan), signIn: "kept" }
   if (plan !== s.plan && save) {
     const r = parse(auth.refresh ?? "") ?? {}
     await save({ ...auth, refresh: JSON.stringify({ ...r, plan, planName: out.plan }) }).catch(() => {})

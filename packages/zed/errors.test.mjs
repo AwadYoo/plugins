@@ -91,3 +91,12 @@ test("a whole reply carrying the provider's error is that error, and an out-of-r
   const odd = await ask("anthropic", [start, { status: { failed: { code: "http_999", message: "odd" } } }], false)
   expect([odd.status, msgOf(odd.text)]).toEqual([502, "odd"])
 })
+
+test("an answer that goes through keeps the mark, as the built-in took it off only on signing in again", async () => {
+  const delta = { event: { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "hi" } } }
+  const lines = [{ status: "started" }, start, textStart, delta, { event: { type: "message_stop" } }, { status: "stream_ended" }]
+  const streamed = await ask("anthropic", lines)
+  expect([streamed.status, streamed.signIn]).toEqual([200, "kept"])
+  const whole = await ask("anthropic", lines, false)
+  expect([whole.status, whole.signIn]).toEqual([200, "kept"])
+})

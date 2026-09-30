@@ -74,5 +74,12 @@ test("an error line saying 401 keeps the account too", async () => {
 test("the Provider API's 401 goes on as it came, the account kept", async () => {
   expect(await signIn(() => Response.json({ error: { message: "Invalid API key" } }, { status: 401 }), "Pro", "/provider/v1/chat/completions"))
     .toEqual({ status: 401, signIn: "kept" })
-  expect(await signIn(() => Response.json({}), "Pro", "/provider/v1/chat/completions")).toEqual({ status: 200, signIn: null })
+})
+
+// nor cleared one: an answer that went through leaves the mark as it is
+test("an answer that goes through keeps the account's mark, Go's and the Provider API's", async () => {
+  expect(await signIn(() => Response.json({}), "Pro", "/provider/v1/chat/completions")).toEqual({ status: 200, signIn: "kept" })
+  expect(await signIn(() => Response.json({}, { status: 404 }), "Pro", "/provider/v1/chat/completions")).toEqual({ status: 404, signIn: "kept" })
+  const line = JSON.stringify({ type: "text-delta", text: "hi" }) + "\n" + JSON.stringify({ type: "finish", finishReason: "stop" }) + "\n"
+  expect(await signIn(() => new Response(line))).toEqual({ status: 200, signIn: "kept" })
 })

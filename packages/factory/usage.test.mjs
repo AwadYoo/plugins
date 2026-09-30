@@ -63,6 +63,7 @@ test("standard's windows, Droid Core's, and the extra usage", async () => {
       { name: "Droid Core · 5 hours", used: 100, span: 18000, resetsAt: "2026-10-01T05:00:00.000Z", aside: true, models: CORE },
       { name: "Extra usage", used: 0, display: "$12.50", aside: true },
     ],
+    signIn: "kept",
   })
   // an EU org's usage is asked of the EU API, with its org
   expect(p.seen).toEqual(["api.eu.factory.ai/api/billing/limits fac_A"])
@@ -82,7 +83,7 @@ test("with no extra usage allowed a window used up stops the account; a half cen
 
 test("no standard limits is an error", async () => {
   const p = await plugin(account(), () => json({ limits: { core: {} } }))
-  expect(await p.usage()).toEqual({ error: "Factory: the account reported no limits" })
+  expect(await p.usage()).toEqual({ error: "Factory: the account reported no limits", signIn: "kept" })
 })
 
 test("an org Factory refuses is put right and the limits asked once more", async () => {
@@ -93,22 +94,46 @@ test("an org Factory refuses is put right and the limits asked once more", async
       return h.get("X-Factory-Org-Id") === "fac_A" ? json({ limits: { standard: { fiveHour: { usedPercent: 7 } } } }) : json(refused, 403)
     return new Response("", { status: 404 })
   })
-  expect(await p.usage()).toEqual({ windows: [{ name: "5 hours", used: 7, span: 18000, notModels: CORE }] })
+  expect(await p.usage()).toEqual({ windows: [{ name: "5 hours", used: 7, span: 18000, notModels: CORE }], signIn: "kept" })
   expect(p.seen).toEqual(["api.factory.ai/api/billing/limits fac_gone", "api.factory.ai/api/cli/whoami ", "api.factory.ai/api/billing/limits fac_A"])
   expect(p.auth().activeOrganizationId).toBe("fac_A")
 })
 
 test("another refusal is Factory's message, not retried", async () => {
   const p = await plugin(account(), () => json({ error: { message: "model not allowed" } }, 403))
-  expect(await p.usage()).toEqual({ error: "Factory: model not allowed" })
+  expect(await p.usage()).toEqual({ error: "Factory: model not allowed", signIn: "kept" })
   expect(p.seen.length).toBe(1)
   const q = await plugin(account(), () => new Response("upstream   went\naway", { status: 502 }))
-  expect(await q.usage()).toEqual({ error: "Factory: 502 Bad Gateway: upstream went away" })
+  expect(await q.usage()).toEqual({ error: "Factory: 502 Bad Gateway: upstream went away", signIn: "kept" })
 })
 
 test("a refresh token WorkOS refuses lapses the account", async () => {
   const p = await plugin(account({ expires: Date.now() - 1000 }), (path) =>
     path === "/user_management/authenticate" ? json({ error: "invalid_grant", error_description: "gone" }, 400) : new Response("", { status: 404 }),
   )
-  expect(await p.usage()).toEqual({ error: "ada's Factory sign-in has expired — sign in again (Factory: invalid_grant gone)" })
+  expect(await p.usage()).toEqual({ error: "ada's Factory sign-in has expired — sign in again (Factory: invalid_grant gone)", signIn: "expired" })
+})
+
+// the built-in's factoryFresh took the lapse mark off when it renewed the
+// token, whatever the limits read then met; a read with no renewal, clean or
+// not, left the mark be
+test("a read that renewed the token says so, whatever the limits then answer", async () => {
+  const renewing = (limits) => (path) =>
+    path === "/user_management/authenticate" ? json({ access_token: "tok-new", refresh_token: "r-new" }) : path === "/api/billing/limits" ? limits() : json({}, 404)
+  const p = await plugin(account({ expires: Date.now() - 1000 }), renewing(() => json({ limits: { standard: { fiveHour: { usedPercent: 7 } } } })))
+  expect(await p.usage()).toEqual({ windows: [{ name: "5 hours", used: 7, span: 18000, notModels: CORE }], signIn: "renewed" })
+  const q = await plugin(account({ expires: Date.now() - 1000 }), renewing(() => json({ error: { message: "busy" } }, 503)))
+  expect(await q.usage()).toEqual({ error: "Factory: busy", signIn: "renewed" })
+})
+
+test("a token put in an org on the way renews it, as the built-in's factoryMendOrg took the mark off", async () => {
+  const refused = { error: { message: "Requested active organization is not accessible by this user" } }
+  const p = await plugin(account({ activeOrganizationId: "", region: "" }), (path, h, init) => {
+    if (path === "/api/cli/org") return json({ workosOrgIds: ["org_W"] })
+    if (path === "/user_management/authenticate") return json({ access_token: "tok-org" })
+    if (path === "/api/billing/limits")
+      return h.get("Authorization") === "Bearer tok-org" ? json({ limits: { standard: { fiveHour: { usedPercent: 1 } } } }) : json(refused, 403)
+    return json({}, 404)
+  })
+  expect((await p.usage()).signIn).toBe("renewed")
 })

@@ -96,7 +96,14 @@ test("a success takes the mark off only after a renewal", async () => {
   l = await live((path) => (path.endsWith("/authenticate") ? new Response(JSON.stringify({ access_token: "tok-new" })) : new Response("{}", { status: 200 })), { ...expired })
   res = await ask(l)
   expect(res.status).toBe(200)
-  expect(res.headers.get("X-Magpie-Sign-In")).toBe(null)
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("renewed")
+})
+
+test("a failure after a renewal still takes the mark off, as factoryFresh did before the request", async () => {
+  const l = await live((path) => (path.endsWith("/authenticate") ? new Response(JSON.stringify({ access_token: "tok-new" })) : new Response(JSON.stringify({ error: { message: "bad token" } }), { status: 401 })), { ...expired })
+  const res = await ask(l)
+  expect(res.status).toBe(401)
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("renewed")
 })
 
 test("a renewal WorkOS fails without refusing it is magpie's 502 for the throw, in Go's words, the account unmarked", async () => {

@@ -2,7 +2,7 @@
 // built-in Cursor (internal/gateway/cursor.go, cursorFailure) gave it, so the
 // gateway moves on to the next account or member as it did.
 import { expect, test } from "bun:test"
-import { _internal } from "./index.mjs"
+import { CursorAuthPlugin, _internal } from "./index.mjs"
 
 const { failure, errorResponse } = _internal
 
@@ -25,21 +25,34 @@ test("the codes and words map as the built-in's cursorStatus", () => {
   expect(failure(200, end("unauthenticated", "Error"))).toEqual({ status: 401, message: "unauthenticated — sign in to Cursor again in magpie" })
 })
 
-// The built-in answered any "expired" with a 401 and marked nothing; here a
-// token or session run out marks the account (a plain 401), anything else
-// run out — a trial, a plan — is the same 401 with X-Magpie-Sign-In: kept.
-test("any expired is the built-in's 401; only a sign-in run out marks the account", () => {
+// The built-in answered any "expired" with a 401 and marked nothing, a
+// session's as a trial's; nor did a success clear a mark.
+test("any expired is the built-in's 401", () => {
   const end = (code, message) => JSON.stringify({ error: { code, message } })
   expect(failure(200, end("failed_precondition", "Your free trial has expired"))).toEqual({
-    status: 401, message: "Your free trial has expired — sign in to Cursor again in magpie", signIn: "kept" })
+    status: 401, message: "Your free trial has expired — sign in to Cursor again in magpie" })
   expect(failure(400, end("", "Your session has expired"))).toEqual({
     status: 401, message: "Your session has expired — sign in to Cursor again in magpie" })
-  expect(failure(401, "")).not.toHaveProperty("signIn")
+  expect(failure(401, "")).toEqual({ status: 401, message: "Unauthorized — sign in to Cursor again in magpie" })
 })
 
-test("the answer carries what it means for the sign-in", async () => {
-  const res = errorResponse({ status: 401, message: "Your plan has expired", signIn: "kept" })
+test("every answer, failed or not, says the account is kept", async () => {
+  for (const status of [401, 403, 429, 502]) {
+    const res = errorResponse({ status, message: "x" })
+    expect(res.status).toBe(status)
+    expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
+  }
+  const ok = _internal.kept(new Response("data: [DONE]\n\n", { status: 200, headers: { "Content-Type": "text/event-stream" } }))
+  expect(ok.status).toBe(200)
+  expect(ok.headers.get("X-Magpie-Sign-In")).toBe("kept")
+  expect(ok.headers.get("Content-Type")).toBe("text/event-stream")
+  expect(await ok.text()).toBe("data: [DONE]\n\n")
+})
+
+test("a sign-in that can't give a token is a 401, the account kept", async () => {
+  const hooks = await CursorAuthPlugin()
+  const l = await hooks.auth.loader(async () => ({ type: "oauth", access: "", refresh: "", expires: 0, accountId: "a@b.c" }))
+  const res = await l.fetch("https://cursor.invalid/v1/chat/completions", { method: "POST", body: JSON.stringify({ model: "auto", messages: [] }) })
   expect(res.status).toBe(401)
   expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
-  expect(errorResponse({ status: 401, message: "x" }).headers.get("X-Magpie-Sign-In")).toBeNull()
 })

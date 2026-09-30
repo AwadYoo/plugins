@@ -49,6 +49,7 @@ test("a Teams plan: its end, its day and week, the extra usage balance", async (
       { name: "1 day", used: 0, span: 86400, resetsAt: 1790841600 },
       { name: "7 days", used: 1, span: 604800, resetsAt: 1791100800 },
     ],
+    signIn: "kept",
   })
   expect(seen[0].url).toBe("https://server.codeium.com/exa.seat_management_pb.SeatManagementService/GetUserStatus")
   expect(seen[0].headers).toEqual({ "Content-Type": "application/json", "Connect-Protocol-Version": "1" })
@@ -62,28 +63,30 @@ test("a quota Devin says nothing left of isn't taken for used up; a hidden one i
   expect(u).toEqual({
     until: "2026-10-26T21:45:55Z",
     windows: [{ name: "ACUs", used: 25, display: "12.5 / 50 ACUs", resetsAt: "2026-10-26T21:45:55Z", aside: true }],
+    signIn: "kept",
   })
 })
 
 test("a plan billed otherwise, with resets and no share given, has no quota windows", async () => {
   const s = status({ dailyQuotaRemainingPercent: undefined, weeklyQuotaRemainingPercent: undefined, overageBalanceMicros: undefined })
   s.userStatus.planStatus.planInfo.billingStrategy = "BILLING_STRATEGY_CREDITS"
-  expect((await run(auth, () => Response.json(s))).u).toEqual({ until: "2026-10-26T21:45:55Z", windows: [] })
+  expect((await run(auth, () => Response.json(s))).u).toEqual({ until: "2026-10-26T21:45:55Z", windows: [], signIn: "kept" })
 })
 
 test("a plan without quotas has no windows, and leaves the row's plan be", async () => {
   const s = { userStatus: { planStatus: { planInfo: { planName: "Free" } } } }
-  expect((await run(auth, () => Response.json(s))).u).toEqual({ windows: [] })
+  expect((await run(auth, () => Response.json(s))).u).toEqual({ windows: [], signIn: "kept" })
 })
 
-test("a refused key says to sign in again", async () => {
+// the built-in read no usage, so none marked the account: a refused key
+// says to sign in again, and says the account is kept
+test("a refused key says to sign in again, the account kept", async () => {
   const { u } = await run(auth, () => Response.json({ code: "unauthenticated", message: "invalid api key" }, { status: 401 }))
-  // worded so magpie's /sign-in has expired/ marks the account
-  expect(u).toEqual({ error: "Devin's sign-in has expired — sign in again", windows: [] })
-  expect(u.error).toMatch(/sign-in has expired/)
+  expect(u).toEqual({ error: "Devin's sign-in has expired — sign in again", windows: [], signIn: "kept" })
   const bare = await run(auth, () => new Response("", { status: 401 }))
-  expect(bare.u.error).toBe("Devin's sign-in has expired — sign in again")
-  expect((await run({ type: "oauth" }, () => Response.json({}))).u).toEqual({ error: "Devin isn't signed in" })
+  expect(bare.u).toEqual({ error: "Devin's sign-in has expired — sign in again", windows: [], signIn: "kept" })
+  expect((await run(auth, () => new Response("", { status: 500 }))).u.signIn).toBe("kept")
+  expect((await run({ type: "oauth" }, () => Response.json({}))).u).toEqual({ error: "Devin isn't signed in", signIn: "kept" })
 })
 
 // the built-in sends none and minimal as asked (devinVariantIn): the

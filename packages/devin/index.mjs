@@ -1008,7 +1008,7 @@ async function* events(it) {
 // errorResponse is a failure as the built-in answered it. None marks the
 // account lapsed: the built-in's 401s (a key Devin turned away, none to
 // send) were answered without touching the account, so each says
-// X-Magpie-Sign-In: kept.
+// X-Magpie-Sign-In: kept — as a success does, which cleared nothing either.
 const errorResponse = ({ status, message }) =>
   new Response(JSON.stringify({ error: { message, type: "devin_error", code: status } }), {
     status,
@@ -1077,7 +1077,7 @@ async function complete({ key, server, families }, chat, signal) {
     }
     if (reasoning) msg.reasoning_content = reasoning
     if (calls.length) msg.tool_calls = calls
-    return Response.json({ id, object: "chat.completion", created, model: chat.model, choices: [{ index: 0, message: msg, finish_reason: stop }], usage })
+    return Response.json({ id, object: "chat.completion", created, model: chat.model, choices: [{ index: 0, message: msg, finish_reason: stop }], usage }, { headers: { "X-Magpie-Sign-In": "kept" } })
   }
 
   const chunk = (delta, finish_reason = null, extra = {}) =>
@@ -1109,7 +1109,7 @@ async function complete({ key, server, families }, chat, signal) {
       it.return?.()
     },
   })
-  return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache" } })
+  return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", "X-Magpie-Sign-In": "kept" } })
 }
 
 // ---- the plugin ---------------------------------------------------------------------
@@ -1214,12 +1214,14 @@ export async function DevinAuthPlugin() {
         { type: "oauth", label: "Devin (browser)", authorize: browserSignIn },
         { type: "oauth", label: "Devin CLI's sign-in", authorize: cliSignIn },
       ],
-      // magpie's: the plan and how much of its quota is gone
+      // magpie's: the plan and how much of its quota is gone. The built-in
+      // read none, so no read marks the account or clears it, not even a
+      // key Devin turned away.
       async usage(getAuth) {
         const auth = await getAuth()
-        if (auth?.type !== "api" || !auth.key) return { error: "Devin isn't signed in" }
+        if (auth?.type !== "api" || !auth.key) return { error: "Devin isn't signed in", signIn: "kept" }
         const { key, server } = await live(auth)
-        return usage(key, server)
+        return { ...(await usage(key, server)), signIn: "kept" }
       },
     },
     async config(config) {

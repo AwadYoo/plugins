@@ -38,31 +38,31 @@ async function run(a, reply) {
 
 test("a Pro account: its plan and its period's end, no windows", async () => {
   const { u, seen, saved } = await run(auth(), () => new Response(me("zed_pro")))
-  expect(u).toEqual({ plan: "Pro", until: "2026-10-01T00:00:00Z" })
+  expect(u).toEqual({ plan: "Pro", until: "2026-10-01T00:00:00Z", signIn: "kept" })
   expect(seen).toEqual([{ url: "https://cloud.zed.dev/client/users/me", auth: "4242 plain-access" }])
   expect(saved).toEqual([])
 })
 
 test("a free account reads Free, as the built-in's row names it, and the plan it moved to is kept", async () => {
   const { u, saved } = await run(auth(), () => new Response(me("zed_free")))
-  expect(u).toEqual({ plan: "Free", until: "2026-10-01T00:00:00Z" })
+  expect(u).toEqual({ plan: "Free", until: "2026-10-01T00:00:00Z", signIn: "kept" })
   expect(saved.length).toBe(1)
   expect(JSON.parse(saved[0].body.refresh)).toMatchObject({ plan: "zed_free", planName: "Free" })
 })
 
 test("an overdue invoice is the error it is", async () => {
   const { u } = await run(auth(), () => new Response(me("zed_pro", true)))
-  expect(u).toEqual({ plan: "Pro", until: "2026-10-01T00:00:00Z", error: "Zed: this account has an overdue invoice, so its models are paused (see zed.dev/account)" })
+  expect(u).toEqual({ plan: "Pro", until: "2026-10-01T00:00:00Z", error: "Zed: this account has an overdue invoice, so its models are paused (see zed.dev/account)", signIn: "kept" })
 })
 
 test("a refused pair says the sign-in expired", async () => {
   const { u } = await run(auth(), () => new Response("", { status: 401 }))
-  expect(u).toEqual({ error: "octo: the Zed sign-in has expired — sign in again" })
+  expect(u).toEqual({ error: "octo: the Zed sign-in has expired — sign in again", signIn: "expired" })
 })
 
 test("another failure says Zed's message", async () => {
   const { u } = await run(auth(), () => new Response(JSON.stringify({ code: "x", message: "down for a bit" }), { status: 503 }))
-  expect(u).toEqual({ error: "Zed: down for a bit (503)" })
+  expect(u).toEqual({ error: "Zed: down for a bit (503)", signIn: "kept" })
 })
 
 test("a business plan picked by organization", async () => {
@@ -73,9 +73,9 @@ test("a business plan picked by organization", async () => {
 })
 
 test("an account reply that can't be read is an error, as zed.FetchMe's", async () => {
-  expect((await run(auth(), () => new Response("<html>oops</html>"))).u).toEqual({ error: "Zed: an unreadable account: invalid character '<' looking for beginning of value" })
-  expect((await run(auth(), () => new Response(""))).u).toEqual({ error: "Zed: an unreadable account: unexpected end of JSON input" })
-  expect((await run(auth(), () => new Response("[]"))).u).toEqual({ error: "Zed: an unreadable account: json: cannot unmarshal array into Go value of type zed.Me" })
+  expect((await run(auth(), () => new Response("<html>oops</html>"))).u).toEqual({ error: "Zed: an unreadable account: invalid character '<' looking for beginning of value", signIn: "kept" })
+  expect((await run(auth(), () => new Response(""))).u).toEqual({ error: "Zed: an unreadable account: unexpected end of JSON input", signIn: "kept" })
+  expect((await run(auth(), () => new Response("[]"))).u).toEqual({ error: "Zed: an unreadable account: json: cannot unmarshal array into Go value of type zed.Me", signIn: "kept" })
 })
 
 // complete's answer to a request, the token already minted once
@@ -145,3 +145,13 @@ test("a model Zed gives no limits has none made up", async () => {
   expect(e.limit).toEqual({ context: 0, output: 0 })
   expect(_internal.entry({ provider: "anthropic", id: "y", max_token_count: 1000, max_output_tokens: 10 }).limit).toEqual({ context: 1000, output: 10 })
 })
+
+test("a usage read says what the built-in's did of the sign-in: marked only on Zed's 401, never cleared", async () => {
+  expect((await run(auth(), () => new Response(me("zed_pro")))).u.signIn).toBe("kept")
+  expect((await run(auth(), () => new Response("", { status: 401 }))).u.signIn).toBe("expired")
+  expect((await run(auth(), () => new Response("", { status: 503 }))).u.signIn).toBe("kept")
+  expect((await run(auth(), () => new Response("[]"))).u.signIn).toBe("kept")
+  const hooks = await ZedAuthPlugin({})
+  expect(await hooks.auth.usage(async () => ({ type: "api", key: "x" }))).toEqual({ error: "no such Zed account", signIn: "kept" })
+})
+

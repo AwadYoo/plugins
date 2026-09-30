@@ -100,31 +100,35 @@ for (const bucket of [["default", "composer-2.5", "cursor-grok-4.5-high", "futur
 }
 
 test("an enterprise plan's spend is no window", async () => {
-  expect((await run(fresh(), () => Response.json({ spendLimitUsage: {} }))).u).toEqual({ windows: [] })
+  expect((await run(fresh(), () => Response.json({ spendLimitUsage: {} }))).u).toEqual({ windows: [], signIn: "kept" })
 })
 
 test("a refused token is the status magpie says", async () => {
-  expect((await run(fresh(), () => new Response("no", { status: 401 }))).u).toEqual({ error: "Unauthorized", windows: [] })
+  expect((await run(fresh(), () => new Response("no", { status: 401 }))).u).toEqual({ error: "Unauthorized", windows: [], signIn: "kept" })
 })
 
 test("a run-out sign-in says so, and asks nothing", async () => {
   const { u, seen } = await run({ ...auth, access: jwt(1) }, () => Response.json({}))
-  expect(u).toEqual({ error: "Cursor's sign-in has run out; sign in to Cursor again", windows: [] })
+  expect(u).toEqual({ error: "Cursor's sign-in has run out; sign in to Cursor again", windows: [], signIn: "kept" })
   expect(seen).toEqual([])
 })
 
-// magpie marks a plugin's account lapsed on any 401, so only a sign-in
-// that is gone says 401
-// the built-in's 401 for any "expired"; X-Magpie-Sign-In keeps the account
-// when what ran out was no sign-in
-test("an expired token is a lapsed sign-in; an expired trial is not", () => {
+// the built-in's 401 for any "expired", a token's or a trial's, which marked
+// no account (errorResponse says kept)
+test("anything expired is the built-in's 401", () => {
   const { failure } = _internal
   const says = (msg) => failure(400, JSON.stringify({ code: "failed_precondition", message: msg }))
-  expect(says("Your access token has expired")).toMatchObject({ status: 401 })
-  expect(says("Your access token has expired")).not.toHaveProperty("signIn")
-  expect(says("Session expired, please log in again")).not.toHaveProperty("signIn")
-  expect(says("Your free trial has expired")).toMatchObject({ status: 401, signIn: "kept" })
-  expect(says("This link has expired")).toMatchObject({ status: 401, signIn: "kept" })
+  for (const m of ["Your access token has expired", "Session expired, please log in again", "Your free trial has expired", "This link has expired"])
+    expect(says(m)).toEqual({ status: 401, message: m + " — sign in to Cursor again in magpie" })
+})
+
+// The built-in's usage read neither marked nor cleared the account, so each
+// read says kept, a clean one too.
+test("a usage read keeps the account, clean or not", async () => {
+  const PERIOD_OK = () => Response.json({ billingCycleEnd: "1792833042000", planUsage: { autoPercentUsed: 1, apiPercentUsed: 2, totalPercentUsed: 3 } })
+  expect((await run(fresh(), PERIOD_OK)).u.signIn).toBe("kept")
+  expect((await run(fresh(), () => new Response("no", { status: 401 }))).u.signIn).toBe("kept")
+  expect((await run({ ...auth, access: jwt(1) }, PERIOD_OK)).u.signIn).toBe("kept")
 })
 
 // the gateway names the provider before a plugin's error

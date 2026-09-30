@@ -33,11 +33,13 @@ test("the plan's 401 goes on as it came, the account kept", async () => {
   expect(await res.json()).toEqual({ error: { message: "token expired or incorrect" } })
 })
 
-test("other answers go as they came", async () => {
+// nor cleared one: an answer that went through leaves the mark as it is
+test("other answers go as they came, the account kept", async () => {
   for (const status of [200, 429]) {
     const res = await send(key, () => new Response("x", { status }))
     expect(res.status).toBe(status)
-    expect(res.headers.get("X-Magpie-Sign-In")).toBeNull()
+    expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
+    expect(await res.text()).toBe("x")
   }
 })
 

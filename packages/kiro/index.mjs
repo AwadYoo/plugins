@@ -194,8 +194,8 @@ const EXPIRED = "Kiro's sign-in has expired; sign in again"
 const EXPIRED_CLI = EXPIRED + " with `kiro-cli login` or the Kiro IDE"
 
 // gone is an error saying the sign-in itself is gone — refused, or never
-// there — which alone marks the account lapsed; a refresh that timed out
-// or met a 5xx fails the request as the built-in did, the account kept.
+// there. The built-in marked no Kiro account lapsed, not even then, nor
+// cleared one: every answer and usage read says the account is kept.
 const gone = (msg) => Object.assign(new Error(msg), { gone: true })
 const fresh = (c) => c.method === "apikey" || !c.expires || c.expires - Date.now() > 2 * 60 * 1000
 
@@ -726,13 +726,22 @@ function failure(status, body) {
 const ERROR_TYPES = { 400: "invalid_request_error", 401: "authentication_error", 402: "billing_error", 403: "permission_error",
   404: "not_found_error", 413: "request_too_large", 429: "rate_limit_error", 503: "overloaded_error", 529: "overloaded_error" }
 const errorType = (status) => ERROR_TYPES[status] ?? "api_error"
-// signIn, the X-Magpie-Sign-In header, says what the answer means for the
-// account whatever its status: "expired" marks it lapsed, "kept" leaves it.
-const errorResponse = (status, message, signIn) =>
+// Each failure says X-Magpie-Sign-In: kept, as the built-in never marked
+// an account lapsed (see gone).
+const errorResponse = (status, message) =>
   new Response(JSON.stringify({ type: "error", error: { type: errorType(status), message } }), {
     status,
-    headers: { "Content-Type": "application/json", ...(signIn ? { "X-Magpie-Sign-In": signIn } : {}) },
+    headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "kept" },
   })
+
+// kept is res saying the account is kept: a success too, which the
+// built-in never took for a sign-in come back.
+function kept(res) {
+  if (res.headers.has("X-Magpie-Sign-In")) return res
+  const headers = new Headers(res.headers)
+  headers.set("X-Magpie-Sign-In", "kept")
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
+}
 
 // ---- the reply: an AWS event stream → Messages ---------------------------------------
 
@@ -1093,8 +1102,8 @@ async function reply(it, model, stream) {
 
 // generate answers a Messages request through Kiro's API: once more,
 // refreshed, when Kiro turns the token down (403). As the built-in: no
-// credentials is a 401, a failed refresh after the 403 a 502; only a
-// sign-in that is gone marks the account.
+// credentials is a 401, a failed refresh after the 403 a 502; none marks
+// the account.
 async function generate(creds, auth, req, signal) {
   const model = String(req.model ?? "auto")
   const budget = thinking(req, model)
@@ -1102,7 +1111,7 @@ async function generate(creds, auth, req, signal) {
   try {
     a = await creds(auth)
   } catch (e) {
-    return errorResponse(401, e.message, e?.gone ? undefined : "kept")
+    return errorResponse(401, e.message)
   }
   let res
   try {
@@ -1116,7 +1125,7 @@ async function generate(creds, auth, req, signal) {
     try {
       a = await creds(auth, true)
     } catch (e) {
-      return errorResponse(502, e.message, e?.gone ? "expired" : undefined)
+      return errorResponse(502, e.message)
     }
     try {
       res = await sendKiro(a, buildKiro(req, model, a.profile, budget), signal)
@@ -1128,9 +1137,9 @@ async function generate(creds, auth, req, signal) {
   if (!res.ok) {
     // Kiro's own 401 is passed on, as the built-in did, the sign-in kept
     const f = failure(res.status, (await res.text()).slice(0, 1 << 20))
-    return errorResponse(f.status, f.message, f.status === 401 ? "kept" : undefined)
+    return errorResponse(f.status, f.message)
   }
-  return reply(events(res.body, model, budget), model, req.stream === true)
+  return kept(await reply(events(res.body, model, budget), model, req.stream === true))
 }
 
 // ---- signing in ----------------------------------------------------------------------
@@ -1337,14 +1346,15 @@ export async function KiroAuthPlugin({ client } = {}) {
           },
         }
       },
-      // the account's credits, as magpie's built-in showed them
+      // the account's credits, as magpie's built-in showed them; a read,
+      // clean or failed, marked the built-in's account nothing
       async usage(getAuth) {
         const auth = await getAuth()
-        if (!(auth?.type === "api" && auth.key) && auth?.type !== "oauth") return { error: "not signed in" }
+        if (!(auth?.type === "api" && auth.key) && auth?.type !== "oauth") return { error: "not signed in", signIn: "kept" }
         try {
-          return usageOf(await usageLimits(await creds(auth), true))
+          return { ...usageOf(await usageLimits(await creds(auth), true)), signIn: "kept" }
         } catch (e) {
-          return { error: e.message }
+          return { error: e.message, signIn: "kept" }
         }
       },
       methods: [

@@ -917,11 +917,11 @@ export async function CommandCodePlugin({ client } = {}) {
               } catch {
                 return errorResponse({ status: 400, message: "a request that isn't JSON" })
               }
-              return generate(key, chat, init.signal)
+              return kept(await generate(key, chat, init.signal))
             }
-            // the Provider API's 401 went on as it came, the account kept
-            const res = await fetch(input, { ...init, headers })
-            return res.status === 401 ? kept(res) : res
+            // the Provider API's answer goes on as it came, the account
+            // kept: the built-in neither marked one lapsed nor cleared it
+            return kept(await fetch(input, { ...init, headers }))
           },
         }
       },
@@ -933,7 +933,9 @@ export async function CommandCodePlugin({ client } = {}) {
       // magpie's: the plan and how much of it is used
       async usage(getAuth) {
         const auth = await getAuth()
-        if (auth?.type !== "api" || !auth.key) return { error: "not signed in" }
+        // signIn kept on each: the built-in's usage read never marked the
+        // account lapsed nor cleared it
+        if (auth?.type !== "api" || !auth.key) return { error: "not signed in", signIn: "kept" }
         const md = auth.metadata ?? {}
         const { out, read } = await usage(await liveKey(auth), md.plan ? { id: md.planId ?? "", plan: md.plan } : undefined)
         // the plan read is saved with the key, so a start doesn't wait on
@@ -943,7 +945,7 @@ export async function CommandCodePlugin({ client } = {}) {
             await client.auth.set({ path: { id: ID }, body: { ...auth, metadata: { ...md, plan: read.plan, planId: read.id } } })
           } catch {}
         }
-        return out
+        return { ...out, signIn: "kept" }
       },
     },
     async config(config) {

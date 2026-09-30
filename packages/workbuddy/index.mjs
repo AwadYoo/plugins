@@ -575,20 +575,22 @@ function makePlugin(site) {
             let body = init?.body
             if (body === undefined && req) body = await req.clone().text()
             const res = await fetch(req ? req.url : input, { ...init, method: init?.method ?? req?.method, headers, body: withSystem(body) })
-            return res.status >= 400 ? explained(res) : res
+            return res.status >= 400 ? explained(res) : kept(res)
           },
         }
       },
-      // the account's credits, as magpie's built-in showed them
+      // the account's credits, as magpie's built-in showed them; each
+      // read keeps the sign-in (signIn), as the built-in's neither marked
+      // an account lapsed nor cleared it
       async usage(getAuth) {
         const auth = await getAuth()
-        if (auth?.type !== "oauth" || !(auth.access || auth.source)) return { error: "not signed in" }
+        if (auth?.type !== "oauth" || !(auth.access || auth.source)) return { error: "not signed in", signIn: "kept" }
         try {
           const a = await current(site, client, auth)
           // the meter has no /v2 prefix, on either site
-          return usageOf(await meter(site, a, "/billing/meter/get-user-resource-summary"), auth.plan)
+          return { ...usageOf(await meter(site, a, "/billing/meter/get-user-resource-summary"), auth.plan), signIn: "kept" }
         } catch (e) {
-          return { error: e?.message ?? String(e) }
+          return { error: e?.message ?? String(e), signIn: "kept" }
         }
       },
       methods: [
@@ -615,6 +617,14 @@ function makePlugin(site) {
 const REFUSED_HINT =
   "WorkBuddy refuses chats from Codex and Claude Code (their system prompt); use it from Hermes, OpenCode or Pi, or add another provider to this group"
 const REFUSED = /unapproved channel|illegal api invocation/i
+
+// kept is an answer that went through, saying the sign-in is kept: the
+// built-in never cleared a WorkBuddy account's mark, as it never set one.
+function kept(res) {
+  const headers = new Headers(res.headers)
+  headers.set("X-Magpie-Sign-In", "kept")
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
+}
 
 // explained is res with REFUSED_HINT added to that refusal's message.
 // Each refusal says the sign-in is kept: the built-in passed WorkBuddy's

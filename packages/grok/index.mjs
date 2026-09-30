@@ -477,10 +477,10 @@ export const GrokAuthPlugin = async ({ client }) => {
             if (typeof parsed.model === "string" && parsed.model) headers.set("x-grok-model-override", parsed.model)
             if (typeof parsed.prompt_cache_key === "string" && parsed.prompt_cache_key) headers.set("x-grok-conv-id", parsed.prompt_cache_key)
             headers.delete("content-length")
-            // sent once, as the built-in sent it: Grok's 401 goes on as it
-            // came, and the built-in never marked a Grok account lapsed
-            const res = await fetch(req.url, { ...init, method: req.method, headers, body })
-            return res.status === 401 ? kept(res) : res
+            // sent once, as the built-in sent it: Grok's answer goes on as
+            // it came, the account kept, as the built-in never marked a Grok
+            // account lapsed nor cleared one
+            return kept(await fetch(req.url, { ...init, method: req.method, headers, body }))
           },
         }
       },
@@ -496,7 +496,9 @@ export const GrokAuthPlugin = async ({ client }) => {
           authorize: current,
         },
       ],
-      // magpie's: how much of the subscription's allowance is gone
+      // magpie's: how much of the subscription's allowance is gone; each
+      // read keeps the sign-in (signIn), as the built-in's marked no
+      // account lapsed nor cleared one
       async usage(getAuth) {
         const auth = await getAuth()
         let c
@@ -504,10 +506,10 @@ export const GrokAuthPlugin = async ({ client }) => {
           if (!auth || auth.type !== "oauth" || !auth.refresh) throw new Error("Grok is not signed in; run `grok login`")
           c = await token(auth.refresh, false)
         } catch (e) {
-          return { error: e.message, windows: [] }
+          return { error: e.message, windows: [], signIn: "kept" }
         }
         await remember(auth, c)
-        return usage(c.key)
+        return { ...(await usage(c.key)), signIn: "kept" }
       },
     },
 

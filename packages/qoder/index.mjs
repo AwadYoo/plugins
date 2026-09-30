@@ -759,6 +759,17 @@ async function bodyText(input, init) {
   return typeof b === "string" ? b : new TextDecoder().decode(b)
 }
 
+// signed is res saying what it means for the sign-in, as the built-in's
+// answer did: a renewed job token cleared the mark whatever came of the
+// request; without one, a success left the mark as it was.
+function signed(res, renewed) {
+  const said = renewed ? "renewed" : res.ok ? "kept" : null
+  if (!said) return res
+  const headers = new Headers(res.headers)
+  headers.set("X-Magpie-Sign-In", said)
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
+}
+
 // ---- usage --------------------------------------------------------------------
 //
 // The account's allowance as magpie's built-in Qoder account shows it
@@ -880,6 +891,9 @@ export async function QoderAuthPlugin({ client }) {
   }
   // each account's listing, the model configs a request carries
   const listings = new Map()
+  // the accounts fresh renewed: the built-in took the lapse mark off on a
+  // renewed job token (qoderPersist), whatever the request then met
+  const renewals = new WeakSet()
 
   // fresh is the account with a live job token, refreshed and saved near
   // its end.
@@ -891,6 +905,7 @@ export async function QoderAuthPlugin({ client }) {
       const jt = await refreshJob(a.refresh, a.accountId || a.email || a.uid)
       const next = { ...a, access: jt.token, refresh: jt.refresh_token, expires: expiresAt(jt) }
       await client.auth.set({ path: { id: ID }, body: next })
+      renewals.add(next)
       return next
     })
 
@@ -914,10 +929,15 @@ export async function QoderAuthPlugin({ client }) {
       return dt.token
     })
 
-  // usage is the account's allowance, magpie's own hook
+  // usage is the account's allowance, magpie's own hook. signIn is what the read means for the sign-in, as the built-in's did:
+  // a refused job refresh marks it, a renewed one clears it, and nothing
+  // else does — not a clean read, nor a refused device token, which serves
+  // only the account pages
   const usage = async (getAuth) => {
+    let signIn = "kept"
     try {
       const cred = await fresh(getAuth)
+      if (renewals.has(cred)) signIn = "renewed"
       let env
       try {
         env = await fetchUsage(cred.deviceToken)
@@ -925,9 +945,9 @@ export async function QoderAuthPlugin({ client }) {
         if (!(e instanceof UsageStatus) || (e.status !== 401 && e.status !== 403)) throw e
         env = await fetchUsage(await deviceToken(getAuth, cred.deviceToken))
       }
-      return parseUsage(env)
+      return { ...parseUsage(env), signIn }
     } catch (e) {
-      return { error: e?.message ?? String(e) }
+      return { error: e?.message ?? String(e), signIn: e?.expired ? "expired" : signIn }
     }
   }
 
@@ -937,6 +957,35 @@ export async function QoderAuthPlugin({ client }) {
       message: String(e?.message ?? e).replace(/^Qoder: /, ""),
       signIn: e?.expired ? "expired" : undefined,
     })
+
+  // ask is the answer to a chat completion on the live account cred.
+  const ask = async (chat, cred, init) => {
+    let m
+    try {
+      m = (await models(cred)).find((x) => x.key === chat.model) ?? (await models(cred, true)).find((x) => x.key === chat.model)
+    } catch (e) {
+      // the built-in answered any failure to read the list 400
+      // (QoderModelOf), a refused one included, marking nothing
+      return errorResponse({ status: 400, message: e.message })
+    }
+    if (!m) return errorResponse({ status: 400, message: `unknown or disabled model "${chat.model}"` })
+    const wire = encodeBody(JSON.stringify(qoderBody(chat, m)))
+    const headers = {
+      ...cosyHeaders(CHAT_URL, cred, wire),
+      Accept: "text/event-stream",
+      "Cache-Control": "no-cache",
+      "X-Model-Key": m.key,
+      "X-Model-Source": m.source,
+    }
+    let res
+    try {
+      res = await fetch(CHAT_URL, { method: "POST", headers, body: wire, signal: init.signal })
+    } catch (e) {
+      return errorResponse({ status: 502, message: e.message })
+    }
+    if (!res.ok) return errorResponse(failure(res.status, (await res.text()).slice(0, 1 << 20)))
+    return answer(res, chat)
+  }
 
   return {
     auth: {
@@ -964,31 +1013,7 @@ export async function QoderAuthPlugin({ client }) {
             } catch (e) {
               return signedInError(e)
             }
-            let m
-            try {
-              m = (await models(cred)).find((x) => x.key === chat.model) ?? (await models(cred, true)).find((x) => x.key === chat.model)
-            } catch (e) {
-              // the built-in answered any failure to read the list 400
-              // (QoderModelOf), a refused one included, marking nothing
-              return errorResponse({ status: 400, message: e.message })
-            }
-            if (!m) return errorResponse({ status: 400, message: `unknown or disabled model "${chat.model}"` })
-            const wire = encodeBody(JSON.stringify(qoderBody(chat, m)))
-            const headers = {
-              ...cosyHeaders(CHAT_URL, cred, wire),
-              Accept: "text/event-stream",
-              "Cache-Control": "no-cache",
-              "X-Model-Key": m.key,
-              "X-Model-Source": m.source,
-            }
-            let res
-            try {
-              res = await fetch(CHAT_URL, { method: "POST", headers, body: wire, signal: init.signal })
-            } catch (e) {
-              return errorResponse({ status: 502, message: e.message })
-            }
-            if (!res.ok) return errorResponse(failure(res.status, (await res.text()).slice(0, 1 << 20)))
-            return answer(res, chat)
+            return signed(await ask(chat, cred, init), renewals.has(cred))
           },
         }
       },

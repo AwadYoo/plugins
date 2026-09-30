@@ -91,3 +91,12 @@ test("an error after a frame with nothing in it is streamed in the built-in's wo
   const ev = r.body.split("\n\n").map((l) => l.replace(/^data: /, "")).find((l) => l.includes('"error"'))
   expect(JSON.parse(ev).error.message).toBe("usage limit reached: rate limit")
 })
+
+// a success cleared no mark the built-in's account could have had
+test("an answer says the account is kept, streamed or not", async () => {
+  for (const stream of [false, true]) {
+    const r = await ask(() => new Response(join(new Uint8Array(5), end({}))), stream)
+    expect(r.status).toBe(200)
+    expect(r.signIn).toBe("kept")
+  }
+})

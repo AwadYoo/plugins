@@ -86,20 +86,20 @@ test("unstreamed, what was said before an exception is the answer", async () => 
 })
 
 // Failing before any of the answer, a request is answered with the built-in's
-// status (internal/gateway/kiro.go askKiro), and X-Magpie-Sign-In says when
-// that is no lapsed sign-in: only one Kiro refused marks the account.
+// status (internal/gateway/kiro.go askKiro), and X-Magpie-Sign-In: kept,
+// as the built-in marked no Kiro account lapsed, even one Kiro refused.
 const { generate, refresh, failure } = _internal
 const msgReq = { model: "claude-sonnet-4.5", messages: [{ role: "user", content: "hi" }] }
 const gone = (msg) => Object.assign(new Error(msg), { gone: true })
 
-test("credentials that can't be had are a 401; the account is kept unless the sign-in is gone", async () => {
+test("credentials that can't be had are a 401, the account kept even when the sign-in is gone", async () => {
   let res = await generate(async () => { throw new Error("refreshing Kiro's sign-in: fetch failed") }, {}, msgReq)
   expect(res.status).toBe(401)
   expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
   expect((await res.json()).error.message).toBe("refreshing Kiro's sign-in: fetch failed")
   res = await generate(async () => { throw gone("Kiro's sign-in has expired; sign in again with `kiro-cli login` or the Kiro IDE") }, {}, msgReq)
   expect(res.status).toBe(401)
-  expect(res.headers.get("X-Magpie-Sign-In")).toBeNull()
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
 })
 
 const withFetch = async (answer, fn) => {
@@ -119,14 +119,14 @@ const creds = (fail) => {
   }
 }
 
-test("a refresh failing after Kiro's 403 is a 502, marked only when Kiro refused it", async () => {
+test("a refresh failing after Kiro's 403 is a 502, the account kept even when Kiro refused it", async () => {
   await withFetch(() => new Response("{}", { status: 403 }), async () => {
     let res = await generate(creds(new Error("refreshing Kiro's sign-in: 503 Service Unavailable")), {}, msgReq)
     expect(res.status).toBe(502)
-    expect(res.headers.get("X-Magpie-Sign-In")).toBeNull()
+    expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
     res = await generate(creds(gone("Kiro's sign-in has expired; sign in again with `kiro-cli login` or the Kiro IDE")), {}, msgReq)
     expect(res.status).toBe(502)
-    expect(res.headers.get("X-Magpie-Sign-In")).toBe("expired")
+    expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
   })
 })
 
@@ -153,4 +153,22 @@ test("a refresh is worded as the built-in's", async () => {
   })
   await expect(refresh({ ...c, refresh: "" })).rejects.toMatchObject({ message: "Kiro's sign-in has expired; sign in again with `kiro-cli login` or the Kiro IDE" })
   await expect(refresh({ ...c, method: "odd" })).rejects.toMatchObject({ message: "Kiro's sign-in has expired" })
+})
+
+// a success, even after a renewal, never cleared the built-in's account
+test("an answer says the account is kept, streamed or not, renewed or not", async () => {
+  const ok = () => new Response(stream(text("Hello")), { status: 200 })
+  for (const s of [true, false]) {
+    await withFetch(ok, async () => {
+      const res = await generate(creds(), {}, { ...msgReq, stream: s })
+      expect(res.status).toBe(200)
+      expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
+    })
+    let n = 0
+    await withFetch(() => (n++ ? ok() : new Response("{}", { status: 403 })), async () => {
+      const res = await generate(creds(), {}, { ...msgReq, stream: s })
+      expect(res.status).toBe(200)
+      expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
+    })
+  }
 })

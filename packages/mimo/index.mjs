@@ -378,16 +378,22 @@ export const MimoAuthPlugin = async ({ client }) => {
   }
 
   // page asks the MiMo server for one of the account's pages, signing on
-  // again once when it is turned away, and gives its data.
-  const page = async (getAuth, path) => {
+  // again once when it is turned away, and gives its data. read.signIn is
+  // what that did to the built-in's lapse mark: signed on again took it
+  // off, a sign-in Xiaomi no longer takes (mimoLapse) put it on.
+  const page = async (getAuth, path, read) => {
     for (let t = 0; ; t++) {
       let s
       try {
         s = await fresh(getAuth, t > 0)
       } catch (e) {
-        if (e instanceof Lapsed) throw new SignInGone(`${fromAuth(await getAuth())?.creds.userId}: the Xiaomi MiMo sign-in has expired — sign in again`)
+        if (e instanceof Lapsed) {
+          read.signIn = "expired"
+          throw new SignInGone(`${fromAuth(await getAuth())?.creds.userId}: the Xiaomi MiMo sign-in has expired — sign in again`)
+        }
         throw e
       }
+      if (s.renewed) read.signIn = "renewed"
       const res = await fetch(s.creds.base.replace(/\/+$/, "") + path, {
         headers: { Cookie: cookieHeader(s.cookies), ...appHeaders() },
         signal: AbortSignal.timeout(20_000),
@@ -401,6 +407,7 @@ export const MimoAuthPlugin = async ({ client }) => {
       if (res.status === 401 || (res.status === 200 && bad)) {
         // a session gone stale, or a redirect to Xiaomi's sign-in
         if (t === 0) continue
+        read.signIn = "expired"
         throw new SignInGone(`${s.creds.userId}: the Xiaomi MiMo sign-in has expired — sign in again`)
       }
       if (res.status !== 200 || bad) throw new Error(`Xiaomi MiMo ${path}: ${vendorError(text, statusLine(res.status))}`)
@@ -409,13 +416,16 @@ export const MimoAuthPlugin = async ({ client }) => {
     }
   }
 
-  // usage is the plan and the week's allowance, magpie's own hook
+  // usage is the plan and the week's allowance, magpie's own hook; signIn
+  // is the lapse mark as the built-in's reads left it, a clean read with
+  // no signing on again leaving it be
   const usage = async (getAuth) => {
+    const read = { signIn: "kept" }
     let self
     try {
-      self = await page(getAuth, "/user/xiaomi/subscription/self")
+      self = await page(getAuth, "/user/xiaomi/subscription/self", read)
     } catch (e) {
-      return { error: e?.message ?? String(e) }
+      return { error: e?.message ?? String(e), signIn: read.signIn }
     }
     const c = self?.current
     const out = { plan: "Free" }
@@ -429,12 +439,13 @@ export const MimoAuthPlugin = async ({ client }) => {
     }
     let use
     try {
-      use = await page(getAuth, "/user/usage")
+      use = await page(getAuth, "/user/usage", read)
     } catch (e) {
       if (e instanceof SignInGone) out.error = e.message
       // the plan alone, when the week's allowance can't be read
-      return out
+      return { ...out, signIn: read.signIn }
     }
+    out.signIn = read.signIn
     const percent = use?.percent
     const reset = use?.resetDate
     // no plan: the free offer shows no allowance
@@ -500,9 +511,10 @@ export const MimoAuthPlugin = async ({ client }) => {
             headers.set("User-Agent", UA)
             headers.set("X-Client-Version", APP_VERSION)
             // the server's answer goes through as it is, a 401 too, as the
-            // built-in's did: it took the lapse off only when it signed on again
+            // built-in's did: it took the lapse off only when it signed on
+            // again, whatever the server then answered
             const res = await fetch(url, { ...init, method: init.method ?? req?.method ?? "POST", headers, body })
-            return s.renewed && res.status >= 200 && res.status < 300 ? res : said(res, "kept")
+            return said(res, s.renewed ? "renewed" : "kept")
           },
         }
       },

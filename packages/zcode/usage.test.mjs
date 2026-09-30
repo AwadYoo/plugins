@@ -50,6 +50,7 @@ test("a Coding Plan's five hours and week", async () => {
       ] })
   })
   expect(await usage(oauth({ site: "zai", key: "two.secret2" }))).toEqual({
+    signIn: "kept",
     plan: "GLM Coding Pro",
     windows: [
       { name: "5 hours", used: 25, display: "500 / 2000", resetsAt: new Date(reset).toISOString(), span: 5 * 3600 },
@@ -59,7 +60,7 @@ test("a Coding Plan's five hours and week", async () => {
   expect(calls.every((c) => c.url.origin === "https://api.z.ai")).toBe(true)
   // an API key, BigModel's, is asked on its own site
   const bm = serve(({ url }) => (url.pathname.endsWith("/limit") ? ok({ limits: [] }) : ok([])))
-  expect(await usage({ type: "api", key: "k", metadata: { site: "bigmodel" } })).toEqual({ windows: [] })
+  expect(await usage({ type: "api", key: "k", metadata: { site: "bigmodel" } })).toEqual({ signIn: "kept", windows: [] })
   expect(bm[0].url.origin).toBe("https://open.bigmodel.cn")
 })
 
@@ -110,6 +111,7 @@ test("ZCode's Start Plan: its buckets, each for its models", async () => {
   })
   const auth = oauth({ site: "bigmodel", jwt: token, device: "11111111-2222-4333-8444-555555555555" })
   expect(await usage(auth)).toEqual({
+    signIn: "kept",
     plan: "Start Plan", until: new Date((now + 7 * 86400) * 1000).toISOString(), renew: "off",
     windows: [{ name: "GLM-5.1", used: 25, display: "250000 / 1000000", resetsAt: new Date((now + 3600) * 1000).toISOString(), span: 86400,
       models: ["GLM-5.1"] }],
@@ -117,7 +119,7 @@ test("ZCode's Start Plan: its buckets, each for its models", async () => {
   expect(calls[0].url.origin).toBe("https://zcode.z.ai")
   expect(calls[0].headers["X-Device-Mid"]).toBe("11111111-2222-4333-8444-555555555555")
 
-  const over = { error: "this account has no GLM Coding Plan, and ZCode's Start Plan has ended or was never started" }
+  const over = { signIn: "kept", error: "this account has no GLM Coding Plan, and ZCode's Start Plan has ended or was never started" }
   balance = startBalance(now, "expired")
   expect(await usage(auth)).toEqual(over)
   // still "active" past its end is over too, as ZCode reads it
@@ -130,7 +132,7 @@ test("ZCode's Start Plan: its buckets, each for its models", async () => {
   expect((await usage(auth)).windows).toEqual([{ name: "GLM-5-Turbo", used: 25, display: "50 / 200", span: 7 * 86400, models: ["GLM-5-Turbo"] }])
 
   // its token run out
-  expect(await usage(oauth({ site: "zai", jwt: jwt(now - 60) }))).toEqual({ error: "ZCode's sign-in has expired; sign in to ZCode again (or add the account again in magpie)" })
+  expect(await usage(oauth({ site: "zai", jwt: jwt(now - 60) }))).toEqual({ signIn: "kept", error: "ZCode's sign-in has expired; sign in to ZCode again (or add the account again in magpie)" })
 })
 
 test("a team seat: the team plan's windows, name, end and resets, its key found and saved", async () => {
@@ -167,6 +169,7 @@ test("a team seat: the team plan's windows, name, end and resets, its key found 
   const sets = []
   const state = { site: "bigmodel", base: "https://open.bigmodel.cn/api/anthropic", token: TOKEN, org: "t1", project: "tp1", plan: "GLM Coding Team Pro" }
   expect(await usage(oauth(state), sets)).toEqual({
+    signIn: "kept",
     plan: "GLM Coding Team Pro", until: "2026-12-31T15:59:59.000Z", renew: "off",
     resets: { count: 3, byWindow: true, fiveHour: 2, weekly: 1, until: new Date(1790000000 * 1000).toISOString() },
     windows: [
@@ -183,12 +186,12 @@ test("a team seat: the team plan's windows, name, end and resets, its key found 
 
 test("Z.ai's refusals are the card's error", async () => {
   serve(() => new Response("", { status: 401 }))
-  expect(await usage(oauth({ site: "zai", key: "k" }))).toEqual({ error: "Unauthorized" })
+  expect(await usage(oauth({ site: "zai", key: "k" }))).toEqual({ signIn: "kept", error: "Unauthorized" })
   serve(() => new Response(JSON.stringify({ code: 1001, msg: "Authorization Token非法" }), { status: 401 }))
-  expect(await usage(oauth({ site: "zai", key: "k" }))).toEqual({ error: "Authorization Token非法 (401, code 1001)" })
+  expect(await usage(oauth({ site: "zai", key: "k" }))).toEqual({ signIn: "kept", error: "Authorization Token非法 (401, code 1001)" })
   serve(() => new Response(JSON.stringify({ code: 500, msg: "" })))
-  expect(await usage(oauth({ site: "zai", key: "k" }))).toEqual({ error: "error 500" })
-  expect(await usage(undefined)).toEqual({ error: "not signed in" })
+  expect(await usage(oauth({ site: "zai", key: "k" }))).toEqual({ signIn: "kept", error: "error 500" })
+  expect(await usage(undefined)).toEqual({ signIn: "kept", error: "not signed in" })
 })
 
 // magpie's built-in starts every card from the saved plan (zcode.go
@@ -210,7 +213,7 @@ test("the saved plan stays on the card when the reply has no level, a team detai
   expect((await usage(oauth(team))).plan).toBe("GLM Coding Team Pro")
 
   serve(() => new Response("", { status: 401 }))
-  expect(await usage(oauth({ site: "zai", key: "k", plan: "GLM Coding Max" }))).toEqual({ plan: "GLM Coding Max", error: "Unauthorized" })
+  expect(await usage(oauth({ site: "zai", key: "k", plan: "GLM Coding Max" }))).toEqual({ signIn: "kept", plan: "GLM Coding Max", error: "Unauthorized" })
 })
 
 // the built-in left a limit ZCode's config doesn't name at 0

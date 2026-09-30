@@ -42,6 +42,7 @@ test("SuperGrok's week and its on-demand spending; the CLI's newer token is kept
     }),
   )
   expect(u).toEqual({
+    signIn: "kept",
     windows: [
       { name: "7 days", used: 42.5, span: 604800, resetsAt: "2026-09-28T02:17:59.504011+00:00" },
       { name: "On-demand", used: 25, resetsAt: "2026-09-28T02:17:59.504011+00:00", aside: true },
@@ -55,21 +56,21 @@ test("a month with no on-demand cap is one window", async () => {
   const { u, saved } = await run({ ...auth, access: "tok-2", expires: Date.parse(expires) }, () =>
     Response.json({ config: { currentPeriod: { type: "USAGE_PERIOD_TYPE_MONTHLY", end: "2026-10-01T00:00:00+00:00" }, onDemandCap: { val: 0 } } }),
   )
-  expect(u).toEqual({ windows: [{ name: "Month", used: 0, span: 2592000, resetsAt: "2026-10-01T00:00:00+00:00" }] })
+  expect(u).toEqual({ signIn: "kept", windows: [{ name: "Month", used: 0, span: 2592000, resetsAt: "2026-10-01T00:00:00+00:00" }] })
   expect(saved).toEqual([])
 })
 
 test("no current period: the billing period's Allowance; an unknown one has no span", async () => {
   let { u } = await run(auth, () => Response.json({ config: { creditUsagePercent: 7, billingPeriodEnd: "2026-10-05T00:00:00Z" } }))
-  expect(u).toEqual({ windows: [{ name: "Allowance", used: 7, resetsAt: "2026-10-05T00:00:00Z" }] })
+  expect(u).toEqual({ signIn: "kept", windows: [{ name: "Allowance", used: 7, resetsAt: "2026-10-05T00:00:00Z" }] })
   ;({ u } = await run(auth, () => Response.json({ config: { currentPeriod: { type: "USAGE_PERIOD_TYPE_HOURLY", end: "soon" } } })))
-  expect(u).toEqual({ windows: [{ name: "Allowance", used: 0 }] })
+  expect(u).toEqual({ signIn: "kept", windows: [{ name: "Allowance", used: 0 }] })
 })
 
 test("a refused token is the status magpie says; no sign-in says to sign in", async () => {
-  expect((await run(auth, () => new Response("", { status: 401 }))).u).toEqual({ error: "Unauthorized", windows: [] })
+  expect((await run(auth, () => new Response("", { status: 401 }))).u).toEqual({ signIn: "kept", error: "Unauthorized", windows: [] })
   const { u, seen } = await run({ ...auth, refresh: join(home, "none") }, () => Response.json({}))
-  expect(u).toEqual({ error: "Grok is not signed in; run `grok login`", windows: [] })
+  expect(u).toEqual({ signIn: "kept", error: "Grok is not signed in; run `grok login`", windows: [] })
   expect(seen).toEqual([])
 })
 
@@ -88,6 +89,7 @@ test("a fetch that fails is the card's error, worded for magpie's keepLast", asy
   for (const [e, said] of cases) {
     const { u } = await run(auth, fail(e))
     expect(u.windows).toEqual([])
+    expect(u.signIn).toBe("kept")
     expect(u.error.startsWith(`Get "${url}": `)).toBe(true)
     expect(u.error).toMatch(/no such host|connection refused|timeout|EOF|Service Unavailable/)
     expect(u.error).toContain(said)
@@ -95,12 +97,12 @@ test("a fetch that fails is the card's error, worded for magpie's keepLast", asy
 })
 
 test("a reply that isn't JSON is the card's error, as Go's encoding/json says it", async () => {
-  expect((await run(auth, () => new Response("<html>oops</html>"))).u).toEqual({ error: "invalid character '<' looking for beginning of value", windows: [] })
-  expect((await run(auth, () => new Response(""))).u).toEqual({ error: "unexpected end of JSON input", windows: [] })
+  expect((await run(auth, () => new Response("<html>oops</html>"))).u).toEqual({ signIn: "kept", error: "invalid character '<' looking for beginning of value", windows: [] })
+  expect((await run(auth, () => new Response(""))).u).toEqual({ signIn: "kept", error: "unexpected end of JSON input", windows: [] })
 })
 
 test("a status Go has no words for still says something", async () => {
-  expect((await run(auth, () => new Response("", { status: 509 }))).u).toEqual({ error: "HTTP 509", windows: [] })
+  expect((await run(auth, () => new Response("", { status: 509 }))).u).toEqual({ signIn: "kept", error: "HTTP 509", windows: [] })
 })
 
 test("a model list Grok couldn't give fails, not falls back to the configured few", async () => {

@@ -30,10 +30,12 @@ test("the channel refusal keeps the account too", async () => {
   expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
 })
 
-test("a reply that went through says nothing of the sign-in", async () => {
+// nor cleared one: a reply that went through leaves the mark as it is
+test("a reply that went through keeps the sign-in too", async () => {
   const res = await ask(() => new Response("data: [DONE]\n\n", { status: 200 }))
   expect(res.status).toBe(200)
-  expect(res.headers.get("X-Magpie-Sign-In")).toBeNull()
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
+  expect(await res.text()).toBe("data: [DONE]\n\n")
 })
 
 // wbFresh with no access token left: its words, on either site

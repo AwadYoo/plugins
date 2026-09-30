@@ -848,22 +848,17 @@ function failure(status, text) {
   return statusOf(status, f.code ?? "", msg)
 }
 
-// signInExpired is a message of a token or session run out. The built-in
-// answered any "expired" with a 401, but a trial, a plan or a link run out
-// is no lapsed sign-in: that 401 says "kept" (X-Magpie-Sign-In).
-const signInExpired = (low) => low.includes("expired") && /token|session|sign[- ]?in|log[- ]?in|auth|credential/.test(low)
-
 // statusOf is the status and words for Cursor's error of this code and
 // message. A region the team isn't served in says so, not to sign in.
 function statusOf(status, code, msg) {
   msg ||= statusText(status)
   const low = msg.toLowerCase()
   // magpie names the provider before the message itself
-  const out = (status, message, signIn) => ({ status, message, ...(signIn ? { signIn } : {}) })
+  const out = (status, message) => ({ status, message })
   if (regional(msg)) return out(403, msg + " — Cursor serves your team only in some regions and turned this request away; signing in again won't change that")
   if (code === "permission_denied") return out(403, msg)
   if (code === "unauthenticated" || status === 401 || low.includes("expired"))
-    return out(401, msg + " — sign in to Cursor again in magpie", code === "unauthenticated" || status === 401 || signInExpired(low) ? undefined : "kept")
+    return out(401, msg + " — sign in to Cursor again in magpie")
   if (code === "resource_exhausted" || low.includes("quota") || low.includes("rate limit") || low.includes("usage limit"))
     return out(429, "usage limit reached: " + msg)
   if (low.includes("too long") || low.includes("context length") || low.includes("too many tokens"))
@@ -1359,17 +1354,28 @@ function exec(msg, tools, send, closeExec) {
 
 // ---- chat completions ------------------------------------------------------------------
 
-// signIn, the X-Magpie-Sign-In header, says what the answer means for the
-// account whatever its status: "kept" leaves it unmarked.
-const errorResponse = ({ status, message, signIn }) =>
+// Every answer says X-Magpie-Sign-In: kept. The built-in marked no Cursor
+// account lapsed, not for a 401 nor for any "expired" (a token, a session,
+// a trial), and cleared none on a success or a renewed token.
+const errorResponse = ({ status, message }) =>
   new Response(JSON.stringify({ error: { message, type: "cursor_error", code: status } }), {
     status,
-    headers: { "Content-Type": "application/json", ...(signIn ? { "X-Magpie-Sign-In": signIn } : {}) },
+    headers: { "Content-Type": "application/json", "X-Magpie-Sign-In": "kept" },
   })
 
-// answer runs a chat completion on Cursor and answers it as one, streamed
+function kept(res) {
+  if (res.headers.has("X-Magpie-Sign-In")) return res
+  const headers = new Headers(res.headers)
+  headers.set("X-Magpie-Sign-In", "kept")
+  return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
+}
+
+// answer runs a chat completion on Cursor, the account kept (errorResponse).
+const answer = async (auth, chat, signal) => kept(await answerOf(auth, chat, signal))
+
+// answerOf runs a chat completion on Cursor and answers it as one, streamed
 // or not.
-async function answer(auth, chat, signal) {
+async function answerOf(auth, chat, signal) {
   let tok
   try {
     tok = await tokenOf(auth)
@@ -1484,16 +1490,17 @@ export async function CursorAuthPlugin() {
         { type: "api", label: "Cursor API key (cursor.com/dashboard → Integrations)" },
       ],
       // magpie's: how much of the plan's included usage is gone (the plan
-      // is the one the sign-in read)
+      // is the one the sign-in read). The built-in's read, clean or not,
+      // neither marked the account nor cleared it.
       async usage(getAuth, provider) {
         let tok
         try {
           tok = await tokenOf(await getAuth())
         } catch (e) {
-          return { error: e.message, windows: [] }
+          return { error: e.message, windows: [], signIn: "kept" }
         }
         const [u, plan] = await Promise.all([usage(tok, Object.keys(provider?.models ?? {})), planOf(tok)])
-        return plan ? { ...u, plan } : u
+        return { ...u, ...(plan ? { plan } : {}), signIn: "kept" }
       },
     },
     async config(config) {
@@ -1526,4 +1533,4 @@ export async function CursorAuthPlugin() {
 }
 
 // for tests
-export const _internal = { errorResponse, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
+export const _internal = { errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }

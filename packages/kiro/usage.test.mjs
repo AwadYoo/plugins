@@ -43,6 +43,7 @@ test("a free account's credits and trial", async () => {
       { name: "Free trial", used: 20, resetsAt: new Date(1791000000_000).toISOString(), display: "100 / 500" },
       { name: "Credits", used: 25, resetsAt: new Date(1790000000_000).toISOString(), display: "12.5 / 50", span: 30 * 24 * 3600 },
     ],
+    signIn: "kept",
   })
   const u = new URL(calls[0].url)
   expect(u.pathname).toEndWith("/Get-Usage-Limits")
@@ -68,14 +69,14 @@ test("names, resets and counts as Go says them", () => {
 
 test("Kiro's refusal is the card's error", async () => {
   answer(403, { message: "The bearer token included in the request is invalid." })
-  expect(await usage()).toEqual({ error: "Kiro: The bearer token included in the request is invalid. (403)" })
+  expect(await usage()).toEqual({ error: "Kiro: The bearer token included in the request is invalid. (403)", signIn: "kept" })
   answer(500, "")
-  expect(await usage()).toEqual({ error: "Kiro: Internal Server Error" })
+  expect(await usage()).toEqual({ error: "Kiro: Internal Server Error", signIn: "kept" })
 })
 
 test("no account, no usage", async () => {
   const calls = answer(200, FREE)
-  expect(await usage(null)).toEqual({ error: "not signed in" })
+  expect(await usage(null)).toEqual({ error: "not signed in", signIn: "kept" })
   expect(calls).toEqual([])
 })
 
@@ -92,19 +93,27 @@ async function ask(a) {
 const stale = { ...auth, expires: Date.now() - 60_000 }
 
 // the built-in answered any credentials it couldn't get with a 401 and
-// marked nothing; only a refresh Kiro refused marks the account here
-test("a refresh that failed for a while is the built-in's 401, the account kept; one Kiro refused marks it", async () => {
+// marked nothing, not even for a refresh Kiro refused
+test("a refresh that failed, or that Kiro refused, is the built-in's 401, the account kept", async () => {
   answer(500, "")
   expect(await ask(stale)).toEqual({ status: 401, message: "refreshing Kiro's sign-in: 500 Internal Server Error", signIn: "kept" })
   globalThis.fetch = async () => { throw new Error("getaddrinfo ENOTFOUND") }
   expect(await ask(stale)).toEqual({ status: 401, message: "refreshing Kiro's sign-in: getaddrinfo ENOTFOUND", signIn: "kept" })
   answer(401, { error: "invalid_grant" })
   const refused = "Kiro's sign-in has expired; sign in again with `kiro-cli login` or the Kiro IDE"
-  expect(await ask(stale)).toEqual({ status: 401, message: refused })
-  expect(await ask({ ...stale, refresh: "" })).toEqual({ status: 401, message: refused })
+  expect(await ask(stale)).toEqual({ status: 401, message: refused, signIn: "kept" })
+  expect(await ask({ ...stale, refresh: "" })).toEqual({ status: 401, message: refused, signIn: "kept" })
 })
 
 test("errors don't name Kiro, which magpie adds", async () => {
   answer(500, { message: "boom" })
-  expect(await ask(auth)).toEqual({ status: 500, message: "boom" })
+  expect(await ask(auth)).toEqual({ status: 500, message: "boom", signIn: "kept" })
+})
+
+// The built-in's usage read neither marked nor cleared the account: a
+// refusal that says to sign in again is kept too, not read by magpie's words.
+test("a usage read that finds the sign-in refused keeps the account", async () => {
+  answer(401, { error: "invalid_grant" })
+  expect(await usage({ ...auth, expires: Date.now() - 60_000 })).toEqual({
+    error: "Kiro's sign-in has expired; sign in again with `kiro-cli login` or the Kiro IDE", signIn: "kept" })
 })
