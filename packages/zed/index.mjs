@@ -146,14 +146,14 @@ const stale = (status, headers) => status === 401 || !!headers.get("x-zed-expire
 // ---- the account --------------------------------------------------------------
 
 // cloud sends one /client/* request with the account's pair.
-async function cloud(method, path, s, body) {
+async function cloud(method, path, s, body, timeout = 20_000) {
   const headers = { Authorization: `${s.userId} ${s.access}`, "Content-Type": "application/json", "User-Agent": userAgent() }
   if (s.systemId) headers["x-zed-system-id"] = s.systemId
   const res = await fetch(CLOUD + path, {
     method,
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
-    signal: AbortSignal.timeout(20_000),
+    signal: AbortSignal.timeout(timeout),
   })
   const text = await res.text()
   if (!res.ok) throw new ZedStatus(res.status, text, res.headers)
@@ -755,9 +755,41 @@ async function complete(s, url, init) {
   return stream ? streamed(w.wire, res) : whole(w.wire, res)
 }
 
+// ---- usage ----------------------------------------------------------------------------
+
+// usage is what the account says of its plan, as magpie's built-in Zed
+// account shows it (zed_usage.go): Zed tells its editor the plan and its
+// billing period, not how much of the allowance is spent, so there are no
+// windows — the plan's name, when the period ends, and a plan Zed won't
+// serve (overdue invoices) as the error it is.
+const RFC3339 = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$/i
+
+async function usage(auth, save) {
+  const s = stateOf(auth)
+  if (!s) return { error: "no such Zed account" }
+  let me
+  try {
+    me = parse(await cloud("GET", "/client/users/me", s, undefined, 15_000)) ?? {}
+  } catch (e) {
+    if (e?.status === 401) return { error: `${s.who}: the Zed sign-in has expired — sign in again` }
+    return { error: e?.message ?? String(e) }
+  }
+  const plan = planOf(me, s.org || orgOf(me))
+  const out = { plan: planName(plan) }
+  if (plan !== s.plan && save) {
+    const r = parse(auth.refresh ?? "") ?? {}
+    await save({ ...auth, refresh: JSON.stringify({ ...r, plan, planName: out.plan }) }).catch(() => {})
+  }
+  const end = me.plan?.subscription_period?.ended_at
+  if (typeof end === "string" && RFC3339.test(end) && !isNaN(Date.parse(end))) out.until = end
+  if (me.plan?.has_overdue_invoices) out.error = "Zed: this account has an overdue invoice, so its models are paused (see zed.dev/account)"
+  else if (plan === "zed_free" || plan === "") out.plan = "No plan"
+  return out
+}
+
 // ---- the plugin ---------------------------------------------------------------------
 
-export async function ZedAuthPlugin() {
+export async function ZedAuthPlugin({ client } = {}) {
   return {
     config: async (cfg) => {
       cfg.provider ??= {}
@@ -805,9 +837,14 @@ export async function ZedAuthPlugin() {
           },
         }
       },
+      // magpie's own hook: the account's plan and its period
+      async usage(getAuth) {
+        const save = client?.auth?.set ? (body) => client.auth.set({ path: { id: PROVIDER }, body }) : null
+        return usage(await getAuth(), save)
+      },
     },
   }
 }
 
 // for tests
-export const _internal = { stateOf, parseModels, providerRequest, wireOf, refusal, failedStatus, decrypt, padded, signedInWith, complete, vendors, tokens, lists, orgOf, who, planName }
+export const _internal = { stateOf, parseModels, providerRequest, wireOf, refusal, failedStatus, decrypt, padded, signedInWith, complete, vendors, tokens, lists, orgOf, who, planName, usage }
