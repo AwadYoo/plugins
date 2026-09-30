@@ -411,7 +411,11 @@ function account(client) {
       const read = await credOf(auth)
       if (!read) {
         held = null
-        throw new Error(auth?.source ? "Kiro isn't signed in; sign in with `kiro-cli login` or the Kiro IDE" : "Kiro isn't signed in; sign in again")
+        throw new Error(
+          auth?.source
+            ? "Kiro isn't signed in; add the Kiro subscription in magpie, sign in with `kiro-cli login` or the Kiro IDE, or save a Kiro API key on the provider"
+            : "this Kiro account's sign-in is gone; add it again in magpie",
+        )
       }
       let c = held?.id === id ? held.c : null
       if (!c || read.access !== c.access || !fresh(c) || stale) {
