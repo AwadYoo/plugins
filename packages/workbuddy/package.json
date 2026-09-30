@@ -1,5 +1,5 @@
 {
-  "name": "@magpie-commuity/opencode-workbuddy-auth",
+  "name": "@magpie-community/opencode-workbuddy-auth",
   "version": "0.1.0",
   "description": "OpenCode provider plugins for WorkBuddy's plans: WorkBuddy (CodeBuddy, copilot.tencent.com) and WorkBuddy AI (www.workbuddy.ai)",
   "type": "module",

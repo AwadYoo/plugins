@@ -1,4 +1,4 @@
-# @magpie-commuity/opencode-zcode-auth
+# @magpie-community/opencode-zcode-auth
 
 Signs in to Z.ai's GLM Coding Plan, or BigModel's (智谱). It does this the
 way [ZCode](https://zcode.z.ai) does, and serves the plan's GLM models

@@ -1,5 +1,5 @@
 {
-  "name": "@magpie-commuity/opencode-zcode-auth",
+  "name": "@magpie-community/opencode-zcode-auth",
   "version": "0.1.0",
   "description": "OpenCode provider plugin: signs in to Z.ai's or BigModel's (智谱) GLM Coding Plan as ZCode does, including team seats and ZCode's Start Plan",
   "type": "module",
@@ -10,7 +10,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/magpie-commuity/plugins.git",
+    "url": "git+https://github.com/magpie-community/plugins.git",
     "directory": "packages/zcode"
   }
 }

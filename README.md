@@ -1,4 +1,4 @@
-# magpie-commuity plugins
+# magpie-community plugins
 
 [OpenCode](https://opencode.ai) provider plugins for coding-plan
 subscriptions, maintained by the community. Each package signs in to one
@@ -20,7 +20,7 @@ subscription and makes its requests. The packages work in OpenCode and in
 magpie:
 
 ```sh
-magpie plugin add @magpie-commuity/opencode-<name>-auth
+magpie plugin add @magpie-community/opencode-<name>-auth
 magpie plugin login <provider id>
 ```
 
@@ -30,7 +30,7 @@ From plugins.
 OpenCode, in `opencode.json`:
 
 ```json
-{ "plugin": ["@magpie-commuity/opencode-<name>-auth"] }
+{ "plugin": ["@magpie-community/opencode-<name>-auth"] }
 ```
 
 then `opencode auth login`.
@@ -40,7 +40,7 @@ then `opencode auth login`.
 Each package is a folder under `packages/<name>/`:
 
 - **`package.json`**
-  - name: `@magpie-commuity/opencode-<name>-auth`
+  - name: `@magpie-community/opencode-<name>-auth`
   - `"type": "module"`, `"main": "./index.mjs"`
   - version, `"license": "MIT"`
   - no runtime dependencies unless one is really needed. Bun's and Node's

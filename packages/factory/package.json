@@ -1,5 +1,5 @@
 {
-  "name": "@magpie-commuity/opencode-factory-auth",
+  "name": "@magpie-community/opencode-factory-auth",
   "version": "0.1.0",
   "description": "Sign in to a Factory (Droid) subscription from OpenCode or magpie",
   "type": "module",

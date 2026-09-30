@@ -1,4 +1,4 @@
-# @magpie-commuity/opencode-workbuddy-auth
+# @magpie-community/opencode-workbuddy-auth
 
 Signs in to the plans of WorkBuddy, Tencent's desktop agent from CodeBuddy.
 It has one provider for each of WorkBuddy's two builds:
