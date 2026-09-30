@@ -681,7 +681,8 @@ export const FactoryAuthPlugin = async ({ client }) => {
               text = await res.text()
             }
             const why = explain(res.status, text)
-            const msg = `${apiError(text, "Forbidden")}: ${why}`
+            // the refusal, then what to do about it, as provider.Explain joins them
+            const msg = `${apiError(text, "403 Forbidden")} — ${why}`
             return errorReply(url, res.status, "permission_error", msg, new Headers(res.headers))
           },
         }

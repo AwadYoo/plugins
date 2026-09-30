@@ -52,3 +52,16 @@ test("and OpenAI's on /llm/o/", async () => {
   expect(b.error.code).toBe(null)
   expect(b.type).toBeUndefined()
 })
+
+test("a refusal says what to do after an em dash, as the built-in's Explain joins it", async () => {
+  globalThis.fetch = async () => new Response(JSON.stringify({ error: { message: "model not allowed" } }), { status: 403 })
+  const auth = { ...expired, access: "tok", expires: Date.now() + 3_600_000 }
+  const hooks = await FactoryAuthPlugin({ client: { auth: { set: async () => {} } } })
+  const l = await hooks.auth.loader(async () => auth)
+  let res = await l.fetch("https://api.factory.ai/api/llm/o/v1/responses", { method: "POST", body: JSON.stringify({ model: "gpt-x" }) })
+  expect(res.status).toBe(403)
+  expect((await res.json()).error.message).toMatch(/^model not allowed — Factory refused this account the request; check that `droid`/)
+  globalThis.fetch = async () => new Response("", { status: 403 })
+  res = await l.fetch("https://api.factory.ai/api/llm/o/v1/responses", { method: "POST", body: JSON.stringify({ model: "gpt-x" }) })
+  expect((await res.json()).error.message).toMatch(/^403 Forbidden — Factory refused/)
+})
