@@ -43,6 +43,7 @@ async function plugin(serve) {
 }
 
 const json = (v, status = 200) => new Response(JSON.stringify(v), { status })
+const API_CHAT = "https://api3.qoder.sh/v1/chat/completions"
 
 test("a refused device token is rotated, saved, and the usage read with it", async () => {
   const p = await plugin((path, init) => {
@@ -119,4 +120,57 @@ test("snake_case fields, an expiry, units, and pools too thin to show", () => {
   expect(_internal.when(1790812800000)).toBe("2026-10-01T00:00:00.000Z")
   expect(_internal.when("1790812800")).toBe("2026-10-01T00:00:00.000Z")
   expect(_internal.when(0)).toBeUndefined()
+})
+
+// the loader's fetch, as OpenCode's engine calls it, against a listing and
+// a chat reply
+async function chat(listing, reply) {
+  const auth = { ...account(), machineId: "m1", name: "One" }
+  globalThis.fetch = async (url) => {
+    const u = new URL(String(url))
+    if (u.pathname.endsWith("/model/list")) return json(listing)
+    return reply()
+  }
+  const hooks = await QoderAuthPlugin({ client: { auth: { set: async () => {} } } })
+  const l = await hooks.auth.loader(async () => auth)
+  return { fetch: l.fetch, hooks, auth }
+}
+
+const LISTING = {
+  chat: [
+    { key: "qmodel", display_name: "Q", enable: true, max_input_tokens: 1000 },
+    { key: "fmodel", display_name: "F", enable: true, is_free: true },
+    { key: "pmodel", display_name: "P", enable: true, price_factor: 0 },
+    { key: "cmodel", display_name: "C", enable: true, priceFactor: 0.5 },
+  ],
+}
+
+test("a refused chat is a 401 only when Qoder says 401; a 403 stays a 403", async () => {
+  for (const status of [401, 403]) {
+    const { fetch } = await chat(LISTING, () => new Response("nope", { status }))
+    const res = await fetch(API_CHAT, { method: "POST", body: JSON.stringify({ model: "qmodel", messages: [{ role: "user", content: "hi" }] }) })
+    expect(res.status).toBe(status)
+    expect((await res.json()).error.message).toBe("the sign-in lapsed — sign in again")
+  }
+})
+
+test("errors don't name Qoder, which magpie adds", async () => {
+  expect(_internal.failure(500, JSON.stringify({ message: "boom" }))).toEqual({ status: 500, message: "boom" })
+  const { fetch } = await chat(LISTING, () => new Response("", { status: 500 }))
+  let res = await fetch(API_CHAT, { method: "POST", body: JSON.stringify({ model: "nomodel", messages: [] }) })
+  expect((await res.json()).error.message).toBe('unknown or disabled model "nomodel"')
+  res = await fetch("https://api3.qoder.sh/v1/responses", { method: "POST", body: "{}" })
+  expect((await res.json()).error.message).toBe("only chat completions are served")
+  const gone = await QoderAuthPlugin({ client: { auth: { set: async () => {} } } })
+  const l = await gone.auth.loader(async () => ({ type: "oauth" }))
+  res = await l.fetch(API_CHAT, { method: "POST", body: JSON.stringify({ model: "qmodel", messages: [] }) })
+  expect(res.status).toBe(401)
+  expect((await res.json()).error.message).toBe("not signed in")
+})
+
+test("a model Qoder lists free (is_free, or a price_factor of 0) is marked free", async () => {
+  const { hooks, auth } = await chat(LISTING, () => new Response(""))
+  const ms = await hooks.provider.models({ models: {} }, { auth })
+  expect(Object.fromEntries(Object.entries(ms).map(([k, m]) => [k, m.free]))).toEqual({ qmodel: false, fmodel: true, pmodel: true, cmodel: false })
+  expect(_internal.modelInfo({ key: "x", isFree: true }).free).toBe(true)
 })

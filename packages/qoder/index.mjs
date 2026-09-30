@@ -252,6 +252,15 @@ const MODELS = [
   { id: "mmodel", name: "MiniMax-M3", context: 180_000 },
 ].map((m) => ({ images: true, ...m }))
 
+// freeOf reads whether the listing marks a model free, as Qoder's client
+// reads it (internal/qoder/models.go): is_free true, or a price_factor (the
+// credits a request costs, as a multiple) of 0, either in snake or camel case.
+function freeOf(raw) {
+  const is = raw.is_free ?? raw.isFree
+  const price = raw.price_factor ?? raw.priceFactor
+  return is === true || (typeof price === "number" && price === 0)
+}
+
 // modelInfo reads one entry of the listing's "chat" array: its efforts and
 // default from thinking_config (is_reasoning alone when it has none).
 function modelInfo(raw) {
@@ -265,6 +274,7 @@ function modelInfo(raw) {
     alwaysThinks: false,
     efforts: Array.isArray(raw.reasoning_efforts) ? [...raw.reasoning_efforts] : [],
     defaultEffort: "",
+    free: freeOf(raw),
     config: raw,
   }
   const tc = raw.thinking_config
@@ -331,6 +341,8 @@ function runtimeModel(m) {
     },
     release_date: "",
     variants: Object.fromEntries((m.efforts ?? []).map((e) => [e, { reasoningEffort: e }])),
+    // magpie's own: served at no cost to the plan's credits
+    free: !!m.free,
   }
 }
 
@@ -478,9 +490,11 @@ function failure(status, text) {
     if (d?.error?.message) msg += ": " + d.error.message
   } catch {}
   msg ||= `HTTP ${status}`
-  if (status === 401 || status === 403) return { status: 401, message: "Qoder: the sign-in lapsed — sign in again" }
+  // only Qoder's 401 says the job token itself is refused; a 403 is kept as
+  // what it is, as magpie marks the account lapsed on a 401
+  if (status === 401 || status === 403) return { status, message: "the sign-in lapsed — sign in again" }
   if (status === 429 || msg.toLowerCase().includes("quota")) return { status: 429, message: "usage limit reached: " + msg }
-  return { status, message: "Qoder: " + msg }
+  return { status, message: msg }
 }
 
 const errorResponse = ({ status, message }) =>
@@ -900,7 +914,7 @@ export async function QoderAuthPlugin({ client }) {
   }
 
   const signedInError = (e) =>
-    errorResponse(e instanceof SignInGone ? { status: 401, message: e.message } : { status: 502, message: "Qoder: " + (e?.message ?? e) })
+    errorResponse({ status: e instanceof SignInGone ? 401 : 502, message: String(e?.message ?? e).replace(/^Qoder: /, "") })
 
   return {
     auth: {
@@ -915,12 +929,12 @@ export async function QoderAuthPlugin({ client }) {
           async fetch(input, init = {}) {
             const url = typeof input === "string" ? input : input instanceof URL ? input.href : input.url
             if (!/\/chat\/completions$/.test(new URL(url).pathname))
-              return errorResponse({ status: 404, message: "Qoder: only chat completions are served" })
+              return errorResponse({ status: 404, message: "only chat completions are served" })
             let chat
             try {
               chat = JSON.parse(await bodyText(input, init))
             } catch {
-              return errorResponse({ status: 400, message: "Qoder: a request that isn't JSON" })
+              return errorResponse({ status: 400, message: "a request that isn't JSON" })
             }
             let cred
             try {
@@ -934,7 +948,7 @@ export async function QoderAuthPlugin({ client }) {
             } catch (e) {
               return errorResponse({ status: 502, message: e.message })
             }
-            if (!m) return errorResponse({ status: 400, message: `Qoder: unknown or disabled model "${chat.model}"` })
+            if (!m) return errorResponse({ status: 400, message: `unknown or disabled model "${chat.model}"` })
             const wire = encodeBody(JSON.stringify(qoderBody(chat, m)))
             const headers = {
               ...cosyHeaders(CHAT_URL, cred, wire),
@@ -947,7 +961,7 @@ export async function QoderAuthPlugin({ client }) {
             try {
               res = await fetch(CHAT_URL, { method: "POST", headers, body: wire, signal: init.signal })
             } catch (e) {
-              return errorResponse({ status: 502, message: "Qoder: " + e.message })
+              return errorResponse({ status: 502, message: e.message })
             }
             if (!res.ok) return errorResponse(failure(res.status, (await res.text()).slice(0, 1 << 20)))
             return answer(res, chat)
@@ -978,7 +992,7 @@ export async function QoderAuthPlugin({ client }) {
           const ms = await models(cred, true)
           if (!ms.length) return provider.models
           return Object.fromEntries(
-            ms.map((m) => [m.key, runtimeModel({ id: m.key, name: m.name, context: m.context, images: m.images, efforts: m.thinks ? m.efforts : [] })]),
+            ms.map((m) => [m.key, runtimeModel({ id: m.key, name: m.name, context: m.context, images: m.images, efforts: m.thinks ? m.efforts : [], free: m.free })]),
           )
         } catch {
           return provider.models
@@ -989,4 +1003,4 @@ export async function QoderAuthPlugin({ client }) {
 }
 
 // for tests
-export const _internal = { parseUsage, gfmt, when }
+export const _internal = { parseUsage, gfmt, when, failure, modelInfo }
