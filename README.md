@@ -7,7 +7,13 @@ subscription and makes its requests. The packages work in OpenCode and in
 
 | Package | Signs in to | Provider id |
 |---|---|---|
-| _(one row per package, added with it)_ | | |
+| [commandcode](packages/commandcode) | Command Code plans (Pro, GOAT, Max, Ultra, Go, Teams Pro) | `commandcode-plan` |
+| [factory](packages/factory) | Factory (Droid) subscription | `factory` |
+| [grok](packages/grok) | Grok (SuperGrok / X Premium+), through the Grok Build CLI's sign-in | `grok` |
+| [mimo](packages/mimo) | Xiaomi MiMo, with a Xiaomi account | `mimo-app` |
+| [workbuddy](packages/workbuddy) | WorkBuddy (China build, CodeBuddy plan) | `workbuddy` |
+| [workbuddy](packages/workbuddy) | WorkBuddy (international build) | `workbuddy-ai` |
+| [zcode](packages/zcode) | ZCode: Z.ai / BigModel (智谱) GLM Coding Plan, team seats, Start Plan | `zcode` |
 
 ## Use
 
