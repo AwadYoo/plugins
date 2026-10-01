@@ -1048,9 +1048,14 @@ export async function ZCodeAuthPlugin({ client }) {
         const start = await onStart(s).catch(() => false)
         const base = start ? START_BASE : s.base
         let ms = modelsOf(await zcodeConfig().catch(() => null), planID(base))
-        if (!ms.length) ms = start ? START_MODELS : MODELS
+        // ZCode's config can't be had: its table stands in, and magpie keeps
+        // the list it was told last, as the built-in keeps the one it fetched last
+        const fell = !ms.length
+        if (fell) ms = start ? START_MODELS : MODELS
         const url = s.base + "/v1"
-        return Object.fromEntries(ms.map((m) => [m.id, model(m, url)]))
+        const out = Object.fromEntries(ms.map((m) => [m.id, model(m, url)]))
+        if (fell) out[Symbol.for("magpie.fellBack")] = true
+        return out
       },
     },
     auth: {
