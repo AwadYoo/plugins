@@ -249,6 +249,10 @@ async function listModels(key) {
   await sign(headers, key)
   const res = await fetch(`${BASE}/models`, { headers })
   const text = await res.text()
+  // a token Grok turned away before its time (signed out elsewhere) is a
+  // sign-in gone, said as one past its time is: a move takes it along
+  // untried rather than stopping on it
+  if (res.status === 401) throw new Error("Grok's sign-in has expired; run `grok login`")
   if (!res.ok) throw new Error(`Grok models: ${res.status} ${text.slice(0, 200)}`)
   const out = []
   for (const d of JSON.parse(text)?.data ?? []) {
