@@ -814,7 +814,9 @@ function build(chat, uid, key) {
       if (!text && !calls.length) continue // a turn that only thought, or failed
       answer()
       msgs.push({ role: ASSISTANT, text, calls })
-      pending = calls
+      // a copy: answering a call takes it off pending, never off the
+      // reply that made it, which goes to Devin with every call it made
+      pending = [...calls]
       continue
     }
     if (m.role === "tool") {
