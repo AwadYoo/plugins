@@ -16,10 +16,17 @@ over Anthropic's Messages API. Provider id: `zcode`.
     `open.bigmodel.cn/api/anthropic`.
   - If the account has no plan of its own, it looks for a seat on a team's
     plan and uses that team project's `zcode-team-api-key`.
-  - Failing both, it uses ZCode's free **Start Plan**, served by zcode.z.ai
+  - Failing both, it tries ZCode's free **Start Plan**, served by zcode.z.ai
     with ZCode's session token and ZCode's own headers.
   - The Start Plan's token can't be refreshed. When it runs out, sign in
     again.
+
+> **ZCode's free Start Plan (and its trial) can't be used through this
+> plugin.** zcode.z.ai only serves that plan to requests carrying the
+> official ZCode client's own system prompt, and refuses others with
+> HTTP 405 "request has been blocked due to unusual activity". The plugin
+> (like magpie) never rewrites prompts or poses as the official client, so
+> a GLM Coding Plan — your own or a team seat — is needed.
 - **ZCode app's sign-in**
   - Uses the account the ZCode app on this computer is signed in to. For
     every request it reads ZCode's own credentials (`~/.zcode/v2`), so it
