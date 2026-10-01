@@ -53,6 +53,10 @@ const MODELS = [
 // and give that list the reasoning levels and pictures it doesn't say —
 // magpie's cmdGoModels.
 const EFF5 = ["low", "medium", "high", "xhigh", "max"]
+// FELL_BACK marks a list handed back for one that can't be had (magpie's
+// plugin host reads it; OpenCode never sees a symbol's key)
+const FELL_BACK = Symbol.for("magpie.fellBack")
+
 const GO_MODELS = [
   { id: "gpt-6-luna", name: "GPT-6 Luna", context: 1_050_000, images: true, efforts: EFF5 },
   { id: "gpt-5.6-luna", name: "GPT-5.6 Luna", context: 1_050_000, images: true, efforts: EFF5 },
@@ -1121,15 +1125,22 @@ export async function CommandCodePlugin({ client } = {}) {
         const key = await liveKey(auth)
         if ((await planNow(key, auth.metadata?.plan)) === "Go") {
           let ms = GO_MODELS
+          let fell = false
           try {
             ms = await goModels()
-          } catch {}
-          return Object.fromEntries(ms.map((m) => [m.id, runtimeModel({ ...m, npm: CHAT })]))
+          } catch {
+            fell = true
+          }
+          const out = Object.fromEntries(ms.map((m) => [m.id, runtimeModel({ ...m, npm: CHAT })]))
+          // the CLI's table stands in: magpie keeps the list it was told
+          // last, as the built-in keeps the one it fetched last
+          if (fell) out[FELL_BACK] = true
+          return out
         }
         try {
           return Object.fromEntries((await liveModels(key)).map((m) => [m.id, runtimeModel(m)]))
         } catch {
-          return provider.models
+          return Object.assign(provider.models, { [FELL_BACK]: true })
         }
       },
     },

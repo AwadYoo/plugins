@@ -54,6 +54,7 @@ test("Go lists Command Code's models less those Go is refused, asked without the
   expect(Object.keys(k3.variants)).toEqual(["low", "high", "max"])
   expect(k3.capabilities.attachment).toBe(true)
   expect(k3.limit.context).toBe(1_000_000)
+  expect(ms[Symbol.for("magpie.fellBack")]).toBeUndefined()
   // every Go model on chat completions, which the fetch sends to /alpha/generate
   expect(new Set(Object.values(ms).map((m) => m.api.npm))).toEqual(new Set(["@ai-sdk/openai-compatible"]))
 })
@@ -64,6 +65,7 @@ test("the CLI's table stands in when the list can't be had, and offers nothing G
   for (const reply of [500, "not json", JSON.stringify({ data: [] }), JSON.stringify({ data: [{ id: "claude-opus-5-5" }, { id: "gpt-6-sol" }] })]) {
     const { ms } = await models(reply)
     expect(Object.keys(ms)).toEqual(_internal.GO_MODELS.map((m) => m.id))
+    expect(ms[Symbol.for("magpie.fellBack")]).toBe(true)
   }
 })
 
