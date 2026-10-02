@@ -291,13 +291,24 @@ const CN_MODELS = [
   { id: "lite", name: "Lite" },
 ]
 
-// freeOf reads whether the listing marks a model free, as Qoder's client
-// reads it (internal/qoder/models.go): is_free true, or a price_factor (the
-// credits a request costs, as a multiple) of 0, either in snake or camel case.
+// freeOf reads whether a model costs the plan no credits: a price_factor
+// (the credits a request costs, as a multiple; priceFactor in camel case)
+// of 0, the price Qoder's own client shows ("0×"). is_free is no word on
+// that: Qoder's listing has it true on Qwen3.8-Max at 0.5×, an off-peak
+// discount (错峰 4 折) on it, and Qoder's client shows the price, not it.
+// It is taken only from a listing with no price at all. A price of 0 for
+// the while an active promotion lasts, with a price before it, is a
+// discount, not a free model; a limited-time free model (Qwen3.8-Flash:
+// 0×, its original_price_factor 0.1 struck through) is free while it is.
 function freeOf(raw) {
-  const is = raw.is_free ?? raw.isFree
   const price = raw.price_factor ?? raw.priceFactor
-  return is === true || (typeof price === "number" && price === 0)
+  if (typeof price === "number" && Number.isFinite(price)) {
+    if (price !== 0) return false
+    const p = raw.promotion ?? raw.prommotion
+    const before = p?.before_promotion_price_factor ?? p?.beforePromotionPriceFactor
+    return !(p?.active === true && typeof before === "number" && before > 0)
+  }
+  return (raw.is_free ?? raw.isFree) === true
 }
 
 // modelInfo reads one entry of the listing's "chat" array: its efforts and

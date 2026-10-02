@@ -226,11 +226,60 @@ test("errors don't name Qoder, which magpie adds", async () => {
   expect((await res.json()).error.message).toBe("not signed in")
 })
 
-test("a model Qoder lists free (is_free, or a price_factor of 0) is marked free", async () => {
+test("a model at a price_factor of 0 is marked free; is_free only counts with no price", async () => {
   const { hooks, auth } = await chat(LISTING, () => new Response(""))
   const ms = await hooks.provider.models({ models: {} }, { auth })
   expect(Object.fromEntries(Object.entries(ms).map(([k, m]) => [k, m.free]))).toEqual({ qmodel: false, fmodel: true, pmodel: true, cmodel: false })
   expect(_internal.modelInfo({ key: "x", isFree: true }).free).toBe(true)
+})
+
+// Qoder's listing as it came on 2026-10-02 (the built-in's saved one): its
+// app shows Qwen3.8-Max at 0.5× with an off-peak badge, Qwen3.8-Flash at 0×
+// with 0.1× struck through — both carry is_free true.
+const OFF_PEAK = {
+  active: false,
+  badge: { en: "Off-Peak 60% off", zh: "错峰 4 折" },
+  description: { en: "Off-Peak 60% off (10 PM-8 AM UTC+8)", zh: "错峰时段4折优惠（10 PM-8 AM UTC+8）" },
+  timezone: "Asia/Singapore",
+  rule_id: "idle_time_model_credit_discount",
+  discount_factor: 0.4,
+  before_promotion_price_factor: 0.5,
+  window_start: "22:00",
+  window_end: "08:00",
+}
+const PRICED = {
+  chat: [
+    { key: "qmodel_38max", display_name: "Qwen3.8-Max", enable: true, is_reasoning: true, price_factor: 0.5, is_free: true, promotion: OFF_PEAK },
+    { key: "qfmodel", display_name: "Qwen3.8-Flash", enable: true, is_reasoning: true, price_factor: 0.0, original_price_factor: 0.1, is_free: true },
+    { key: "qmodel_latest", display_name: "Qwen3.7-Max", enable: true, price_factor: 0.5, original_price_factor: 0.5 },
+    { key: "kmodel_latest", display_name: "Kimi-K3", enable: true, price_factor: 1.4, is_free: false },
+    // 0 only while an active promotion lasts, with a price before it
+    { key: "window", display_name: "W", enable: true, price_factor: 0, is_free: true, promotion: { ...OFF_PEAK, active: true, discount_factor: 0.0001, before_promotion_price_factor: 0.5 } },
+    // a promotion over, or one that had nothing to take off
+    { key: "over", display_name: "O", enable: true, price_factor: 0, promotion: { ...OFF_PEAK, active: false } },
+    { key: "nothing", display_name: "N", enable: true, price_factor: 0, promotion: { ...OFF_PEAK, active: true, before_promotion_price_factor: 0 } },
+    // no price: is_free says it
+    { key: "unpriced", display_name: "U", enable: true, is_free: true },
+    { key: "unpriced2", display_name: "U2", enable: true, is_free: false },
+  ],
+}
+
+test("a discount is not free: Qwen3.8-Max (0.5×, is_free true) is priced, Qwen3.8-Flash (0×) is free", async () => {
+  const { hooks, auth } = await chat(PRICED, () => new Response(""))
+  const ms = await hooks.provider.models({ models: {} }, { auth })
+  expect(Object.fromEntries(Object.entries(ms).map(([k, m]) => [k, m.free]))).toEqual({
+    qmodel_38max: false,
+    qfmodel: true,
+    qmodel_latest: false,
+    kmodel_latest: false,
+    window: false,
+    over: true,
+    nothing: true,
+    unpriced: true,
+    unpriced2: false,
+  })
+  expect(_internal.modelInfo({ key: "x", priceFactor: 0.5, isFree: true }).free).toBe(false)
+  expect(_internal.modelInfo({ key: "x", priceFactor: 0, promotion: { active: true, beforePromotionPriceFactor: 1 } }).free).toBe(false)
 })
 
 // a usage read on an account whose job token is due, the refresh answered by refresh()
