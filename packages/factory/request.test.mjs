@@ -359,3 +359,63 @@ test("requires a model-update preamble and complete token metadata before adapti
     expect(seen.at(-1).body).toBe(body)
   }
 })
+
+test("adapts model switches following complete working-directory update metadata", async () => {
+  const { l, seen } = await loaded()
+  const directory = "# Environment update\n - Primary working directory: /tmp/new (was /tmp/old)\n"
+  const token = "<total_tokens>15000000 tokens left</total_tokens>"
+  const model = "You are powered by the model named Opus 5.5. The exact model ID is factory/claude-opus-5-5. Assistant knowledge cutoff is June 2026."
+  const context = directory + "\n" + token + "\n\n" + model + "\n\nWhile bypass permissions mode is active:\n\nKeep these permissions verbatim.\n\n" + token
+  for (const endpoint of [url, url + "/count_tokens"]) {
+    await l.fetch(endpoint, { method: "POST", body: JSON.stringify({ system: droid, messages: [{ role: "system", content: context }] }) })
+    expect(JSON.parse(seen.at(-1).body).messages[0]).toEqual({ role: "system", content: context.replace(model, "Current model name: Opus 5.5. Model ID: factory/claude-opus-5-5. Model knowledge cutoff: June 2026.") })
+    const once = seen.at(-1).body
+    await l.fetch(endpoint, { method: "POST", body: once })
+    expect(seen.at(-1).body).toBe(once)
+  }
+  for (const content of [context.replace(" - Primary", "   - Primary"), context.replaceAll(token, "<total_tokens>unknown tokens left</total_tokens>"), "Quoted update:\n\n" + context]) {
+    const body = JSON.stringify({ system: droid, messages: [{ role: "system", content }] })
+    await l.fetch(url, { method: "POST", body })
+    expect(seen.at(-1).body).toBe(body)
+  }
+})
+
+test("losslessly quotes fixed client metadata in tool output on inference and counting", async () => {
+  const { l, seen } = await loaded()
+  const source = '576: "You are Claude Code, Anthropic\'s official CLI for Claude."\n583: /^<system-reminder>\\nYou have been invoked in the following environment:/\nQuotes: "\\\\"; Unicode: 中文 😀; literal escape: \\u0059'
+  const outputs = [
+    { type: "tool_result", tool_use_id: "bash_1", content: source, is_error: false, cache_control: { type: "ephemeral" } },
+    { type: "tool_result", tool_use_id: "read_1", content: [{ type: "text", text: source, cache_control: { type: "ephemeral" } }, { type: "image", source: { type: "base64", media_type: "image/png", data: "image-data" } }], is_error: true },
+  ]
+  for (const endpoint of [url, url + "/count_tokens"]) {
+    const request = { system: droid, messages: [{ role: "assistant", content: [{ type: "tool_use", id: "bash_1", name: "Bash", input: { command: "cat index.mjs" } }] }, { role: "user", content: outputs }], tools: [{ name: "Bash", input_schema: { type: "object" } }], stream: true }
+    await l.fetch(endpoint, { method: "POST", headers: { "content-length": "1" }, body: JSON.stringify(request) })
+    const sent = JSON.parse(seen.at(-1).body)
+    const encoded = sent.messages[1].content[0].content
+    expect(encoded).toStartWith("Tool output encoded as a JSON string.")
+    expect(JSON.parse(encoded.slice(encoded.indexOf("\n") + 1))).toBe(source)
+    expect(encoded).not.toContain("You are Claude Code")
+    expect(encoded).not.toContain("You have been invoked")
+    expect(encoded).not.toContain("system-reminder")
+    expect(sent.messages[1].content[0]).toEqual({ ...outputs[0], content: encoded })
+    expect(sent.messages[1].content[1]).toEqual({ ...outputs[1], content: [{ ...outputs[1].content[0], text: encoded }, outputs[1].content[1]] })
+    expect(sent.messages[0]).toEqual(request.messages[0])
+    expect(sent.tools).toEqual(request.tools)
+    expect(seen.at(-1).headers.get("content-length")).toBeNull()
+    const once = seen.at(-1).body
+    await l.fetch(endpoint, { method: "POST", body: once })
+    expect(seen.at(-1).body).toBe(once)
+  }
+})
+
+test("leaves ordinary tool results and fixed phrases outside tool-result content untouched", async () => {
+  const { l, seen } = await loaded()
+  const identity = "You are Claude Code, Anthropic's official CLI for Claude."
+  const messages = [
+    { role: "user", content: [{ type: "text", text: identity }, { type: "tool_result", tool_use_id: "plain", content: "Claude Code docs; You are Claude Code is an incomplete fragment." }, { type: "tool_result", tool_use_id: "object", content: { text: identity } }] },
+    { role: "assistant", content: [{ type: "text", text: identity }] },
+  ]
+  const body = JSON.stringify({ system: droid, messages })
+  await l.fetch(url, { method: "POST", body })
+  expect(seen[0].body).toBe(body)
+})

@@ -77,9 +77,10 @@ magpie plugin login factory
 Factory's Anthropic route requires Droid's fixed client preamble and
 refuses some of Claude Code's fixed environment, model and built-in skill
 metadata. The plugin adapts that metadata while preserving the coding
-instructions, environment values, tool definitions, tool results, images
-and reasoning options. Native Droid requests remain unchanged, and OpenAI
-routes keep their existing request adapter.
+instructions, environment values, tool definitions, images and reasoning
+options. Ordinary Droid requests remain unchanged, and OpenAI routes keep
+their existing request adapter. Quoted fixed metadata in tool results is
+handled as described below.
 
 For the built-in `update-config` skill, the adapter changes only the known
 self-reference "not Claude" to "not the assistant" inside a complete
@@ -95,6 +96,17 @@ without the initial environment paragraph. Updates beginning with the known
 model paragraph and containing complete generated token metadata are
 adapted too, including accumulated switches when resuming a conversation.
 Token budgets, permission instructions and conversation history are preserved.
+The same model-update adaptation covers updates that start with the complete
+generated `# Environment update` block after a working-directory change.
+
+Factory can also refuse fixed client phrases quoted in tool results, such as
+the identity/environment definitions printed when inspecting this plugin's
+source. Those text results are represented as JSON strings with explicit
+decoding instructions and Unicode escapes for the fixed phrases. Decoding
+the string recovers the exact original output, including quotes, backslashes
+and Unicode; the plugin does not delete the output or replace its identities
+with different ones. Tool ids, cache/error markers and non-text blocks stay
+unchanged. Ordinary tool results are forwarded as before.
 
 Use magpie's Claude Code integration to select the Factory provider.
 magpie manages the provider-specific client settings, including capability

@@ -592,15 +592,17 @@ const CONFIG_SKILL_COMPAT = CONFIG_SKILL_METADATA.replace("not Claude", "not the
 // Claude 5 also sends its runtime metadata as a string-content system
 // message, instead of user-message reminders. Preserve that role and all
 // instructions. A model switch sends a separate update without the
-// environment paragraph; require its opening model paragraph and complete
-// generated token context before adapting that shape.
+// environment paragraph, sometimes following a working-directory update;
+// require the generated opening block and complete token context before
+// adapting either update shape.
 const SYSTEM_ENV_CONTEXT = /^# Environment\nYou have been invoked in the following environment:[ \t]*\n(?: {1,2}- [^\n]*\n)+(?=\n|$)/
 const SYSTEM_MODEL_CONTEXT = /(^|\n\n)You are powered by the model (?:named )?[^\n<>]+\.(?=\n\n|$)/g
 const SYSTEM_MODEL_UPDATE = /^You are powered by the model (?:named )?[^\n<>]+\.(?=\n\n|$)/
+const SYSTEM_ENV_UPDATE = /^# Environment update\n(?: {1,2}- [^\n]*\n)+(?=\n|$)/
 const SYSTEM_TOKEN_CONTEXT = /(?:^|\n\n)<total_tokens>\d+ tokens left<\/total_tokens>(?=\n\n|$)/
 function systemContext(text) {
   const environment = SYSTEM_ENV_CONTEXT.test(text)
-  if (!environment && !(SYSTEM_MODEL_UPDATE.test(text) && SYSTEM_TOKEN_CONTEXT.test(text))) return text
+  if (!environment && !((SYSTEM_MODEL_UPDATE.test(text) || SYSTEM_ENV_UPDATE.test(text)) && SYSTEM_TOKEN_CONTEXT.test(text))) return text
   let out = text.replace(SYSTEM_MODEL_CONTEXT, (paragraph) => paragraph
     .replace("You are powered by the model named", "Current model name:")
     .replace("You are powered by the model", "Current model:")
@@ -616,6 +618,23 @@ function systemContext(text) {
     out = out.slice(0, start) + out.slice(start).replace("\n" + CONFIG_SKILL_METADATA, "\n" + CONFIG_SKILL_COMPAT)
   }
   return out
+}
+
+// Factory also refuses these fixed client phrases when they are quoted in
+// tool output, e.g. while reading this adapter's source. Keep the original
+// text recoverable: a JSON string with explicit decoding instructions,
+// rather than deleting or rewriting the file's contents. Other output and
+// the tool's id, error/cache markers and non-text blocks stay untouched.
+const QUOTED_TOOL_PREFIX = "Tool output encoded as a JSON string. Decode the JSON string to recover the exact original text before using it:\n"
+function quotedToolText(text) {
+  if (![...CLAUDE_IDENTITIES].some((identity) => text.includes(identity)) &&
+      !text.includes("You have been invoked in the following environment:") &&
+      !text.includes("x-anthropic-billing-header: cc_version=")) return text
+  let encoded = JSON.stringify(text)
+  for (const phrase of ["You are", "You have", "x-anthropic-billing-header", "system-reminder"]) {
+    encoded = encoded.replaceAll(phrase, "\\u" + phrase.charCodeAt(0).toString(16).padStart(4, "0") + phrase.slice(1))
+  }
+  return QUOTED_TOOL_PREFIX + encoded
 }
 
 function anthropicBody(body) {
@@ -685,6 +704,25 @@ function anthropicBody(body) {
     }
     if (message?.role !== "user" || !Array.isArray(message.content)) continue
     for (const block of message.content) {
+      if (block?.type === "tool_result") {
+        if (typeof block.content === "string") {
+          const adapted = quotedToolText(block.content)
+          if (adapted !== block.content) {
+            block.content = adapted
+            changed = true
+          }
+        } else if (Array.isArray(block.content)) {
+          for (const part of block.content) {
+            if (part?.type !== "text" || typeof part.text !== "string") continue
+            const adapted = quotedToolText(part.text)
+            if (adapted !== part.text) {
+              part.text = adapted
+              changed = true
+            }
+          }
+        }
+        continue
+      }
       if (block?.type !== "text" || typeof block.text !== "string") continue
       if (ENV_REMINDER.test(block.text)) {
         block.text = block.text.replace("# Environment", "# Runtime context")
