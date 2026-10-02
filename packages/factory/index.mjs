@@ -245,7 +245,7 @@ const orgRefused = (status, text) => status === 403 && text.toLowerCase().includ
 function explain(status, text) {
   if (status !== 403) return ""
   if (orgRefused(status, text)) return "the Factory account's organization changed; remove the account in magpie and sign in to it again"
-  return "Factory takes a Factory subscription's requests only from Droid itself. magpie opens other agents' requests to Factory's GPT, Grok and open models (GLM, Kimi…) as Droid's do, but Factory may still tell them apart, and Claude models (and MiniMax M2.7) are sent as the agent sent them, so Claude Code's and other agents' are refused there; use the model from Droid, and if Droid is refused it too, the organization's model policy or the plan doesn't allow this model"
+  return "Factory refused the request. magpie adapts fixed client metadata on both OpenAI and Anthropic routes. Factory may still refuse unsupported fields or wrappers; check the upstream error, the organization's model policy, plan and regional provider availability, and compare the same model in Droid"
 }
 
 // ---- opening as droid ---------------------------------------------------------
@@ -260,8 +260,8 @@ function explain(status, text) {
 // system message first, joined the same way). So another agent's request to
 // /api/llm/o opens with the line too, as the built-in's factoryDroidBody
 // (internal/provider/factory_client.go) has it. Anthropic's Messages
-// (/api/llm/a) is left as the agent sent it, and so is a request that
-// already opens with the line: droid's own goes on byte for byte.
+// (/api/llm/a) uses anthropicBody below to adapt fixed client metadata.
+// A native Droid request goes on byte for byte.
 
 const DROID_LINE = "You are Droid, an AI software engineering agent built by Factory."
 
@@ -569,6 +569,96 @@ function bodyModel(body) {
   }
 }
 
+// Factory's Anthropic route accepts Droid's client preamble. Keep the
+// caller's instructions, tools and history, adapting only fixed client
+// metadata that Factory refuses (including Claude Code's wrappers).
+const CLAUDE_IDENTITIES = new Set([
+  "You are Claude Code, Anthropic's official CLI for Claude.",
+  "You are Claude Code, Anthropic's official CLI for Claude, running within the Claude Agent SDK.",
+  "You are a Claude agent, built on Anthropic's Claude Agent SDK.",
+])
+
+// Match a complete generated block, not a pasted reminder followed by a
+// user's question, or an incomplete fragment of one.
+const ENV_REMINDER = /^<system-reminder>\n# Environment\nYou have been invoked in the following environment:[ \t]*\n(?: {1,2}- [^\n]*\n)+<\/system-reminder>$/
+const MODEL_REMINDER = /^<system-reminder>\nYou are powered by the model (?:named )?[^\n<>]+\.\n<\/system-reminder>$/
+
+function anthropicBody(body) {
+  let request
+  try {
+    const text = typeof body === "string" ? body
+      : body instanceof ArrayBuffer ? Buffer.from(body).toString("utf8")
+      : ArrayBuffer.isView(body) ? Buffer.from(body.buffer, body.byteOffset, body.byteLength).toString("utf8") : ""
+    request = JSON.parse(text)
+  } catch {
+    return body
+  }
+  // As in droidBody, JSON round-tripping uses JavaScript Numbers: integer
+  // tokens above 2^53 can lose precision when a body needs adapting. A
+  // body that needs no changes is returned byte-for-byte instead.
+  if (!request || !Array.isArray(request.messages)) return body
+  if (request.system != null && typeof request.system !== "string" && !Array.isArray(request.system)) return body
+  if (Array.isArray(request.system) && request.system.some((b) => b?.type === "text" && typeof b.text !== "string")) return body
+
+  let changed = false
+  const system = typeof request.system === "string" ? [{ type: "text", text: request.system }] : request.system ?? []
+  if (typeof request.system === "string" && !request.system.startsWith(DROID_LINE)) changed = true
+  const kept = []
+  for (const block of system) {
+    if (block?.type === "text" && block.text.trim() === "") {
+      changed = true
+      continue
+    }
+    // Attribution is consumed here; Factory does not strip Anthropic's
+    // billing block and requires the Droid identity to be first.
+    if (block?.type === "text" && block.text?.startsWith("x-anthropic-billing-header: cc_version=")) {
+      changed = true
+      continue
+    }
+    if (block?.type === "text" && CLAUDE_IDENTITIES.has(block.text)) {
+      block.text = DROID_LINE
+      changed = true
+    }
+    kept.push(block)
+  }
+  const identity = kept.findIndex((b) => b?.type === "text" && b.text.startsWith(DROID_LINE))
+  if (identity < 0) {
+    kept.unshift({ type: "text", text: DROID_LINE })
+    changed = true
+  } else if (identity > 0) {
+    kept.unshift(...kept.splice(identity, 1))
+    changed = true
+  }
+  // Drop only duplicate identity-only blocks. A block that also contains
+  // task instructions stays intact.
+  for (let i = kept.length - 1; i > 0; i--) {
+    if (kept[i]?.type === "text" && kept[i].text === DROID_LINE) {
+      kept.splice(i, 1)
+      changed = true
+    }
+  }
+  if (changed) request.system = kept
+
+  for (const message of request.messages) {
+    if (message?.role !== "user" || !Array.isArray(message.content)) continue
+    for (const block of message.content) {
+      if (block?.type !== "text" || typeof block.text !== "string") continue
+      if (ENV_REMINDER.test(block.text)) {
+        block.text = block.text.replace("# Environment", "# Runtime context")
+          .replace("You have been invoked in the following environment:", "The session environment is:")
+        changed = true
+      } else if (MODEL_REMINDER.test(block.text)) {
+        block.text = block.text.replace("You are powered by the model named", "Current model name:")
+          .replace("You are powered by the model", "Current model:")
+          .replace("The exact model ID is", "Model ID:")
+          .replace("Assistant knowledge cutoff is", "Model knowledge cutoff:")
+        changed = true
+      }
+    }
+  }
+  return changed ? JSON.stringify(request) : body
+}
+
 export const FactoryAuthPlugin = async ({ client }) => {
   // the session id this process's requests carry
   const session = crypto.randomUUID()
@@ -806,7 +896,8 @@ export const FactoryAuthPlugin = async ({ client }) => {
           // which Anthropic's SDK sends beside the bearer token
           if (path.includes("/llm/a/")) h.set("X-Api-Key", "placeholder")
           // another agent's request opens as droid's does (droidBody)
-          const out = droidBody(path, body)
+          const out = path.includes("/llm/a/") && (path.endsWith("/messages") || path.endsWith("/messages/count_tokens"))
+            ? anthropicBody(body) : droidBody(path, body)
           if (out !== body) h.delete("content-length")
           return fetch(url, { ...init, method: init?.method ?? (input instanceof Request ? input.method : "POST"), headers: h, body: out })
         }

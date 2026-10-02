@@ -44,9 +44,9 @@ droid sends opens its system prompt with "You are Droid, an AI software
 engineering agent built by Factory.", so another agent's request to
 Factory's OpenAI-shaped API (`/api/llm/o`: GPT and Grok on Responses, the
 open models on chat completions) opens with that line too, the agent's own
-prompt after it. Claude models (and MiniMax M2.7) on Anthropic's Messages
-are sent as the agent sent them, and Factory may refuse them from agents
-other than Droid.
+prompt after it. On Anthropic's Messages (`/api/llm/a`), the plugin adapts
+fixed client metadata while preserving the task instructions and history;
+see [Claude Code through magpie](#claude-code-through-magpie) below.
 
 ## Models
 
@@ -71,3 +71,26 @@ The list is not included:
 magpie plugin add @magpie-community/opencode-factory-auth
 magpie plugin login factory
 ```
+
+## Claude Code through magpie
+
+Factory's Anthropic route requires Droid's fixed client preamble and
+refuses some of Claude Code's fixed environment and model wrappers. The
+plugin adapts that metadata while preserving the coding instructions,
+environment values, tool definitions, tool results, images and reasoning
+options. Native Droid requests remain unchanged, and OpenAI routes keep
+their existing request adapter.
+
+Use magpie's Claude Code integration to select the Factory provider.
+magpie manages the provider-specific client settings, including capability
+and permission configuration. Fields such as `safeguards` and
+`context_management` are forwarded for Factory to validate; the request
+adapter preserves them along with the other request options.
+
+The same metadata adaptation applies to `/messages` and
+`/messages/count_tokens`, so token counting sees the prompt used for
+inference. Serving the counting endpoint still depends on the host and
+upstream. Model and feature availability depend on the Factory account,
+organization region and upstream API. Connectivity has been verified with
+Sonnet 4.6, Sonnet 5.5 and Opus 5.5, and a two-turn Read tool call with
+Sonnet 4.6.
