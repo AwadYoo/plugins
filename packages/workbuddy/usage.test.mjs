@@ -143,3 +143,40 @@ test("a desktop sign-in with the app signed out says why it failed", async () =>
   const r = await (await m.authorize()).callback()
   expect(r).toEqual({ type: "failed", error: "WorkBuddy AI desktop isn't signed in" })
 })
+
+// Each model carries the credits WorkBuddy's picker shows by it, as
+// magpie's built-in reads them (internal/provider/workbuddy_free_test.go,
+// TestWBCreditsRate): x0.03 is 0.03, X1.00 is 1; x0.00 is free and no
+// rate, and one it can't read (or an infinite one) is neither.
+test("each model's rate is its credits", async () => {
+  for (const plugin of [WorkBuddyAuthPlugin, WorkBuddyAIAuthPlugin]) {
+    const calls = serve({ "/v3/config": () => ok({
+      agents: [{ name: "cli", models: ["deepseek-v4.1-flash", "deepseek-v4.1-flash-sg", "gpt-5.5", "kimi-k3", "hy3", "odd", "inf"] }],
+      models: [
+        { id: "deepseek-v4.1-flash", name: "Deepseek-V4.1-Flash", credits: "x0.00" },
+        { id: "deepseek-v4.1-flash-sg", name: "Deepseek-V4.1-Flash SG", credits: "x0.03" },
+        { id: "gpt-5.5", credits: "X1.00" },
+        { id: "kimi-k3", credits: 1.5 },
+        { id: "hy3" },
+        { id: "odd", credits: "lots" },
+        { id: "inf", credits: "xInfinity" },
+      ],
+    }) })
+    const hooks = await plugin({ client: {} })
+    const auth = { type: "oauth", access: "a", refresh: "r", expires: later(), uid: "u", domain: "" }
+    const ms = await hooks.provider.models({ id: hooks.auth.provider, models: {} }, { auth })
+    expect(calls.map((c) => c.url.pathname)).toEqual(["/v3/config"])
+    expect(Object.fromEntries(Object.entries(ms).map(([k, m]) => [k, [m.rate, m.free]]))).toEqual({
+      "deepseek-v4.1-flash": [0, true],
+      "deepseek-v4.1-flash-sg": [0.03, false],
+      "gpt-5.5": [1, false],
+      "kimi-k3": [1.5, false],
+      hy3: [0, false],
+      odd: [0, false],
+      inf: [0, false],
+    })
+  }
+  const { creditsOf } = _internal
+  expect(["x0.03", " X1.00 ", 1.5, "0"].map(creditsOf)).toEqual([0.03, 1, 1.5, 0])
+  for (const c of ["", null, undefined, "free", "x-1", "Infinity"]) expect(creditsOf(c)).toBeUndefined()
+})

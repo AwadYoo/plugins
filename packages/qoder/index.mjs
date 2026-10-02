@@ -311,6 +311,33 @@ function freeOf(raw) {
   return (raw.is_free ?? raw.isFree) === true
 }
 
+// rateOf reads a model's price as Qoder's client shows it beside the model
+// (magpie shows it in its lists, so the cheap ones can be picked without
+// opening Qoder): rate, the price_factor (0.5×), and rateWas, the price
+// struck through beside it while a discount runs: an active promotion's
+// before_promotion_price_factor, else an original_price_factor above the
+// price (Qwen3.8-Flash: 0×, 0.1× struck through). A promotion's 0 that
+// isn't free is its price before times its discount_factor. A listing with
+// no price gives none (0). The same rule as magpie's built-in
+// (internal/qoder/models.go, ModelInfo.free).
+function rateOf(raw) {
+  const price = raw.price_factor ?? raw.priceFactor
+  if (typeof price !== "number" || !Number.isFinite(price)) return { rate: 0, rateWas: 0 }
+  const num = (v) => (typeof v === "number" && Number.isFinite(v) ? v : 0)
+  const p = raw.promotion ?? raw.prommotion
+  const before = p?.before_promotion_price_factor ?? p?.beforePromotionPriceFactor
+  const discount = num(p?.discount_factor) || num(p?.discountFactor)
+  const discounted = p?.active === true && typeof before === "number" && before > 0
+  let rate = Math.max(price, 0)
+  let rateWas = Math.max(num(raw.original_price_factor), num(raw.originalPriceFactor))
+  if (discounted) {
+    rateWas = before
+    if (rate === 0) rate = before * discount
+  }
+  if (rateWas <= rate) rateWas = 0
+  return { rate, rateWas }
+}
+
 // modelInfo reads one entry of the listing's "chat" array: its efforts and
 // default from thinking_config (is_reasoning alone when it has none).
 function modelInfo(raw) {
@@ -325,6 +352,7 @@ function modelInfo(raw) {
     efforts: Array.isArray(raw.reasoning_efforts) ? [...raw.reasoning_efforts] : [],
     defaultEffort: "",
     free: freeOf(raw),
+    ...rateOf(raw),
     config: raw,
   }
   const tc = raw.thinking_config
@@ -394,6 +422,10 @@ function runtimeModel(site, m) {
     variants: Object.fromEntries((m.efforts ?? []).map((e) => [e, { reasoningEffort: e }])),
     // magpie's own: served at no cost to the plan's credits
     free: !!m.free,
+    // magpie's own: the credits a request costs, as a multiple, and the
+    // price before a discount running now (0: none)
+    rate: m.rate ?? 0,
+    rateWas: m.rateWas ?? 0,
   }
 }
 
@@ -1143,7 +1175,7 @@ const makePlugin = (site) => async ({ client }) => {
           const ms = await models(cred, true)
           if (!ms.length) return provider.models
           return Object.fromEntries(
-            ms.map((m) => [m.key, runtimeModel(site, { id: m.key, name: m.name, context: m.context, images: m.images, efforts: m.thinks ? m.efforts : [], free: m.free })]),
+            ms.map((m) => [m.key, runtimeModel(site, { id: m.key, name: m.name, context: m.context, images: m.images, efforts: m.thinks ? m.efforts : [], free: m.free, rate: m.rate, rateWas: m.rateWas })]),
           )
         } catch {
           return provider.models

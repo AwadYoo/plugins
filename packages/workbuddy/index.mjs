@@ -465,18 +465,29 @@ function modelOf(site, provider, m) {
     variants: variants(m.efforts),
     // magpie's own: served at no cost to the plan's credits
     free: !!m.free,
+    // magpie's own: the credits a request costs, as a multiple (0: none)
+    rate: m.rate ?? 0,
   }
 }
 
 // liveModels asks WorkBuddy's product config for the plan's models: the
 // "cli" agent's list, each with its details. The CLI User-Agent picks
 // WorkBuddy's config (a bare WorkBuddy/<v> gets CodeBuddy IDE's, no cli).
+// creditsOf reads a model's credits, the multiple WorkBuddy's picker shows
+// by it: "x0.03", "0" or 0; "x0.00" is free. A rate it can't read (or
+// none, or an infinite one) is undefined: the model is neither free nor
+// rated. The same rule as magpie's built-in (wbCredits).
+function creditsOf(c) {
+  if (c == null || c === "") return undefined
+  const s = String(c).trim().toLowerCase().replace(/^x/, "")
+  const n = Number(s)
+  return s !== "" && Number.isFinite(n) && n >= 0 ? n : undefined
+}
+
 // freeCredits says whether a model's credits are none: "x0.00", "0" or 0.
 // A rate it can't read is not free.
 function freeCredits(c) {
-  if (c == null || c === "") return false
-  const s = String(c).trim().toLowerCase().replace(/^x/, "")
-  return s !== "" && Number.isFinite(Number(s)) && Number(s) === 0
+  return creditsOf(c) === 0
 }
 
 async function liveModels(site, a) {
@@ -500,7 +511,11 @@ async function liveModels(site, a) {
         m.context = d.maxInputTokens
         m.output = d.maxOutputTokens
         m.images = d.supportsImages === true
-        m.free = freeCredits(d.credits)
+        const r = creditsOf(d.credits)
+        if (r !== undefined) {
+          m.free = r === 0
+          m.rate = r
+        }
         const es = d.reasoning?.supportedEfforts ?? []
         if (es.length) {
           const canOff = d.reasoning?.canDisableThinking
@@ -661,4 +676,4 @@ export const WorkBuddyAuthPlugin = makePlugin(SITES.workbuddy)
 export const WorkBuddyAIAuthPlugin = makePlugin(SITES["workbuddy-ai"])
 
 // for tests
-export const _internal = { withSystem, usageOf, desktopHeld, explained, REFUSED_HINT, freeCredits, fresh, SITES }
+export const _internal = { withSystem, usageOf, desktopHeld, explained, REFUSED_HINT, freeCredits, creditsOf, fresh, SITES }

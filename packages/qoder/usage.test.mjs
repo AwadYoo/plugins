@@ -282,6 +282,41 @@ test("a discount is not free: Qwen3.8-Max (0.5×, is_free true) is priced, Qwen3
   expect(_internal.modelInfo({ key: "x", priceFactor: 0, promotion: { active: true, beforePromotionPriceFactor: 1 } }).free).toBe(false)
 })
 
+// Each model carries its price as Qoder's client shows it beside the model,
+// as magpie's built-in reads it (internal/qoder/models_test.go,
+// TestParseModelsRate): Qwen3.8-Max 0.5×, Kimi-K3 1.4×, Qwen3.8-Flash 0×
+// with 0.1× struck through; a running promotion's price before it struck
+// through, and its 0 that isn't free read as that price times its
+// discount. A listing with no price gives none.
+test("each model's rate, and its price before a running discount", async () => {
+  const RATED = {
+    chat: [
+      { key: "qmodel_38max", enable: true, price_factor: 0.5, is_free: true, promotion: OFF_PEAK },
+      { key: "qmodel_38max-offpeak", enable: true, price_factor: 0.2, promotion: { ...OFF_PEAK, active: true } },
+      { key: "qfmodel", enable: true, price_factor: 0.0, original_price_factor: 0.1, is_free: true },
+      { key: "qmodel_latest", enable: true, price_factor: 0.5, original_price_factor: 0.5 },
+      { key: "kmodel_latest", enable: true, priceFactor: 1.4, originalPriceFactor: 2 },
+      { key: "window", enable: true, price_factor: 0, promotion: { active: true, discount_factor: 0.5, before_promotion_price_factor: 1 } },
+      { key: "window-camel", enable: true, priceFactor: 0, promotion: { active: true, discountFactor: 0.25, beforePromotionPriceFactor: 2 } },
+      { key: "unpriced", enable: true, is_free: true },
+    ],
+  }
+  const { hooks, auth } = await chat(RATED, () => new Response(""))
+  const ms = await hooks.provider.models({ models: {} }, { auth })
+  expect(Object.fromEntries(Object.entries(ms).map(([k, m]) => [k, [m.rate, m.rateWas]]))).toEqual({
+    qmodel_38max: [0.5, 0],
+    "qmodel_38max-offpeak": [0.2, 0.5],
+    qfmodel: [0, 0.1],
+    qmodel_latest: [0.5, 0],
+    kmodel_latest: [1.4, 2],
+    window: [0.5, 1],
+    "window-camel": [0.5, 2],
+    unpriced: [0, 0],
+  })
+  expect(ms.qfmodel.free).toBe(true)
+  expect(ms.window.free).toBe(false)
+})
+
 // a usage read on an account whose job token is due, the refresh answered by refresh()
 async function dueUsage(refresh, read) {
   let auth = { ...account(), expires: 0 }
