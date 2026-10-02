@@ -4,6 +4,9 @@
 # One password covers the lot: it is sent with each publish while it lasts.
 set -e
 cd "$(dirname "$0")/.."
+# npm's own registry, whatever ~/.npmrc names (a mirror such as npmmirror
+# takes no publish)
+export npm_config_registry=https://registry.npmjs.org
 bun scripts/check.mjs
 otp="$1"
 for dir in packages/*/; do
