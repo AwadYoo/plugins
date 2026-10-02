@@ -299,3 +299,63 @@ test("system-role context adaptation is idempotent and preserves non-metadata pa
   await l.fetch(url, { method: "POST", body: seen[0].body })
   expect(seen[1].body).toBe(seen[0].body)
 })
+
+test("adapts accumulated model-switch updates when continuing a Claude 5 session", async () => {
+  const { l, seen } = await loaded()
+  const tokenContext = "<total_tokens>15000000 tokens left</total_tokens>"
+  const instructions = "## Auto Mode Active\n\nKeep all permission instructions verbatim.\n\nUser quoted: You are powered by the model custom-model."
+  const update = [
+    "You are powered by the model named Sonnet 5.5. The exact model ID is factory/claude-sonnet-5-5. Assistant knowledge cutoff is June 2026.",
+    tokenContext,
+    "You are powered by the model group/claude-default.",
+    instructions,
+    tokenContext,
+    "You are powered by the model named Opus 5.5. The exact model ID is factory/claude-opus-5-5. Assistant knowledge cutoff is June 2026.",
+    "The following agent types are no longer available:\n- claude-code-guide",
+    tokenContext,
+    "USD budget: $0/$0.4; $0.4 remaining",
+  ].join("\n\n")
+  const messages = [
+    { role: "user", content: "Continue the existing conversation." },
+    { role: "system", content: "# Environment update\n - Primary working directory: /tmp/project (was /tmp/old)\n\n" + tokenContext },
+    { role: "assistant", content: [{ type: "tool_use", id: "read_1", name: "Read", input: { path: "/tmp/project/proof" } }] },
+    { role: "user", content: [{ type: "tool_result", tool_use_id: "read_1", content: update, cache_control: { type: "ephemeral" } }] },
+    { role: "system", content: update },
+  ]
+  const request = { system: droid, messages, tools: [{ name: "Read", input_schema: { type: "object" } }], stream: true }
+  const adapted = update.replaceAll("\n\nYou are powered by the model named", "\n\nCurrent model name:")
+    .replace(/^You are powered by the model named/, "Current model name:")
+    .replace("\n\nYou are powered by the model group/", "\n\nCurrent model: group/")
+    .replaceAll("The exact model ID is", "Model ID:")
+    .replaceAll("Assistant knowledge cutoff is", "Model knowledge cutoff:")
+  for (const endpoint of [url, url + "/count_tokens"]) {
+    await l.fetch(endpoint, { method: "POST", body: JSON.stringify(request) })
+    expect(JSON.parse(seen.at(-1).body)).toEqual({ ...request, messages: [...messages.slice(0, -1), { role: "system", content: adapted }] })
+    const once = seen.at(-1).body
+    await l.fetch(endpoint, { method: "POST", body: once })
+    expect(seen.at(-1).body).toBe(once)
+  }
+})
+
+test("requires a model-update preamble and complete token metadata before adapting standalone system text", async () => {
+  const { l, seen } = await loaded()
+  const model = "You are powered by the model group/claude-default."
+  const update = model + "\n\n<total_tokens>15000000 tokens left</total_tokens>"
+  for (const content of [
+    model,
+    update.replace("</total_tokens>", ""),
+    update.replace("15000000", "unknown"),
+    "Explain this quoted metadata:\n\n" + update,
+    model + "\n\nQuoted token marker: <total_tokens>15000000 tokens left</total_tokens>",
+    [{ type: "text", text: update }],
+  ]) {
+    const body = JSON.stringify({ system: droid, messages: [{ role: "system", content }] })
+    await l.fetch(url, { method: "POST", body })
+    expect(seen.at(-1).body).toBe(body)
+  }
+  for (const role of ["user", "assistant"]) {
+    const body = JSON.stringify({ system: droid, messages: [{ role, content: update }] })
+    await l.fetch(url, { method: "POST", body })
+    expect(seen.at(-1).body).toBe(body)
+  }
+})

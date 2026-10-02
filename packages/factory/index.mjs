@@ -591,18 +591,24 @@ const CONFIG_SKILL_COMPAT = CONFIG_SKILL_METADATA.replace("not Claude", "not the
 
 // Claude 5 also sends its runtime metadata as a string-content system
 // message, instead of user-message reminders. Preserve that role and all
-// instructions; only the known environment paragraph opens this adapter.
+// instructions. A model switch sends a separate update without the
+// environment paragraph; require its opening model paragraph and complete
+// generated token context before adapting that shape.
 const SYSTEM_ENV_CONTEXT = /^# Environment\nYou have been invoked in the following environment:[ \t]*\n(?: {1,2}- [^\n]*\n)+(?=\n|$)/
 const SYSTEM_MODEL_CONTEXT = /(^|\n\n)You are powered by the model (?:named )?[^\n<>]+\.(?=\n\n|$)/g
+const SYSTEM_MODEL_UPDATE = /^You are powered by the model (?:named )?[^\n<>]+\.(?=\n\n|$)/
+const SYSTEM_TOKEN_CONTEXT = /(?:^|\n\n)<total_tokens>\d+ tokens left<\/total_tokens>(?=\n\n|$)/
 function systemContext(text) {
-  if (!SYSTEM_ENV_CONTEXT.test(text)) return text
-  let out = text.replace("# Environment", "# Runtime context")
+  const environment = SYSTEM_ENV_CONTEXT.test(text)
+  if (!environment && !(SYSTEM_MODEL_UPDATE.test(text) && SYSTEM_TOKEN_CONTEXT.test(text))) return text
+  let out = text.replace(SYSTEM_MODEL_CONTEXT, (paragraph) => paragraph
+    .replace("You are powered by the model named", "Current model name:")
+    .replace("You are powered by the model", "Current model:")
+    .replace("The exact model ID is", "Model ID:")
+    .replace("Assistant knowledge cutoff is", "Model knowledge cutoff:"))
+  if (!environment) return out
+  out = out.replace("# Environment", "# Runtime context")
     .replace("You have been invoked in the following environment:", "The session environment is:")
-    .replace(SYSTEM_MODEL_CONTEXT, (paragraph) => paragraph
-      .replace("You are powered by the model named", "Current model name:")
-      .replace("You are powered by the model", "Current model:")
-      .replace("The exact model ID is", "Model ID:")
-      .replace("Assistant knowledge cutoff is", "Model knowledge cutoff:"))
   const skillHeader = "\n\nThe following skills are available for use with the Skill tool:\n\n"
   const skills = out.indexOf(skillHeader)
   if (skills >= 0) {

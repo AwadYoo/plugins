@@ -90,6 +90,11 @@ Claude 5 can send runtime metadata in string-content `system` messages
 instead of user-message reminders. The plugin adapts the known environment,
 model and configuration-skill metadata in that shape too, preserving the
 message role, environment values and session instructions.
+After `/model` switches, Claude Code can send model-only system updates
+without the initial environment paragraph. Updates beginning with the known
+model paragraph and containing complete generated token metadata are
+adapted too, including accumulated switches when resuming a conversation.
+Token budgets, permission instructions and conversation history are preserved.
 
 Use magpie's Claude Code integration to select the Factory provider.
 magpie manages the provider-specific client settings, including capability
