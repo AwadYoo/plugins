@@ -1,11 +1,11 @@
 {
   "name": "@magpie-community/opencode-qoder-auth",
-  "version": "0.1.4",
-  "description": "Qoder subscription in OpenCode and magpie",
+  "version": "0.2.0",
+  "description": "Qoder subscriptions in OpenCode and magpie: Qoder (qoder.com) and Qoder CN (qoder.cn)",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
   "files": ["index.mjs", "README.md", "LICENSE-CLIProxyAPI"],
-  "keywords": ["opencode", "opencode-plugin", "magpie", "qoder"],
+  "keywords": ["opencode", "opencode-plugin", "magpie", "qoder", "qoder-cn"],
   "license": "MIT"
 }

@@ -1,7 +1,16 @@
 # @magpie-community/opencode-qoder-auth
 
 Your [Qoder](https://qoder.com) subscription in OpenCode and
-[magpie](https://usemagpie.ai), with provider id `qoder`.
+[magpie](https://usemagpie.ai). The package serves Qoder's two sites, whose
+accounts exist only on their own:
+
+| Provider id | Site | Accounts | Plugin export |
+|---|---|---|---|
+| `qoder` | qoder.com (international) | Google, GitHub or email | `QoderAuthPlugin` |
+| `qoder-cn` | qoder.cn ([Qoder CN](#qoder-cn)) | Alibaba Cloud or phone number | `QoderCNAuthPlugin` |
+
+What follows is about `qoder`. Qoder CN works the same way on its own
+hosts; [its section](#qoder-cn) says what differs.
 
 ## Sign-in
 
@@ -82,6 +91,46 @@ The `config` hook declares the list as it was on 2026-09-30:
 - MiniMax-M3
 
 Every model speaks chat completions (`@ai-sdk/openai-compatible`).
+
+## Qoder CN
+
+`qoder-cn` is for accounts on [qoder.cn](https://qoder.cn), the China site.
+Those accounts sign in with Alibaba Cloud or a phone number and can't sign
+in through `qoder`. Qoder CN speaks the same protocol as qoder.com:
+
+- the same device flow, poll, job token and refresh paths;
+- the same COSY envelope and body codec;
+- the same model list, chat and usage paths.
+
+Only the hosts and the sign-in's client id differ. The plugin uses the ones
+Qoder CN's own CLI builds in for its `cn` build (`@qodercn-ai/qoderclicn`
+1.1.65):
+
+| | `qoder` | `qoder-cn` |
+|---|---|---|
+| Sign-in page | qoder.com | qoder.cn |
+| Accounts: poll, tokens, user info, usage | openapi.qoder.sh | openapi.qoder.com.cn |
+| Models and chat | api3.qoder.sh | gateway.qoder.com.cn |
+| Device-flow client id | Qoder's desktop client's | Qoder CN's CLI's (production) |
+| `redirect_uri` on the sign-in page | `qoder-app://` | none, as the CLI sends |
+
+Qoder CN's CLI chats with the device token itself and never makes a job
+token. The plugin asks qoder.cn for a job token first, as it does on
+qoder.com. If qoder.cn refuses it (a 4xx), the account works the way the
+CLI does:
+
+- the device token signs the model calls;
+- it is renewed with `/api/v1/deviceToken/refresh`, the chat and account
+  tokens being one pair;
+- a refused renewal (401 or 403) means signing in again.
+
+Until you sign in, the `config` hook declares the tiers Qoder CN's CLI names
+(Ultimate, Performance, Efficient, Lite). Once you are signed in, the
+account's own list from gateway.qoder.com.cn replaces them.
+
+Neither magpie's built-in Qoder CN nor this plugin has been checked against
+every kind of qoder.cn account. If a sign-in or a chat fails, please open
+an issue with the error.
 
 ## Not here
 
