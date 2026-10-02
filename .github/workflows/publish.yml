@@ -1,0 +1,33 @@
+# Publishes every package whose version isn't on npm yet, from GitHub
+# Actions with npm's trusted publishing (OIDC): no token and no one-time
+# password. Each package names this workflow as its trusted publisher on
+# npmjs.com (package → Settings → Trusted Publisher).
+name: publish
+
+on:
+  push:
+    branches: [main]
+    paths: ["packages/*/package.json"]
+  workflow_dispatch:
+
+permissions:
+  id-token: write # npm's OIDC exchange
+  contents: read
+
+concurrency: publish
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24 # npm 11.5+, which speaks trusted publishing
+          registry-url: https://registry.npmjs.org
+      - name: test
+        # the tests refuse a real home: no real sign-in is ever read
+        run: HOME=$(mktemp -d) bun test
+      - name: publish
+        run: scripts/publish.sh

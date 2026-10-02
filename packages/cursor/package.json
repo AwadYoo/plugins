@@ -7,5 +7,6 @@
   "exports": "./index.mjs",
   "files": ["index.mjs", "README.md"],
   "keywords": ["opencode", "opencode-plugin", "magpie", "cursor"],
-  "license": "MIT"
+  "license": "MIT",
+  "repository": { "type": "git", "url": "git+https://github.com/magpie-community/plugins.git", "directory": "packages/cursor" }
 }

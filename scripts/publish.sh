@@ -1,6 +1,8 @@
 #!/bin/sh
 # Publishes every package whose version isn't on npm yet.
-#   scripts/publish.sh <otp>     (the one-time password of the npm account)
+#   scripts/publish.sh [otp]     (by hand: the npm account's one-time password)
+# GitHub Actions runs it with no password on each version bump pushed to
+# main (.github/workflows/publish.yml, npm's trusted publishing).
 # One password covers the lot: it is sent with each publish while it lasts.
 set -e
 cd "$(dirname "$0")/.."
