@@ -1,6 +1,6 @@
 // auth.usage tells what magpie's built-in WorkBuddy usage told for the same
 // answers (internal/provider/workbuddy_test.go, workbuddy_ai_test.go).
-import { test, expect, beforeAll, afterEach } from "bun:test"
+import { test, expect, afterAll, beforeAll, afterEach } from "bun:test"
 import { mkdirSync, writeFileSync, readFileSync } from "node:fs"
 import { homedir, tmpdir } from "node:os"
 import { realpathSync } from "node:fs"
@@ -14,9 +14,14 @@ beforeAll(async () => {
   home = homedir()
   ;({ WorkBuddyAuthPlugin, WorkBuddyAIAuthPlugin, _internal } = await import("./index.mjs"))
 })
-// nothing leaves the machine
+// nothing leaves the machine; the fetch this file found is put back when
+// it is done, so the next test file (bun runs them all in one process)
+// doesn't inherit offline: qoder's cn.test.mjs, taking it as the real
+// fetch, sent its stand-in's requests nowhere and its sign-in polled on
 const offline = async () => { throw new Error("no network in tests") }
+const real = globalThis.fetch
 globalThis.fetch = offline
+afterAll(() => (globalThis.fetch = real))
 afterEach(() => {
   globalThis.fetch = offline
   _internal.desktopHeld.clear()

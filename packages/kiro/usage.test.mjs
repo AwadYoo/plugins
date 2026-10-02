@@ -1,6 +1,6 @@
 // auth.usage tells what magpie's built-in Kiro usage told for the same
 // answer (internal/provider/kiro_test.go TestKiroLimits).
-import { test, expect, beforeAll, afterEach } from "bun:test"
+import { test, expect, afterAll, beforeAll, afterEach } from "bun:test"
 import { homedir, tmpdir } from "node:os"
 import { realpathSync } from "node:fs"
 
@@ -11,9 +11,14 @@ beforeAll(async () => {
   if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error("run with HOME=$(mktemp -d) bun test")
   ;({ KiroAuthPlugin: plugin, _internal } = await import("./index.mjs"))
 })
-// nothing leaves the machine
+// nothing leaves the machine; the fetch this file found is put back when
+// it is done, so the next test file (bun runs them all in one process)
+// doesn't inherit offline: qoder's cn.test.mjs, taking it as the real
+// fetch, sent its stand-in's requests nowhere and its sign-in polled on
 const offline = async () => { throw new Error("no network in tests") }
+const real = globalThis.fetch
 globalThis.fetch = offline
+afterAll(() => (globalThis.fetch = real))
 afterEach(() => (globalThis.fetch = offline))
 
 const PROFILE = "arn:aws:codewhisperer:us-east-1:111111111111:profile/TEST"

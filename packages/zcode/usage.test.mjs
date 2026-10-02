@@ -1,7 +1,7 @@
 // auth.usage tells what magpie's built-in ZCode usage told for the same
 // answers (internal/provider/zcode_test.go TestZCodeAccounts,
 // zcode_start_test.go TestZCodeStartPlanOwnAccount, zcode_team_test.go).
-import { test, expect, beforeAll, beforeEach } from "bun:test"
+import { test, expect, afterAll, beforeAll, beforeEach } from "bun:test"
 import { homedir, tmpdir } from "node:os"
 import { realpathSync } from "node:fs"
 
@@ -12,8 +12,12 @@ beforeAll(async () => {
   if (![tmpdir(), realpathSync(tmpdir())].some((t) => homedir().startsWith(t))) throw new Error("run with HOME=$(mktemp -d) bun test")
   ;({ ZCodeAuthPlugin, _internal } = await import("./index.mjs"))
 })
-// nothing leaves the machine
+// nothing leaves the machine; the fetch this file found is put back when
+// it is done, so the next test file (bun runs them all in one process)
+// doesn't inherit offline or a fake of this file's
 const offline = async () => { throw new Error("no network in tests") }
+const real = globalThis.fetch
+afterAll(() => (globalThis.fetch = real))
 beforeEach(() => {
   globalThis.fetch = offline
   _internal.routes.clear()
