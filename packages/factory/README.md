@@ -75,11 +75,16 @@ magpie plugin login factory
 ## Claude Code through magpie
 
 Factory's Anthropic route requires Droid's fixed client preamble and
-refuses some of Claude Code's fixed environment and model wrappers. The
-plugin adapts that metadata while preserving the coding instructions,
-environment values, tool definitions, tool results, images and reasoning
-options. Native Droid requests remain unchanged, and OpenAI routes keep
-their existing request adapter.
+refuses some of Claude Code's fixed environment, model and built-in skill
+metadata. The plugin adapts that metadata while preserving the coding
+instructions, environment values, tool definitions, tool results, images
+and reasoning options. Native Droid requests remain unchanged, and OpenAI
+routes keep their existing request adapter.
+
+For the built-in `update-config` skill, the adapter changes only the known
+self-reference "not Claude" to "not the assistant" inside a complete
+generated skill-list reminder. Its configuration instructions, other
+skill descriptions, tools and caller text are preserved.
 
 Use magpie's Claude Code integration to select the Factory provider.
 magpie manages the provider-specific client settings, including capability
@@ -93,4 +98,4 @@ inference. Serving the counting endpoint still depends on the host and
 upstream. Model and feature availability depend on the Factory account,
 organization region and upstream API. Connectivity has been verified with
 Sonnet 4.6, Sonnet 5.5 and Opus 5.5, and a two-turn Read tool call with
-Sonnet 4.6.
+Sonnet 4.6 using Claude Code's default tool set.

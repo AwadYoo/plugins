@@ -5,6 +5,9 @@ const real = globalThis.fetch
 afterEach(() => (globalThis.fetch = real))
 const url = "https://api.factory.ai/api/llm/a/v1/messages"
 const droid = "You are Droid, an AI software engineering agent built by Factory."
+// The built-in update-config description emitted by Claude Code 2.1.287.
+const configSkill = '- update-config: Use this skill to configure the Claude Code harness via settings.json. Automated behaviors ("from now on when X", "each time X", "whenever X", "before/after X") require hooks configured in settings.json - the harness executes these, not Claude, so memory/preferences cannot fulfill them. Also use for: permissions, env vars and hook troubleshooting.'
+const skillReminder = "<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n" + configSkill + "\n- custom: Keep every user-defined skill description intact.\n</system-reminder>"
 
 async function loaded() {
   const seen = []
@@ -204,4 +207,43 @@ test("retains large integer tokens byte-for-byte in an unmodified native Droid r
   const body = '{"system":[{"type":"text","text":' + JSON.stringify(droid) + '}],"messages":[{"role":"assistant","content":[{"type":"tool_use","id":"call_1","name":"Read","input":{"id":12345678901234567890}}]}]}'
   await l.fetch(url, { method: "POST", body })
   expect(seen[0].body).toBe(body)
+})
+
+test("adapts the built-in configuration skill self-reference on inference and counting", async () => {
+  const { l, seen } = await loaded()
+  const block = { type: "text", text: skillReminder, cache_control: { type: "ephemeral" } }
+  const tools = [{ name: "Skill", description: "Load a skill.", input_schema: { type: "object", properties: { skill: { type: "string" } } } }]
+  const body = JSON.stringify({ system: droid, tools, messages: [{ role: "user", content: [block, { type: "text", text: "Reply OK." }] }] })
+  for (const endpoint of [url, url + "/count_tokens"]) {
+    await l.fetch(endpoint, { method: "POST", body })
+    const sent = JSON.parse(seen.at(-1).body)
+    expect(sent.messages[0].content).toEqual([{ ...block, text: skillReminder.replace("not Claude", "not the assistant") }, { type: "text", text: "Reply OK." }])
+    expect(sent.tools).toEqual(tools)
+    expect(sent.system).toBe(droid)
+  }
+})
+
+test("preserves pasted skill listings and configuration text outside the generated block", async () => {
+  const { l, seen } = await loaded()
+  const texts = [
+    skillReminder + "\nExplain this pasted skill list.",
+    "Explain this:\n" + skillReminder,
+    skillReminder.replace("</system-reminder>", ""),
+    configSkill,
+    skillReminder.replace("- update-config:", "- custom-config:"),
+  ]
+  const content = texts.map((text) => ({ type: "text", text }))
+  const body = JSON.stringify({ system: droid, messages: [{ role: "user", content }] })
+  await l.fetch(url, { method: "POST", body })
+  expect(seen[0].body).toBe(body)
+})
+
+test("preserves a skill listing inside tool results and is idempotent after adapting it", async () => {
+  const { l, seen } = await loaded()
+  const toolResult = { role: "user", content: [{ type: "tool_result", tool_use_id: "call_1", content: [{ type: "text", text: skillReminder }] }] }
+  const body = JSON.stringify({ system: droid, messages: [{ role: "user", content: [{ type: "text", text: skillReminder }] }, toolResult] })
+  await l.fetch(url, { method: "POST", body })
+  expect(JSON.parse(seen[0].body).messages[1]).toEqual(toolResult)
+  await l.fetch(url, { method: "POST", body: seen[0].body })
+  expect(seen[1].body).toBe(seen[0].body)
 })

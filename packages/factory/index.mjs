@@ -582,6 +582,12 @@ const CLAUDE_IDENTITIES = new Set([
 // user's question, or an incomplete fragment of one.
 const ENV_REMINDER = /^<system-reminder>\n# Environment\nYou have been invoked in the following environment:[ \t]*\n(?: {1,2}- [^\n]*\n)+<\/system-reminder>$/
 const MODEL_REMINDER = /^<system-reminder>\nYou are powered by the model (?:named )?[^\n<>]+\.\n<\/system-reminder>$/
+const SKILL_REMINDER = /^<system-reminder>\nThe following skills are available for use with the Skill tool:\n\n(?:(?!<\/?system-reminder>)[\s\S])*\n<\/system-reminder>$/
+// Factory also refuses this fixed self-reference in Claude Code 2.1.287's
+// built-in update-config description. Keep its instructions and the rest
+// of the skill list intact; only the known line in a complete listing changes.
+const CONFIG_SKILL_METADATA = '- update-config: Use this skill to configure the Claude Code harness via settings.json. Automated behaviors ("from now on when X", "each time X", "whenever X", "before/after X") require hooks configured in settings.json - the harness executes these, not Claude, so memory/preferences cannot fulfill them.'
+const CONFIG_SKILL_COMPAT = CONFIG_SKILL_METADATA.replace("not Claude", "not the assistant")
 
 function anthropicBody(body) {
   let request
@@ -653,6 +659,12 @@ function anthropicBody(body) {
           .replace("The exact model ID is", "Model ID:")
           .replace("Assistant knowledge cutoff is", "Model knowledge cutoff:")
         changed = true
+      } else if (SKILL_REMINDER.test(block.text)) {
+        const adapted = block.text.replace("\n" + CONFIG_SKILL_METADATA, "\n" + CONFIG_SKILL_COMPAT)
+        if (adapted !== block.text) {
+          block.text = adapted
+          changed = true
+        }
       }
     }
   }
