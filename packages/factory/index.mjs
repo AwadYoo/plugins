@@ -13,7 +13,7 @@ const API_EU = "https://api.eu.factory.ai"
 // droid's WorkOS client, production
 const CLIENT_ID = "client_01HNM792M5G5G1A2THWPXKFMXB"
 // the droid release the requests say they are
-const VERSION = "0.229.0"
+const VERSION = "0.231.0"
 // how long before an access token lapses it is renewed (droid: a minute)
 const REFRESH_LEAD = 2 * 60 * 1000
 // how long an account whose whoami failed waits before asking again
@@ -53,7 +53,7 @@ const MODELS = [
   ["grok-4.7", "Grok 4.7", RESPONSES, "xai", 500000, 63356, E4, true],
   ["grok-4.6", "Grok 4.6", RESPONSES, "xai", 200000, 63356, E4, true],
   ["glm-5.3", "GLM-5.3", CHAT, "fireworks", 1040000, 131072, ["low", "high", "max"], false],
-  ["glm-5.3-flash", "GLM-5.3-Flash", CHAT, "fireworks", 1048576, 131072, ["low", "high", "max"], false],
+  ["glm-5.3-flash", "GLM-5.3-Flash", CHAT, "fireworks", 1048576, 131072, ["low", "high", "max"], true],
   ["glm-5.2", "GLM-5.2", CHAT, "baseten", 1040000, 131072, ["high", "max"], false],
   ["kimi-k3", "Kimi K3", CHAT, "fireworks", 262144, 65536, ["low", "high", "max"], true],
   ["deepseek-v4.1-flash", "DeepSeek V4.1 Flash", CHAT, "fireworks", 1040000, 131072, ["low", "high", "max"], true],
@@ -245,7 +245,85 @@ const orgRefused = (status, text) => status === 403 && text.toLowerCase().includ
 function explain(status, text) {
   if (status !== 403) return ""
   if (orgRefused(status, text)) return "the Factory account's organization changed; remove the account in magpie and sign in to it again"
-  return "Factory refused this account the request; check that `droid`, signed in to the same account and organization, can use this model (an organization's model policy or the plan may not allow it), and if it can, remove the Factory account in magpie and sign in to it again"
+  return "Factory takes a Factory subscription's requests only from Droid itself. magpie opens other agents' requests to Factory's GPT, Grok and open models (GLM, Kimi…) as Droid's do, but Factory may still tell them apart, and Claude models (and MiniMax M2.7) are sent as the agent sent them, so Claude Code's and other agents' are refused there; use the model from Droid, and if Droid is refused it too, the organization's model policy or the plan doesn't allow this model"
+}
+
+// ---- opening as droid ---------------------------------------------------------
+//
+// Factory takes a subscription's model requests only from Droid (magpie
+// #242, #506): the same account's GPT, Grok and GLM answered Droid every
+// time and refused Codex, Grok Build and Claude Code every time, on the same
+// models, efforts, endpoint and headers, the body the only difference. Every
+// request droid sends opens its system prompt with one line (droid 0.231.0:
+// its system blocks are [that line, the agent's prompt, …], sent as
+// Responses' instructions joined with "\n", and on chat completions as one
+// system message first, joined the same way). So another agent's request to
+// /api/llm/o opens with the line too, as the built-in's factoryDroidBody
+// (internal/provider/factory_client.go) has it. Anthropic's Messages
+// (/api/llm/a) is left as the agent sent it, and so is a request that
+// already opens with the line: droid's own goes on byte for byte.
+
+const DROID_LINE = "You are Droid, an AI software engineering agent built by Factory."
+
+// droidChat opens msgs' first system message with droid's line, or puts one
+// before them with the line alone: false when it opens so already.
+function droidChat(msgs) {
+  const first = msgs[0]
+  if (first && typeof first === "object" && first.role === "system") {
+    const c = first.content
+    if (typeof c === "string") {
+      if (c.startsWith(DROID_LINE)) return false
+      first.content = c.trim() === "" ? DROID_LINE : DROID_LINE + "\n" + c
+      return true
+    }
+    if (Array.isArray(c)) {
+      // droid sends a string, its blocks joined with "\n": text parts
+      // alone are joined so
+      let texts = [DROID_LINE]
+      for (let i = 0; i < c.length; i++) {
+        const p = c[i]
+        if (!p || typeof p !== "object" || p.type !== "text" || typeof p.text !== "string") {
+          texts = null
+          break
+        }
+        if (i === 0 && p.text.startsWith(DROID_LINE)) return false
+        texts.push(p.text)
+      }
+      first.content = texts ? texts.join("\n") : [{ type: "text", text: DROID_LINE }, ...c]
+      return true
+    }
+  }
+  msgs.unshift({ role: "system", content: DROID_LINE })
+  return true
+}
+
+// droidBody is body, a request to Factory's /api/llm/o at path, as droid
+// would open it: Responses' instructions, or chat completions' first system
+// message, starting with droid's line. Anything else, a body that can't be
+// read, or one that already starts so is returned as it is.
+function droidBody(path, body) {
+  if (!path.includes("/llm/o/") || body == null) return body
+  let text
+  if (typeof body === "string") text = body
+  else if (body instanceof ArrayBuffer || ArrayBuffer.isView(body)) text = Buffer.from(body instanceof ArrayBuffer ? body : body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength)).toString("utf8")
+  else return body
+  let m
+  try {
+    m = JSON.parse(text)
+  } catch {
+    return body
+  }
+  if (!m || typeof m !== "object" || Array.isArray(m)) return body
+  if (path.endsWith("/responses")) {
+    const v = m.instructions
+    if (v !== undefined && v !== null && typeof v !== "string") return body // not something droid sends
+    const ins = v ?? ""
+    if (ins.startsWith(DROID_LINE)) return body
+    m.instructions = ins.trim() === "" ? DROID_LINE : DROID_LINE + "\n" + ins
+  } else if (path.endsWith("/chat/completions")) {
+    if (!Array.isArray(m.messages) || !droidChat(m.messages)) return body
+  } else return body
+  return JSON.stringify(m)
 }
 
 // errorReply is an error as the API the request was for words one:
@@ -266,6 +344,35 @@ function said(res, v) {
   const h = new Headers(res.headers)
   h.set("X-Magpie-Sign-In", v)
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers: h })
+}
+
+// ---- API keys -----------------------------------------------------------------
+//
+// A Factory API key (fk-…), as droid takes one from FACTORY_API_KEY: its
+// om() hands the key on as the token, sent as "Authorization: Bearer fk-…"
+// with the headers every request carries, and never renewed. droid's active
+// org (st(), X-Factory-Org-Id) is what a sign-in stored, so a key alone
+// sends none. As the built-in's factory_key.go keeps one.
+
+const isKey = (a) => a?.type === "api" && typeof a.key === "string" && a.key.trim() !== ""
+
+// keyAccount is a key as the account the requests are signed with.
+function keyAccount(a) {
+  const md = a.metadata ?? {}
+  const key = a.key.trim()
+  return {
+    key: true,
+    access: key,
+    refresh: "",
+    expires: 0,
+    accountId: md.email || md.userId || "",
+    email: md.email ?? "",
+    userId: md.userId ?? "",
+    activeOrganizationId: "",
+    region: md.region ?? "",
+    premBaseHost: md.premBaseHost ?? "",
+    whoKnown: typeof md.region === "string",
+  }
 }
 
 // ---- sign-in ----------------------------------------------------------------
@@ -476,8 +583,8 @@ export const FactoryAuthPlugin = async ({ client }) => {
   // when each account last asked whoami for its org, so one whoami can't
   // answer doesn't ask before every request, nor hold back the others
   const asked = new Map()
-  const askedOf = (c) => asked.get(c.accountId || c.refresh || "") ?? 0
-  const ask = (c) => asked.set(c.accountId || c.refresh || "", Date.now())
+  const askedOf = (c) => asked.get(c.accountId || c.refresh || c.access || "") ?? 0
+  const ask = (c) => asked.set(c.accountId || c.refresh || c.access || "", Date.now())
 
   // account is the account getAuth reads, with what keeps its token live
   // and its org right.
@@ -488,8 +595,37 @@ export const FactoryAuthPlugin = async ({ client }) => {
     }
     const current = async () => {
       const a = await getAuth()
+      if (isKey(a)) return keyAccount(a)
       if (a?.type !== "oauth" || !a.access) throw new Error("Factory: not signed in")
       return { ...a }
+    }
+
+    // keyed is a key account with where Factory serves its org: whoami,
+    // asked with the key and no org (droid's st() is null for a key), as
+    // droid's yP checks a key before it is used, and as the built-in asks
+    // it when the key is added. What it names is kept in the key's
+    // metadata, so magpie shows whose the key is; a whoami that fails is
+    // asked again ASK_AGAIN later, the request going on meanwhile.
+    const keyed = async (c) => {
+      if (c.whoKnown || Date.now() - askedOf(c) < ASK_AGAIN) return c
+      ask(c)
+      let who
+      try {
+        who = await whoami({ ...c, activeOrganizationId: "" })
+      } catch {
+        return c
+      }
+      c.region = who.region ?? ""
+      c.premBaseHost = who.premBaseHostV2 ?? ""
+      c.email ||= who.email ?? ""
+      c.userId ||= who.userId ?? ""
+      c.whoKnown = true
+      const a = await getAuth()
+      if (isKey(a) && a.key === c.access) {
+        const metadata = { ...(a.metadata ?? {}), email: c.email, userId: c.userId, region: c.region, premBaseHost: c.premBaseHost }
+        await client.auth.set({ path: { id: PROVIDER }, body: { ...a, metadata } }).catch(() => {})
+      }
+      return c
     }
 
     // orgOf fills in the active org when there is none: droid asks
@@ -507,6 +643,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
     const fresh = (renewed) =>
       locked(async () => {
         const c = await current()
+        if (c.key) return keyed(c) // an API key: nothing to renew, and no org with it
         if ((c.expires > 0 && Date.now() < c.expires - REFRESH_LEAD) || !c.refresh) return orgOf(c)
         let t
         try {
@@ -539,6 +676,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
         if (status !== 403) return false
         const isOrg = orgRefused(status, text)
         const c = await current()
+        if (c.key) return false // an API key carries no org droid would send
         if (c.activeOrganizationId) {
           if (!isOrg) return false // the org was sent: the refusal is about something else
           const was = c.activeOrganizationId
@@ -633,6 +771,8 @@ export const FactoryAuthPlugin = async ({ client }) => {
           label: "Sign in with Factory (device code)",
           authorize: deviceSignIn,
         },
+        // droid's FACTORY_API_KEY: the key is the bearer, never renewed
+        { type: "api", label: "Factory API key (fk-…)", placeholder: "fk-…" },
       ],
       // magpie's own hook: the account's limits
       async usage(getAuth) {
@@ -640,7 +780,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
       },
       async loader(getAuth) {
         const first = await getAuth()
-        if (first?.type !== "oauth") return {}
+        if (first?.type !== "oauth" && !isKey(first)) return {}
 
         const { fresh, mendOrg } = account(getAuth)
 
@@ -665,7 +805,10 @@ export const FactoryAuthPlugin = async ({ client }) => {
           // droid's Anthropic client is made with the key "placeholder",
           // which Anthropic's SDK sends beside the bearer token
           if (path.includes("/llm/a/")) h.set("X-Api-Key", "placeholder")
-          return fetch(url, { ...init, method: init?.method ?? (input instanceof Request ? input.method : "POST"), headers: h, body })
+          // another agent's request opens as droid's does (droidBody)
+          const out = droidBody(path, body)
+          if (out !== body) h.delete("content-length")
+          return fetch(url, { ...init, method: init?.method ?? (input instanceof Request ? input.method : "POST"), headers: h, body: out })
         }
 
         return {
@@ -710,4 +853,4 @@ export const FactoryAuthPlugin = async ({ client }) => {
 }
 
 // for tests
-export const _internal = { limitWindows, windowEnd, dollars, vendorError, CORE }
+export const _internal = { limitWindows, windowEnd, dollars, vendorError, CORE, droidBody, DROID_LINE }

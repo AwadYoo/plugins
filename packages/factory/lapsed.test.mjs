@@ -66,10 +66,10 @@ test("a refusal says what to do after an em dash, as the built-in's Explain join
   let res = await l.fetch("https://api.factory.ai/api/llm/o/v1/responses", { method: "POST", body: JSON.stringify({ model: "gpt-x" }) })
   expect(res.status).toBe(403)
   expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
-  expect((await res.json()).error.message).toMatch(/^model not allowed — Factory refused this account the request; check that `droid`/)
+  expect((await res.json()).error.message).toMatch(/^model not allowed — Factory takes a Factory subscription's requests only from Droid itself\. /)
   globalThis.fetch = async () => new Response("", { status: 403 })
   res = await l.fetch("https://api.factory.ai/api/llm/o/v1/responses", { method: "POST", body: JSON.stringify({ model: "gpt-x" }) })
-  expect((await res.json()).error.message).toMatch(/^403 Forbidden — Factory refused/)
+  expect((await res.json()).error.message).toMatch(/^403 Forbidden — Factory takes a Factory subscription's requests only from Droid/)
 })
 
 // a live account whose requests fetch answers with serve

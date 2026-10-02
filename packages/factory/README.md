@@ -9,6 +9,10 @@ model requests to Factory's API the way `droid` sends them. Provider id:
 - **Sign in with Factory (device code).** This is WorkOS's device flow
   under droid's own client. The browser opens Factory's page with the code
   filled in. Confirm it there, and the plugin picks up the tokens.
+- **Factory API key.** A key (`fk-…`), as droid takes one from
+  `FACTORY_API_KEY`. It is sent as the bearer token with droid's headers
+  and never renewed. A key carries no organization header; `whoami`, asked
+  once with the key, says whose it is and where its organization is served.
 - **Organization.** A token that isn't in an organization yet is put in
   the first one your account belongs to.
 - **Whoami.** The plugin asks `whoami` for your active organization, its
@@ -32,6 +36,17 @@ at once.
 **Refusals.** If Factory refuses the organization a request names, the
 plugin asks `whoami` again and resends the request once. If the refusal
 stands, the error says what to check.
+
+## Requests from other agents
+
+Factory serves a subscription's model requests to Droid. Every request
+droid sends opens its system prompt with "You are Droid, an AI software
+engineering agent built by Factory.", so another agent's request to
+Factory's OpenAI-shaped API (`/api/llm/o`: GPT and Grok on Responses, the
+open models on chat completions) opens with that line too, the agent's own
+prompt after it. Claude models (and MiniMax M2.7) on Anthropic's Messages
+are sent as the agent sent them, and Factory may refuse them from agents
+other than Droid.
 
 ## Models
 
