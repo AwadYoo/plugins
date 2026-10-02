@@ -1,6 +1,7 @@
 // auth.usage tells what magpie's built-in Cursor account shows
 // (internal/provider/cursor_usage.go), against Cursor's replies as its tests
 // give them (cursor_usage_test.go).
+import "./nonet.mjs" // first: no request leaves this machine
 import { afterEach, expect, test } from "bun:test"
 import { CursorAuthPlugin, _internal } from "./index.mjs"
 

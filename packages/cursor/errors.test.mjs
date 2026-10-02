@@ -1,6 +1,7 @@
 // A request Cursor fails is answered with the status and words magpie's
 // built-in Cursor (internal/gateway/cursor.go, cursorFailure) gave it, so the
 // gateway moves on to the next account or member as it did.
+import "./nonet.mjs" // first: no request leaves this machine
 import { expect, test } from "bun:test"
 import { CursorAuthPlugin, _internal } from "./index.mjs"
 

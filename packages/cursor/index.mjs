@@ -602,14 +602,19 @@ function modelID(raw, model, effort, fast) {
   return vs[fitEffort(effort, levels)]
 }
 
-// usable is the account's list, as `cursor-agent models` has it: its ids,
-// names and the id each is run by; kept a while, by token.
+// usable is the account's list: what `cursor-agent models` has
+// (GetUsableModels: its ids, names and the id each is run by, and whether
+// Cursor serves it in Max Mode), and the models Cursor's model picker
+// offers that it leaves out (parameterized). Kept a while, by token.
 const lists = new Map()
 async function usable(tok) {
   const h = createHash("sha256").update(tok).digest("hex")
   const had = lists.get(h)
   if (had && Date.now() - had.at < MODELS_KEEP) return had.raw
-  const j = await unary(API, "agent.v1.AgentService/GetUsableModels", tok, {}, 30_000)
+  const [j, picker] = await Promise.all([
+    unary(API, "agent.v1.AgentService/GetUsableModels", tok, {}, 30_000),
+    parameterized(tok),
+  ])
   const raw = []
   for (const m of j?.models ?? []) {
     const id = m.displayModelId || m.modelId
@@ -617,12 +622,87 @@ async function usable(tok) {
     // some names come with zero-width spaces and doubled ones
     let name = String(m.displayName || id).replaceAll("​", "").split(/\s+/).filter(Boolean).join(" ")
     name = name.replace(/\(default\)$/, "").trim().replace(/\(current\)$/, "").trim()
-    raw.push({ id, name, context: contextOf(name), run: m.modelId || id })
+    const run = m.modelId || id
+    // Max Mode as the CLI sends it: the list's own say, else the picker's
+    // (a model with no other mode, or a variant that is Max Mode's)
+    const maxMode = m.maxMode === true || !!(picker.slugs.get(id)?.maxMode || picker.slugs.get(run)?.maxMode)
+    raw.push({ id, name, context: contextOf(name), run, ...(maxMode ? { maxMode } : {}) })
   }
   if (!raw.length) throw new Error("Cursor listed no models")
+  for (const m of picker.extra(raw)) raw.push(m)
   lists.set(h, { at: Date.now(), raw })
   return raw
 }
+
+// left out of the CLI's picker as it leaves them out (model-service.ts)
+const PICKER_SKIP = new Set(["claude-4.5-haiku", "claude-4.5-haiku-thinking", "gemini-2.5-pro", "gemini-2.5-flash"])
+
+// needsMax is whether a variant of a picker's model is run in Max Mode
+// only, as the CLI reads it: a model with no other mode, or a Max Mode
+// variant.
+const needsMax = (m, v) => m?.supportsNonMaxMode === false || v?.isMaxMode === true
+
+// parameterized is Cursor's model picker (AiService/AvailableModels, as
+// the CLI asks for it): each id a model goes by (its name, legacy slugs,
+// each variant's slug) with the model and variant it is, and extra(raw),
+// the picker's models the usable list doesn't have, as entries of it (a
+// model added since, such as GLM-5.3, or one the account hasn't turned
+// on). A picker Cursor can't give is none.
+async function parameterized(tok) {
+  let models = []
+  try {
+    const j = await unary(API, "aiserver.v1.AiService/AvailableModels", tok, { useModelParameters: true, doNotUseMarkdown: true }, 8_000)
+    models = Array.isArray(j?.models) ? j.models : []
+  } catch {}
+  const slugs = new Map()
+  const namesOf = (m) => {
+    const vs = m.variants ?? []
+    return [m.name, m.serverModelName, ...(m.legacySlugs ?? []), ...(m.idAliases ?? []), ...vs.flatMap((v) => [v.legacySlug, v.variantStringRepresentation])].filter(Boolean)
+  }
+  for (const m of models) {
+    const vs = m.variants ?? []
+    for (const v of vs) for (const s of [v.legacySlug, v.variantStringRepresentation]) if (s && !slugs.has(s)) slugs.set(s, { maxMode: needsMax(m, v) })
+    for (const s of [m.name, m.serverModelName, ...(m.legacySlugs ?? [])]) if (s && !slugs.has(s)) slugs.set(s, { maxMode: needsMax(m, defaultVariant(m)) })
+  }
+  const extra = (raw) => {
+    const have = new Set(raw.flatMap((r) => [r.id, r.run]))
+    const out = []
+    for (const m of models) {
+      if (!m?.name || m.isHidden || m.isChatOnly || m.onlySupportsCmdK || m.supportsAgent === false || PICKER_SKIP.has(m.name)) continue
+      if (namesOf(m).some((s) => have.has(s))) continue
+      const title = clean(m.clientDisplayName || m.name)
+      const params = (v) => (v?.parameterValues ?? []).map((p) => ({ id: String(p.id ?? ""), value: String(p.value ?? "") })).filter((p) => p.id)
+      const entry = (id, name, v) => {
+        const maxMode = needsMax(m, v)
+        const limit = (maxMode && m.contextTokenLimitForMaxMode) || m.contextTokenLimit
+        return { id, name, context: limit > 0 ? limit : contextOf(name), run: m.name, params: params(v), ...(maxMode ? { maxMode } : {}) }
+      }
+      const named = (m.variants ?? []).filter((v) => v.legacySlug)
+      if (named.length) {
+        for (const v of named) {
+          if (have.has(v.legacySlug)) continue
+          have.add(v.legacySlug)
+          const label = clean(v.displayNameOutsidePicker || [title, v.displayName].filter(Boolean).join(" "))
+          out.push(entry(v.legacySlug, label, v))
+        }
+      } else if (!have.has(m.name)) {
+        have.add(m.name)
+        out.push(entry(m.name, title, defaultVariant(m)))
+      }
+    }
+    return out
+  }
+  return { slugs, extra }
+}
+
+// defaultVariant is the variant the CLI picks for a model asked for by
+// name: its default without Max Mode, else with it, else the first.
+const defaultVariant = (m) => {
+  const vs = m?.variants ?? []
+  return vs.find((v) => v.isDefaultNonMaxConfig) ?? vs.find((v) => v.isDefaultMaxConfig) ?? vs[0]
+}
+
+const clean = (s) => String(s ?? "").replaceAll("​", "").split(/\s+/).filter(Boolean).join(" ")
 
 function runtimeModel(m) {
   return {
@@ -1084,8 +1164,11 @@ function usageOf(uf) {
 // buildRun is the Run's first message, an AgentClientMessage with its
 // run_request, and the blobs it names. The conversation state is the
 // messages and one turn, which the server wants there to sample at all.
-// conv is the conversation_id (conversationID), a new one when "".
-function buildRun(msgs, lastUser, tools, model, conv = "") {
+// conv is the conversation_id (conversationID), a new one when "". The
+// model goes as the CLI sends it: in Max Mode when maxMode is set (Cursor
+// refuses a model it serves only that way otherwise: "Max Mode
+// Required"), with the picker variant's parameters when it has them.
+function buildRun(msgs, lastUser, tools, model, conv = "", { maxMode = false, params = [] } = {}) {
   const blobs = new Map()
   const put = (b) => {
     const id = createHash("sha256").update(b).digest()
@@ -1106,13 +1189,22 @@ function buildRun(msgs, lastUser, tools, model, conv = "") {
     mcp.bytes(1, d)
   }
   const action = pb().bytes(2, pb().bytes(2, rc)) // resume_action
+  // ModelDetails: model_id, display_model_id, display_name, max_mode (7);
+  // RequestedModel: model_id, max_mode (2), parameters (3)
+  const details = pb().str(1, model).str(3, model).str(4, model)
+  const requested = pb().str(1, model)
+  if (maxMode) {
+    details.varint(7, 1)
+    requested.varint(2, 1)
+  }
+  for (const p of params) requested.bytes(3, pb().str(1, p.id).str(2, p.value))
   const rr = pb()
     .bytes(1, state)
     .bytes(2, action)
-    .bytes(3, pb().str(1, model).str(3, model).str(4, model))
+    .bytes(3, details)
     .bytes(4, mcp)
     .str(5, conv || randomUUID())
-    .bytes(9, pb().str(1, model))
+    .bytes(9, requested)
     .varint(19, 1) // inline images
   return { first: pb().bytes(1, rr).done(), blobs }
 }
@@ -1179,8 +1271,8 @@ function open(base, headers, signal) {
 
 // runOnce is one Run of the chat on the agent API at base: an async
 // iterator of the answer's pieces, or the error it failed with before any.
-async function runOnce({ tok, base, id, tools, conv, convID, signal }) {
-  const { first, blobs } = buildRun(conv.msgs, conv.last, tools, id, convID)
+async function runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, params }) {
+  const { first, blobs } = buildRun(conv.msgs, conv.last, tools, id, convID, { maxMode, params })
   const o = await open(
     base,
     {
@@ -1438,6 +1530,14 @@ function kept(res) {
 // answer runs a chat completion on Cursor, the account kept (errorResponse).
 const answer = async (auth, chat, signal, session) => kept(await answerOf(auth, chat, signal, session))
 
+// maxOnly are the ids Cursor said it serves in Max Mode only.
+const maxOnly = new Set()
+
+// maxRequired is Cursor's refusal of a model asked for without Max Mode
+// (the CLI's MAX_MODE_REQUIRED): "Max Mode Required: The model "x"
+// requires Max Mode to be enabled. …"
+const maxRequired = (msg) => /max[ _]mode[ _]required|requires max mode/i.test(String(msg ?? ""))
+
 // answerOf runs a chat completion on Cursor and answers it as one, streamed
 // or not.
 async function answerOf(auth, chat, signal, session = "") {
@@ -1454,18 +1554,34 @@ async function answerOf(auth, chat, signal, session = "") {
   } catch {}
   const fast = chat.service_tier === "priority" || chat.service_tier === "fast"
   let id = modelID(raw, model, chat.reasoning_effort ?? "", fast)
-  id = raw.find((m) => m.id === id)?.run ?? id
+  const entry = raw.find((m) => m.id === id)
+  id = entry?.run ?? id
   if (id === "auto") id = "default" // Cursor's pick, which its API calls default
+  const params = entry?.params ?? []
+  let maxMode = !!entry?.maxMode || maxOnly.has(id)
   const tools = toolsOf(chat)
   const conv = conversation(chat, tools)
   const convID = conversationID(chat, session)
-  const base = await agentURL(tok, false)
-  let r = await runOnce({ tok, base, id, tools, conv, convID, signal })
+  let base = await agentURL(tok, false)
+  const once = () => runOnce({ tok, base, id, tools, conv, convID, signal, maxMode, params })
+  let r = await once()
   if (r.error && regional(r.error.message)) {
     // the team moved, or the config was kept from before: once more with
     // what the config says now
     const fresh = await agentURL(tok, true)
-    if (fresh !== base) r = await runOnce({ tok, base: fresh, id, tools, conv, convID, signal })
+    if (fresh !== base) {
+      base = fresh
+      r = await once()
+    }
+  }
+  if (r.error && !maxMode && maxRequired(r.error.message)) {
+    // a model Cursor serves only in Max Mode that neither list said so of:
+    // in Max Mode, as the CLI turns it on for such a model, and so from
+    // now on. An account Max Mode isn't open to is answered as Cursor
+    // answers that.
+    maxMode = true
+    maxOnly.add(id)
+    r = await once()
   }
   if (r.error) return errorResponse(r.error)
   const it = r.events
@@ -1609,4 +1725,4 @@ export async function CursorAuthPlugin() {
 }
 
 // for tests
-export const _internal = { conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
+export const _internal = { usable, maxRequired, conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }

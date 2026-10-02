@@ -3,6 +3,7 @@
 // (magpie #498, internal/gateway/cursor_conversation_test.go), against a
 // fake Cursor: its API answered by a stand-in fetch, its agent API by an
 // HTTP/2 server here. Nothing reaches Cursor.
+import "./nonet.mjs" // first: no request leaves this machine
 import { afterAll, afterEach, beforeAll, expect, test } from "bun:test"
 import http2 from "node:http2"
 import { CursorAuthPlugin, _internal } from "./index.mjs"

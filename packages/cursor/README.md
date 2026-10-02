@@ -70,6 +70,15 @@ The `config` hook declares `auto` (Cursor's pick). Once signed in, the
   is. `-fast` and `-thinking` models stay models of their own; a
   `service_tier` of `priority` picks the fast one.
 - The context window is 1M for a model whose name says 1M, else 200K.
+- Cursor's model picker (`AiService/AvailableModels`, as the CLI asks for
+  it) adds the models it offers that the usable list leaves out (GLM-5.3,
+  GLM-5.3 Flash), run with the picker variant's parameters; hidden and
+  Tab-only models stay out.
+- A model Cursor serves only in Max Mode (the usable list's `maxMode`, a
+  picker model with no other mode, or a Max Mode variant) is asked for in
+  Max Mode, as the CLI turns it on for one. A model neither says it of is
+  asked again in Max Mode when Cursor answers "Max Mode Required", and so
+  from then on.
 
 ## Not included
 
