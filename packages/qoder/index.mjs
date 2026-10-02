@@ -1,4 +1,7 @@
-// Qoder's subscription (qoder.com) as an OpenCode provider plugin.
+// Qoder's subscriptions as OpenCode provider plugins, one for each of its
+// sites, whose accounts exist only on their own:
+//   - qoder: the international site, qoder.com
+//   - qoder-cn: Qoder CN, qoder.cn (Alibaba Cloud or phone sign-in)
 //
 // Qoder is signed in to the way its desktop client is: a PKCE device flow
 // (qoder.com's page, then a poll of openapi.qoder.sh for the device token),
@@ -15,17 +18,18 @@
 // The protocol (endpoints, COSY envelope, body codec, device flow) is ported
 // from magpie's internal/qoder, which ported it from CLIProxyAPI's qoder
 // support (https://github.com/ufec/CLIProxyAPI, MIT).
+//
+// Qoder CN speaks the same protocol on its own hosts, as Qoder CN's CLI
+// (@qodercn-ai/qoderclicn 1.1.65) builds them in for its "cn" build: the
+// sign-in page on qoder.cn, accounts on openapi.qoder.com.cn and models on
+// gateway.qoder.com.cn, with the device-flow client id that CLI sends in
+// production and no redirect_uri. That CLI chats on the device token itself;
+// if qoder.cn won't trade it for a job token, the account does the same.
 import { createCipheriv, createHash, publicEncrypt, randomBytes, randomUUID, constants } from "node:crypto"
 import { STATUS_CODES } from "node:http"
 
-const ID = "qoder"
-const CLIENT_ID = "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa"
-const DEVICE_HOST = "https://qoder.com"
-const OPENAPI = "https://openapi.qoder.sh"
-const API = "https://api3.qoder.sh"
-const REDIRECT = "qoder-app://"
-const CHAT_URL = API + "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
-const MODELS_URL = API + "/algo/api/v2/model/list?Encode=1"
+const CHAT_PATH = "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=llm_model_result&AgentId=agent_common&Encode=1"
+const MODELS_PATH = "/algo/api/v2/model/list?Encode=1"
 const COSY_VERSION = "1.1.49"
 const SIGN_IN_TIMEOUT = 15 * 60 * 1000
 const REFRESH_LEAD = 5 * 60 * 1000
@@ -145,8 +149,8 @@ function decodeBody(wire) {
 
 const b64url = (buf) => buf.toString("base64url")
 
-async function openapi(path, { method = "GET", token, body, query } = {}) {
-  const url = new URL(OPENAPI + path)
+async function openapi(site, path, { method = "GET", token, body, query } = {}) {
+  const url = new URL(site.openapi + path)
   for (const [k, v] of Object.entries(query ?? {})) url.searchParams.set(k, v)
   const headers = { Accept: "application/json" }
   if (body) headers["Content-Type"] = "application/json"
@@ -164,23 +168,34 @@ async function openapi(path, { method = "GET", token, body, query } = {}) {
 // runs out; a day when it said none.
 const expiresAt = (jt) => Date.now() + (jt.expires_in > 0 ? jt.expires_in : DAY)
 
-async function deviceSignIn() {
+// deviceExpiry is when a device token used for chat runs out: its
+// expires_at (a date) or expires_in (seconds), as Qoder's CLI reads it; a
+// day when it said neither.
+function deviceExpiry(dt) {
+  const at = Date.parse(String(dt?.expires_at ?? "").trim())
+  if (!isNaN(at)) return at
+  if (dt?.expires_in > 0) return Date.now() + dt.expires_in * 1000
+  return Date.now() + DAY
+}
+
+async function deviceSignIn(site) {
   const verifier = b64url(randomBytes(64))
   const challenge = b64url(createHash("sha256").update(verifier).digest())
   const nonce = randomUUID()
   const machineId = randomUUID()
-  const q = new URLSearchParams({ challenge, challenge_method: "S256", nonce, machine_id: machineId, client_id: CLIENT_ID, redirect_uri: REDIRECT })
+  const q = new URLSearchParams({ challenge, challenge_method: "S256", nonce, machine_id: machineId, client_id: site.clientId })
+  if (site.redirect) q.set("redirect_uri", site.redirect)
   const until = Date.now() + SIGN_IN_TIMEOUT
   return {
-    url: `${DEVICE_HOST}/device/selectAccounts?${q}`,
-    instructions: "Sign in to Qoder in the browser and authorize this device",
+    url: `${site.web}/device/selectAccounts?${q}`,
+    instructions: `Sign in to ${site.name} in the browser and authorize this device`,
     method: "auto",
     async callback() {
       let dt
       for (;;) {
-        if (Date.now() > until) throw new Error("Qoder: the sign-in timed out; start again")
+        if (Date.now() > until) throw new Error(`${site.name}: the sign-in timed out; start again`)
         try {
-          const r = await openapi("/api/v1/deviceToken/poll", { query: { nonce, verifier, challenge_method: "S256" } })
+          const r = await openapi(site, "/api/v1/deviceToken/poll", { query: { nonce, verifier, challenge_method: "S256" } })
           if (r.status === 200 && String(r.json?.token ?? "").trim()) {
             dt = r.json
             break
@@ -188,24 +203,29 @@ async function deviceSignIn() {
         } catch {} // a hiccup: ask again
         await new Promise((r) => setTimeout(r, 2000))
       }
-      const jr = await openapi("/api/v1/me/jobToken", { method: "POST", token: dt.token, body: { clientId: CLIENT_ID } })
-      if (jr.status !== 200) throw new Error(`Qoder job token: status ${jr.status}: ${jr.text.trim().slice(0, 300)}`)
-      if (!String(jr.json?.token ?? "").trim()) throw new Error("Qoder job token: empty token in response")
+      const jr = await openapi(site, "/api/v1/me/jobToken", { method: "POST", token: dt.token, body: { clientId: site.clientId } })
+      let chat
+      if (jr.status === 200) {
+        if (!String(jr.json?.token ?? "").trim()) throw new Error(`${site.name} job token: empty token in response`)
+        chat = { access: jr.json.token, refresh: jr.json.refresh_token ?? "", expires: expiresAt(jr.json) }
+      } else if (site.deviceChat && jr.status >= 400 && jr.status < 500) {
+        // Qoder CN's CLI never makes a job token: its device token is what
+        // signs the model calls, renewed as a device token
+        chat = { access: dt.token, refresh: dt.refresh_token ?? "", expires: deviceExpiry(dt), deviceChat: true }
+      } else throw new Error(`${site.name} job token: status ${jr.status}: ${jr.text.trim().slice(0, 300)}`)
       let email = ""
       let name = ""
       try {
-        const ui = await openapi("/api/v1/userinfo", { token: dt.token })
+        const ui = await openapi(site, "/api/v1/userinfo", { token: dt.token })
         if (ui.status >= 200 && ui.status < 300) [email, name] = [ui.json?.email ?? "", ui.json?.name ?? ""]
       } catch {}
       return {
         type: "success",
-        access: jr.json.token,
-        refresh: jr.json.refresh_token ?? "",
-        expires: expiresAt(jr.json),
+        ...chat,
         accountId: email || dt.user_id,
         uid: dt.user_id,
         email,
-        name,
+        name: name || dt.user_name || "",
         machineId,
         deviceToken: dt.token,
         deviceRefresh: dt.refresh_token ?? "",
@@ -227,11 +247,11 @@ class SignInGone extends Error {
 
 // refreshJob trades the job token's refresh token for a new pair; the old
 // one is spent.
-async function refreshJob(refresh, user) {
-  if (!String(refresh ?? "").trim()) throw new SignInGone("Qoder: the sign-in lapsed; sign in again")
-  const r = await openapi("/api/v1/jobToken/refresh", { method: "POST", body: { refresh_token: refresh } })
+async function refreshJob(site, refresh, user) {
+  if (!String(refresh ?? "").trim()) throw new SignInGone(`${site.name}: the sign-in lapsed; sign in again`)
+  const r = await openapi(site, "/api/v1/jobToken/refresh", { method: "POST", body: { refresh_token: refresh } })
   if (r.status === 401 || r.status === 403)
-    throw new SignInGone(`${user}'s Qoder sign-in has expired — sign in again (qoder job token refresh: status ${r.status})`, true)
+    throw new SignInGone(`${user}'s ${site.name} sign-in has expired — sign in again (qoder job token refresh: status ${r.status})`, true)
   if (r.status !== 200) throw new Error(`qoder job token refresh: status ${r.status}`)
   if (!String(r.json?.token ?? "").trim() || !String(r.json?.refresh_token ?? "").trim())
     throw new Error("qoder job token refresh: incomplete token pair")
@@ -262,6 +282,14 @@ const MODELS = [
   { id: "dfmodel", name: "DeepSeek-Flash", context: 1_000_000, efforts: ["low", "high", "max"] },
   { id: "mmodel", name: "MiniMax-M3", context: 180_000 },
 ].map((m) => ({ images: true, ...m }))
+
+// Qoder CN's list when the account's can't be asked: the tiers Qoder CN's
+// CLI names (auto routes inside Qoder and isn't one model). The account's
+// own list, read once signed in, takes over from it.
+const CN_MODELS = [
+  ...MODELS.filter((m) => ["ultimate", "performance", "efficient"].includes(m.id)),
+  { id: "lite", name: "Lite" },
+]
 
 // freeOf reads whether the listing marks a model free, as Qoder's client
 // reads it (internal/qoder/models.go): is_free true, or a price_factor (the
@@ -313,10 +341,11 @@ function modelInfos(listing) {
     .map(modelInfo)
 }
 
-async function fetchListing(cred) {
-  const res = await fetch(MODELS_URL, { headers: cosyHeaders(MODELS_URL, cred, ""), signal: AbortSignal.timeout(15_000) })
+async function fetchListing(site, cred) {
+  const url = site.api + MODELS_PATH
+  const res = await fetch(url, { headers: cosyHeaders(url, cred, ""), signal: AbortSignal.timeout(15_000) })
   const text = await res.text()
-  if (!res.ok) throw new Error(`Qoder models: HTTP ${res.status}: ${text.trim().slice(0, 512)}`)
+  if (!res.ok) throw new Error(`${site.name} models: HTTP ${res.status}: ${text.trim().slice(0, 512)}`)
   return JSON.parse(text)
 }
 
@@ -330,12 +359,12 @@ function configModel(m) {
   }
 }
 
-function runtimeModel(m) {
+function runtimeModel(site, m) {
   return {
     id: m.id,
-    providerID: ID,
+    providerID: site.id,
     name: m.name ?? m.id,
-    api: { id: m.id, url: API, npm: CHAT },
+    api: { id: m.id, url: site.api, npm: CHAT },
     status: "active",
     headers: {},
     options: {},
@@ -785,11 +814,11 @@ class UsageStatus extends Error {
 }
 
 // fetchUsage is the usage envelope, {displayMode, qoderUsage}.
-async function fetchUsage(deviceToken) {
+async function fetchUsage(site, deviceToken) {
   if (!String(deviceToken ?? "").trim()) throw new Error("qoder usage: missing device token")
   let res
   try {
-    res = await fetch(OPENAPI + "/sash/api/v2/me/usage", {
+    res = await fetch(site.openapi + "/sash/api/v2/me/usage", {
       headers: { Accept: "application/json", Authorization: `Bearer ${deviceToken}`, "Cosy-ClientType": "10", "User-Agent": "Qoder" },
       signal: AbortSignal.timeout(20_000),
     })
@@ -810,25 +839,31 @@ async function fetchUsage(deviceToken) {
 
 // refreshDevice trades the device refresh token for a new pair; it rotates
 // too, so the caller saves it.
-async function refreshDevice(refresh) {
-  if (!String(refresh ?? "").trim()) throw new Error("qoder device token refresh: missing refresh token; sign in again")
+async function refreshDevice(site, refresh, chat = false) {
+  if (!String(refresh ?? "").trim()) {
+    if (chat) throw new SignInGone(`${site.name}: the sign-in lapsed; sign in again`)
+    throw new Error("qoder device token refresh: missing refresh token; sign in again")
+  }
   let r
   try {
-    r = await openapi("/api/v1/deviceToken/refresh", { method: "POST", body: { refresh_token: refresh } })
+    r = await openapi(site, "/api/v1/deviceToken/refresh", { method: "POST", body: { refresh_token: refresh } })
   } catch (e) {
     throw new Error(`qoder device token refresh: request failed: ${e?.message ?? e}`)
   }
   if (r.status !== 200) {
     const err = `qoder device token refresh: upstream HTTP ${r.status}`
-    // the device token serves only the account pages (usage); chat runs on
-    // the job token, so a refused one doesn't lapse the account
-    if (r.status === 401 || r.status === 403)
-      throw new Error(`Qoder usage is unavailable: Qoder refused the account-page sign-in (chat still works) — sign in again to see usage (${err})`)
+    if (r.status === 401 || r.status === 403) {
+      // a device token that is the chat token too: refused, the sign-in is gone
+      if (chat) throw new SignInGone(`${site.name} sign-in has expired — sign in again (${err})`, true)
+      // otherwise it serves only the account pages (usage); chat runs on
+      // the job token, so a refused one doesn't lapse the account
+      throw new Error(`${site.name} usage is unavailable: ${site.name} refused the account-page sign-in (chat still works) — sign in again to see usage (${err})`)
+    }
     throw new Error(err)
   }
   const token = r.json?.token || r.json?.device_token || ""
   if (!String(token).trim() || !String(r.json?.refresh_token ?? "").trim()) throw new Error("qoder device token refresh: incomplete token pair")
-  return { token, refresh: r.json.refresh_token }
+  return { token, refresh: r.json.refresh_token, expires: deviceExpiry(r.json) }
 }
 
 // gfmt is a number as Go's %g writes it.
@@ -880,7 +915,35 @@ function parseUsage(env) {
   return out
 }
 
-export async function QoderAuthPlugin({ client }) {
+// SITES are Qoder's two sites, each a subscription of its own.
+const SITES = {
+  qoder: {
+    id: "qoder",
+    name: "Qoder",
+    clientId: "732aef47-9cf2-46a2-95fe-4cebb5d0d1fa",
+    web: "https://qoder.com",
+    openapi: "https://openapi.qoder.sh",
+    api: "https://api3.qoder.sh",
+    redirect: "qoder-app://",
+    models: MODELS,
+  },
+  "qoder-cn": {
+    id: "qoder-cn",
+    name: "Qoder CN",
+    // the production client id of Qoder CN's CLI (@qodercn-ai/qoderclicn)
+    clientId: "e883ade2-e6e3-4d6d-adf7-f92ceff5fdcb",
+    web: "https://qoder.cn",
+    openapi: "https://openapi.qoder.com.cn",
+    api: "https://gateway.qoder.com.cn",
+    redirect: "", // Qoder CN's CLI sends none
+    deviceChat: true, // a refused job token falls back to the CLI's device-token chat
+    models: CN_MODELS,
+  },
+}
+
+const makePlugin = (site) => async ({ client }) => {
+  const ID = site.id
+  const CHAT_URL = site.api + CHAT_PATH
   // serializes checking, rotating and saving tokens: a refresh token is
   // spent once, so two refreshes would spend it twice
   let lock = Promise.resolve()
@@ -908,10 +971,18 @@ export async function QoderAuthPlugin({ client }) {
   const fresh = (getAuth) =>
     locked(async () => {
       const a = await getAuth()
-      if (a?.type !== "oauth" || !a.access || !a.uid) throw new SignInGone("Qoder: not signed in")
+      if (a?.type !== "oauth" || !a.access || !a.uid) throw new SignInGone(`${site.name}: not signed in`)
       if (a.expires - Date.now() > REFRESH_LEAD) return a
-      const jt = await refreshJob(a.refresh, a.accountId || a.email || a.uid)
-      const next = { ...a, access: jt.token, refresh: jt.refresh_token, expires: expiresAt(jt) }
+      let next
+      if (a.deviceChat) {
+        // the device token is the chat token: renewed as a device token,
+        // both pairs being the one pair
+        const dt = await refreshDevice(site, a.refresh, true)
+        next = { ...a, access: dt.token, refresh: dt.refresh, expires: dt.expires, deviceToken: dt.token, deviceRefresh: dt.refresh }
+      } else {
+        const jt = await refreshJob(site, a.refresh, a.accountId || a.email || a.uid)
+        next = { ...a, access: jt.token, refresh: jt.refresh_token, expires: expiresAt(jt) }
+      }
       await client.auth.set({ path: { id: ID }, body: next })
       renewals.add(next)
       return next
@@ -920,7 +991,7 @@ export async function QoderAuthPlugin({ client }) {
   const models = async (cred, again = false) => {
     let l = listings.get(cred.uid)
     if (!l || again) {
-      l = modelInfos(await fetchListing(cred))
+      l = modelInfos(await fetchListing(site, cred))
       listings.set(cred.uid, l)
     }
     return l
@@ -932,8 +1003,11 @@ export async function QoderAuthPlugin({ client }) {
     locked(async () => {
       const a = await getAuth()
       if (a?.deviceToken !== attempted) return a?.deviceToken
-      const dt = await refreshDevice(a.deviceRefresh)
-      await client.auth.set({ path: { id: ID }, body: { ...a, deviceToken: dt.token, deviceRefresh: dt.refresh } })
+      const dt = await refreshDevice(site, a.deviceRefresh, !!a.deviceChat)
+      const next = { ...a, deviceToken: dt.token, deviceRefresh: dt.refresh }
+      // the pair it spent was the chat pair too
+      if (a.deviceChat) Object.assign(next, { access: dt.token, refresh: dt.refresh, expires: dt.expires })
+      await client.auth.set({ path: { id: ID }, body: next })
       return dt.token
     })
 
@@ -948,10 +1022,10 @@ export async function QoderAuthPlugin({ client }) {
       if (renewed(cred)) signIn = "renewed"
       let env
       try {
-        env = await fetchUsage(cred.deviceToken)
+        env = await fetchUsage(site, cred.deviceToken)
       } catch (e) {
         if (!(e instanceof UsageStatus) || (e.status !== 401 && e.status !== 403)) throw e
-        env = await fetchUsage(await deviceToken(getAuth, cred.deviceToken))
+        env = await fetchUsage(site, await deviceToken(getAuth, cred.deviceToken))
       }
       return { ...parseUsage(env), signIn }
     } catch (e) {
@@ -962,7 +1036,7 @@ export async function QoderAuthPlugin({ client }) {
   const signedInError = (e) =>
     errorResponse({
       status: e instanceof SignInGone ? 401 : 502,
-      message: String(e?.message ?? e).replace(/^Qoder: /, ""),
+      message: String(e?.message ?? e).replace(new RegExp(`^${site.name}: `), ""),
       signIn: e?.expired ? "expired" : undefined,
     })
 
@@ -1002,7 +1076,7 @@ export async function QoderAuthPlugin({ client }) {
         const a = await getAuth()
         if (a?.type !== "oauth") return {}
         return {
-          baseURL: API,
+          baseURL: site.api,
           apiKey: "qoder",
           // every chat completion written as Qoder's own request
           async fetch(input, init = {}) {
@@ -1025,18 +1099,18 @@ export async function QoderAuthPlugin({ client }) {
           },
         }
       },
-      methods: [{ type: "oauth", label: "Sign in with Qoder", authorize: deviceSignIn }],
+      methods: [{ type: "oauth", label: `Sign in with ${site.name}`, authorize: () => deviceSignIn(site) }],
       usage,
     },
     async config(config) {
       config.provider ??= {}
       const was = config.provider[ID] ?? {}
       config.provider[ID] = {
-        name: "Qoder",
+        name: site.name,
         npm: CHAT,
-        api: API,
+        api: site.api,
         ...was,
-        models: { ...Object.fromEntries(MODELS.map((m) => [m.id, configModel(m)])), ...(was.models ?? {}) },
+        models: { ...Object.fromEntries(site.models.map((m) => [m.id, configModel(m)])), ...(was.models ?? {}) },
       }
     },
     // the account's own list, as Qoder's client asks it
@@ -1058,7 +1132,7 @@ export async function QoderAuthPlugin({ client }) {
           const ms = await models(cred, true)
           if (!ms.length) return provider.models
           return Object.fromEntries(
-            ms.map((m) => [m.key, runtimeModel({ id: m.key, name: m.name, context: m.context, images: m.images, efforts: m.thinks ? m.efforts : [], free: m.free })]),
+            ms.map((m) => [m.key, runtimeModel(site, { id: m.key, name: m.name, context: m.context, images: m.images, efforts: m.thinks ? m.efforts : [], free: m.free })]),
           )
         } catch {
           return provider.models
@@ -1068,5 +1142,8 @@ export async function QoderAuthPlugin({ client }) {
   }
 }
 
+export const QoderAuthPlugin = makePlugin(SITES.qoder)
+export const QoderCNAuthPlugin = makePlugin(SITES["qoder-cn"])
+
 // for tests
-export const _internal = { parseUsage, gfmt, when, failure, modelInfo }
+export const _internal = { parseUsage, gfmt, when, failure, modelInfo, SITES, decodeBody }
