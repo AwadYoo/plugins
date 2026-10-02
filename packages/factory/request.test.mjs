@@ -247,3 +247,55 @@ test("preserves a skill listing inside tool results and is idempotent after adap
   await l.fetch(url, { method: "POST", body: seen[0].body })
   expect(seen[1].body).toBe(seen[0].body)
 })
+
+test("adapts Claude 5 system-role runtime context without changing its role or instructions", async () => {
+  const { l, seen } = await loaded()
+  const environment = "# Environment\nYou have been invoked in the following environment: \n - Primary working directory: /tmp/project\n - Additional working directories:\n  - /extra/one\n  - C:\\extra two\n - Platform: darwin\n"
+  const skills = "The following skills are available for use with the Skill tool:\n\n" + configSkill + "\n- custom: Keep not Claude in this user's description."
+  for (const model of ["You are powered by the model named Sonnet 5.5. The exact model ID is factory/claude-sonnet-5-5. Assistant knowledge cutoff is June 2026.", "You are powered by the model group/claude-default."]) {
+    const context = environment + "\n" + model + "\n\n" + skills + "\n\nToday's date is 2026-10-02.\n\nKeep these session instructions verbatim."
+    const adapted = context.replace("# Environment", "# Runtime context")
+      .replace("You have been invoked in the following environment:", "The session environment is:")
+      .replace("You are powered by the model named", "Current model name:")
+      .replace("You are powered by the model", "Current model:")
+      .replace("The exact model ID is", "Model ID:")
+      .replace("Assistant knowledge cutoff is", "Model knowledge cutoff:")
+      .replace("not Claude", "not the assistant")
+    const request = {
+      system: [{ type: "text", text: droid }],
+      messages: [{ role: "user", content: [{ type: "text", text: "Reply OK.", cache_control: { type: "ephemeral" } }] }, { role: "system", content: context }],
+      tools: [{ name: "Read", input_schema: { type: "object", properties: { path: { type: "string" } } } }],
+      thinking: { type: "adaptive" }, stream: true,
+    }
+    for (const endpoint of [url, url + "/count_tokens"]) {
+      await l.fetch(endpoint, { method: "POST", body: JSON.stringify(request) })
+      expect(JSON.parse(seen.at(-1).body)).toEqual({ ...request, messages: [request.messages[0], { role: "system", content: adapted }] })
+    }
+  }
+})
+
+test("leaves ordinary system messages and incomplete context outside the generated shape unchanged", async () => {
+  const { l, seen } = await loaded()
+  const context = "# Environment\nYou have been invoked in the following environment:\n - Platform: linux\n\nYou are powered by the model custom-model."
+  for (const message of [
+    { role: "user", content: context },
+    { role: "assistant", content: context },
+    { role: "system", content: "Follow the user's instructions.\n\n" + context },
+    { role: "system", content: context.replace(" - Platform", "   - Platform") },
+    { role: "system", content: "You are powered by the model custom-model." },
+    { role: "system", content: [{ type: "text", text: context }] },
+  ]) {
+    const body = JSON.stringify({ system: droid, messages: [message] })
+    await l.fetch(url, { method: "POST", body })
+    expect(seen.at(-1).body).toBe(body)
+  }
+})
+
+test("system-role context adaptation is idempotent and preserves non-metadata paragraphs", async () => {
+  const { l, seen } = await loaded()
+  const context = "# Environment\nYou have been invoked in the following environment:\n - Platform: linux\n\nUser quoted: You are powered by the model custom-model.\n\nKeep the phrase not Claude in the instructions."
+  await l.fetch(url, { method: "POST", body: JSON.stringify({ system: droid, messages: [{ role: "system", content: context }] }) })
+  expect(JSON.parse(seen[0].body).messages[0].content).toBe(context.replace("# Environment", "# Runtime context").replace("You have been invoked in the following environment:", "The session environment is:"))
+  await l.fetch(url, { method: "POST", body: seen[0].body })
+  expect(seen[1].body).toBe(seen[0].body)
+})

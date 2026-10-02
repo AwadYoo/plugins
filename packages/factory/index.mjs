@@ -589,6 +589,29 @@ const SKILL_REMINDER = /^<system-reminder>\nThe following skills are available f
 const CONFIG_SKILL_METADATA = '- update-config: Use this skill to configure the Claude Code harness via settings.json. Automated behaviors ("from now on when X", "each time X", "whenever X", "before/after X") require hooks configured in settings.json - the harness executes these, not Claude, so memory/preferences cannot fulfill them.'
 const CONFIG_SKILL_COMPAT = CONFIG_SKILL_METADATA.replace("not Claude", "not the assistant")
 
+// Claude 5 also sends its runtime metadata as a string-content system
+// message, instead of user-message reminders. Preserve that role and all
+// instructions; only the known environment paragraph opens this adapter.
+const SYSTEM_ENV_CONTEXT = /^# Environment\nYou have been invoked in the following environment:[ \t]*\n(?: {1,2}- [^\n]*\n)+(?=\n|$)/
+const SYSTEM_MODEL_CONTEXT = /(^|\n\n)You are powered by the model (?:named )?[^\n<>]+\.(?=\n\n|$)/g
+function systemContext(text) {
+  if (!SYSTEM_ENV_CONTEXT.test(text)) return text
+  let out = text.replace("# Environment", "# Runtime context")
+    .replace("You have been invoked in the following environment:", "The session environment is:")
+    .replace(SYSTEM_MODEL_CONTEXT, (paragraph) => paragraph
+      .replace("You are powered by the model named", "Current model name:")
+      .replace("You are powered by the model", "Current model:")
+      .replace("The exact model ID is", "Model ID:")
+      .replace("Assistant knowledge cutoff is", "Model knowledge cutoff:"))
+  const skillHeader = "\n\nThe following skills are available for use with the Skill tool:\n\n"
+  const skills = out.indexOf(skillHeader)
+  if (skills >= 0) {
+    const start = skills + skillHeader.length - 1
+    out = out.slice(0, start) + out.slice(start).replace("\n" + CONFIG_SKILL_METADATA, "\n" + CONFIG_SKILL_COMPAT)
+  }
+  return out
+}
+
 function anthropicBody(body) {
   let request
   try {
@@ -646,6 +669,14 @@ function anthropicBody(body) {
   if (changed) request.system = kept
 
   for (const message of request.messages) {
+    if (message?.role === "system" && typeof message.content === "string") {
+      const adapted = systemContext(message.content)
+      if (adapted !== message.content) {
+        message.content = adapted
+        changed = true
+      }
+      continue
+    }
     if (message?.role !== "user" || !Array.isArray(message.content)) continue
     for (const block of message.content) {
       if (block?.type !== "text" || typeof block.text !== "string") continue
