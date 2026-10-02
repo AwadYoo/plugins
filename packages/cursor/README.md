@@ -43,8 +43,18 @@ plugin's `fetch` answers them on Cursor's agent API:
   system prompt; the model calls them through Cursor's `CallDynamicTool`,
   and the calls come back as chat completion tool calls. Cursor's own tools
   (shell, file reads, edits) are never run.
+- A conversation's Runs share one `conversation_id`, so Cursor sends them
+  to the machine that has the prompt cached (Grok on Cursor caches by
+  machine). It is made from what names the session — the request's
+  `prompt_cache_key` (Codex's thread id), else the session the
+  `chat.headers` hook is told — and the conversation's first user message,
+  so subagents under one session are conversations of their own. With
+  nothing naming the session, each Run has a new one.
 - Text, thinking (`reasoning_content`) and token usage come back streamed
-  or not. Failures keep their statuses: 401 to sign in again, 429 at the
+  or not. Cursor's `input_tokens` counts the cached prompt too: the cache
+  read and written is taken out of it, and given as `cached_tokens` and
+  `cache_write_tokens`, so it is counted once; its reasoning tokens are
+  `reasoning_tokens`. Failures keep their statuses: 401 to sign in again, 429 at the
   usage limit, 400 for a prompt too long, 403 for a region refusal.
 
 ## Models

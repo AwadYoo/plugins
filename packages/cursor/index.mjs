@@ -1020,10 +1020,72 @@ function toolDef(t) {
 
 const env = () => pb().str(1, GOOS).str(2, tmpdir()).str(10, "UTC")
 
+// SESSION carries the session magpie (or OpenCode) names a request's
+// conversation by, from the chat.headers hook to the loader's fetch. It
+// goes no further: nothing of the request's headers is sent to Cursor.
+const SESSION = "x-magpie-cursor-session"
+
+// sessionOf is the session a chat.headers hook is told, "" when it names
+// none. magpie, with no session header from the agent, makes one of the
+// conversation's first user message ("magpie-" and 24 hex digits): that
+// names no session, and is taken as none, as the built-in's
+// nativeSessionOf takes no such header as none.
+function sessionOf(input) {
+  const s = String(input?.sessionID ?? "").trim()
+  if (!s || /^magpie-[0-9a-f]{24}$/.test(s)) return ""
+  return s.slice(0, 128)
+}
+
+// uuidOf is a version 4 UUID made of a hash's first 16 bytes.
+function uuidOf(b) {
+  b = Buffer.from(b.subarray(0, 16))
+  b[6] = (b[6] & 0x0f) | 0x40
+  b[8] = (b[8] & 0x3f) | 0x80
+  const h = b.toString("hex")
+  return `${h.slice(0, 8)}-${h.slice(8, 12)}-${h.slice(12, 16)}-${h.slice(16, 20)}-${h.slice(20)}`
+}
+
+// conversationID is the AgentRunRequest's conversation_id for a
+// conversation, as the built-in's cursorConversation makes it (magpie
+// #498): the same on every request of it, so that Cursor's backend keeps
+// sending it to the machine that has its prompt cached — Grok on Cursor
+// caches by machine. Cursor's own client keeps one conversationId per
+// agent session, so it is made from what names the session — the
+// client's prompt_cache_key (Codex's thread id), else the session magpie
+// or OpenCode names — together with the conversation's first user
+// message, which every later request repeats: subagents running at once
+// under one session (Claude Code's Task agents share its session id) are
+// separate conversations to Cursor, as they are to its own client. With
+// nothing naming the session it is "", and each Run gets a new id as
+// before: a first message alone ("hi") would put strangers' conversations
+// under one id.
+function conversationID(chat, session) {
+  const key = (typeof chat?.prompt_cache_key === "string" ? chat.prompt_cache_key.trim() : "") || session || ""
+  if (!key) return ""
+  const msgs = Array.isArray(chat?.messages) ? chat.messages : []
+  const first = msgs.find((m) => m?.role === "user") ?? msgs[0]
+  const sum = createHash("sha256")
+    .update("cursor conversation\0" + key + "\0" + (first === undefined ? "" : JSON.stringify(first)))
+    .digest()
+  return uuidOf(sum)
+}
+
+// usageOf is a TurnEndedUpdate as magpie counts usage, as the built-in's
+// cursorUsage has it (magpie #498). Its input_tokens is the whole prompt,
+// what was read from the cache and written to it included, as Cursor's
+// own client has it (it takes both out to get the prompt's uncached
+// rest); input is that rest, the cache added back for prompt_tokens. Its
+// reasoning_tokens is kept as reasoning.
+function usageOf(uf) {
+  const [inp, cr, cw] = [pbNum(uf, 1), pbNum(uf, 3), pbNum(uf, 4)]
+  return { input: Math.max(inp - cr - cw, 0), output: pbNum(uf, 2), cacheRead: cr, cacheWrite: cw, reasoning: pbNum(uf, 5) }
+}
+
 // buildRun is the Run's first message, an AgentClientMessage with its
 // run_request, and the blobs it names. The conversation state is the
 // messages and one turn, which the server wants there to sample at all.
-function buildRun(msgs, lastUser, tools, model) {
+// conv is the conversation_id (conversationID), a new one when "".
+function buildRun(msgs, lastUser, tools, model, conv = "") {
   const blobs = new Map()
   const put = (b) => {
     const id = createHash("sha256").update(b).digest()
@@ -1049,7 +1111,7 @@ function buildRun(msgs, lastUser, tools, model) {
     .bytes(2, action)
     .bytes(3, pb().str(1, model).str(3, model).str(4, model))
     .bytes(4, mcp)
-    .str(5, randomUUID())
+    .str(5, conv || randomUUID())
     .bytes(9, pb().str(1, model))
     .varint(19, 1) // inline images
   return { first: pb().bytes(1, rr).done(), blobs }
@@ -1117,8 +1179,8 @@ function open(base, headers, signal) {
 
 // runOnce is one Run of the chat on the agent API at base: an async
 // iterator of the answer's pieces, or the error it failed with before any.
-async function runOnce({ tok, base, id, tools, conv, signal }) {
-  const { first, blobs } = buildRun(conv.msgs, conv.last, tools, id)
+async function runOnce({ tok, base, id, tools, conv, convID, signal }) {
+  const { first, blobs } = buildRun(conv.msgs, conv.last, tools, id, convID)
   const o = await open(
     base,
     {
@@ -1191,10 +1253,12 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
   let calls = 0
   let listed = 0
   let said = 0
-  let usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }
+  let usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, reasoning: 0 }
   const finish = () => {
     if (!usage.output) usage.output = Math.floor((said + 3) / 4)
-    if (!usage.input) usage.input = estimate
+    // a guess only when Cursor counted nothing: a prompt read whole from
+    // the cache leaves no uncached rest, and is no reason to guess
+    if (!usage.input && !usage.cacheRead && !usage.cacheWrite) usage.input = estimate
     const prompt = usage.input + usage.cacheRead + usage.cacheWrite
     return {
       stop: calls > 0 ? "tool_calls" : "stop",
@@ -1203,6 +1267,7 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
         completion_tokens: usage.output,
         total_tokens: prompt + usage.output,
         prompt_tokens_details: { cached_tokens: usage.cacheRead, cache_write_tokens: usage.cacheWrite },
+        ...(usage.reasoning ? { completion_tokens_details: { reasoning_tokens: usage.reasoning } } : {}),
       },
     }
   }
@@ -1241,7 +1306,7 @@ async function* decode(stream, { send, blobs, tools, estimate }) {
                   break
                 }
                 case 14: // turn ended, with what it used
-                  usage = { input: pbNum(uf, 1), output: pbNum(uf, 2), cacheRead: pbNum(uf, 3), cacheWrite: pbNum(uf, 4) }
+                  usage = usageOf(uf)
                   if (calls === 0) {
                     yield finish()
                     return
@@ -1371,11 +1436,11 @@ function kept(res) {
 }
 
 // answer runs a chat completion on Cursor, the account kept (errorResponse).
-const answer = async (auth, chat, signal) => kept(await answerOf(auth, chat, signal))
+const answer = async (auth, chat, signal, session) => kept(await answerOf(auth, chat, signal, session))
 
 // answerOf runs a chat completion on Cursor and answers it as one, streamed
 // or not.
-async function answerOf(auth, chat, signal) {
+async function answerOf(auth, chat, signal, session = "") {
   let tok
   try {
     tok = await tokenOf(auth)
@@ -1393,13 +1458,14 @@ async function answerOf(auth, chat, signal) {
   if (id === "auto") id = "default" // Cursor's pick, which its API calls default
   const tools = toolsOf(chat)
   const conv = conversation(chat, tools)
+  const convID = conversationID(chat, session)
   const base = await agentURL(tok, false)
-  let r = await runOnce({ tok, base, id, tools, conv, signal })
+  let r = await runOnce({ tok, base, id, tools, conv, convID, signal })
   if (r.error && regional(r.error.message)) {
     // the team moved, or the config was kept from before: once more with
     // what the config says now
     const fresh = await agentURL(tok, true)
-    if (fresh !== base) r = await runOnce({ tok, base: fresh, id, tools, conv, signal })
+    if (fresh !== base) r = await runOnce({ tok, base: fresh, id, tools, conv, convID, signal })
   }
   if (r.error) return errorResponse(r.error)
   const it = r.events
@@ -1480,7 +1546,8 @@ export async function CursorAuthPlugin() {
             } catch {
               return errorResponse({ status: 400, message: "a request that isn't JSON" })
             }
-            return answer((await getAuth()) ?? auth, chat, init.signal ?? (input instanceof Request ? input.signal : undefined))
+            const session = new Headers(init.headers ?? (input instanceof Request ? input.headers : undefined)).get(SESSION) ?? ""
+            return answer((await getAuth()) ?? auth, chat, init.signal ?? (input instanceof Request ? input.signal : undefined), session)
           },
         }
       },
@@ -1502,6 +1569,15 @@ export async function CursorAuthPlugin() {
         const [u, plan] = await Promise.all([usage(tok, Object.keys(provider?.models ?? {})), planOf(tok)])
         return { ...u, ...(plan ? { plan } : {}), signIn: "kept" }
       },
+    },
+    // the session the request is part of, for the conversation_id
+    // (conversationID): magpie and OpenCode name it here, and the loader's
+    // fetch reads it back. Every plugin's hook sees every provider's
+    // requests, so it is put on Cursor's alone.
+    async "chat.headers"(input, output) {
+      if (input?.model?.providerID !== ID && input?.provider?.info?.id !== ID) return
+      const s = sessionOf(input)
+      if (s) output.headers[SESSION] = s
     },
     async config(config) {
       config.provider ??= {}
@@ -1533,4 +1609,4 @@ export async function CursorAuthPlugin() {
 }
 
 // for tests
-export const _internal = { errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
+export const _internal = { conversationID, usageOf, sessionOf, SESSION, errorResponse, kept, poolBase, splitID, families, byEffort, offered, modelID, conversation, buildRun, decode, exec, fields, pb, pbValue, pbAny, frame, frames, failure, toolsOf, expiry }
