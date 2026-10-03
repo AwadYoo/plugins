@@ -6,6 +6,9 @@
 // agent's /api/agent/v3/llm_utils_chat, which answers in its own SSE
 // events. Worked out from two open-source relays (wangqi233/trae2api and
 // autumnsentiment/Trae2api-cn); not run against a real account here.
+// The account's fetch also sends Trae CN's own pages on api.trae.cn
+// (/trae/api/…) as the account, for magpie's daily check-in (每日签到:
+// /trae/api/v2/ug/checkin_credits/status, then /claim).
 import { randomBytes, randomUUID, randomInt } from "node:crypto"
 import { createServer, STATUS_CODES } from "node:http"
 
@@ -130,6 +133,18 @@ function fromAuth(auth) {
 function apiOf(a) {
   const h = String(a?.api ?? "").replace(/\/+$/, "")
   return /mchost\.guru|trae-api-/i.test(h) ? h : HOSTS.api
+}
+
+// ownPage: url is one of Trae CN's own JSON pages on api.trae.cn
+// (/trae/api/…: the daily check-in, credits), which the account's fetch
+// sends as the account rather than as a chat
+function ownPage(url) {
+  try {
+    const u = new URL(url)
+    return u.origin === new URL(HOSTS.auth).origin && u.pathname.startsWith("/trae/api/")
+  } catch {
+    return false
+  }
 }
 
 // ---- errors --------------------------------------------------------------------
@@ -819,6 +834,32 @@ export const TraeCNAuthPlugin = async ({ client }) => {
     return { status: res.status, text, v: parseJSON(text) }
   }
 
+  // ownRequest sends a request for one of Trae CN's own JSON pages as the
+  // account, as its IDE does: magpie asks the daily check-in
+  // (/trae/api/v2/ug/checkin_credits/status, then /claim) through the
+  // account's fetch, as it does WorkBuddy's. Trae's answer comes back as it
+  // is; a token it turned away (401, or code 1001 in a 200) marks the
+  // sign-in, as usage does.
+  const ownRequest = async (getAuth, a0, url, method, body, signal) => {
+    let a
+    try {
+      a = await fresh(getAuth)
+    } catch (e) {
+      if (e instanceof Expired) return errorResponse(401, `${a0.name || a0.uid}: ${e.message}`, "expired")
+      throw e
+    }
+    const res = await fetch(url, {
+      method,
+      headers: ideHeaders(a, { Accept: "application/json" }),
+      body: method === "GET" || method === "HEAD" ? undefined : typeof body === "string" ? body : "{}",
+      signal: signal ?? AbortSignal.timeout(20_000),
+    })
+    const text = await res.text()
+    const lapsed = res.status === 401 || lapsedCode(errorOf(text).code)
+    const headers = { "content-type": res.headers.get("content-type") ?? "application/json", "X-Magpie-Sign-In": lapsed ? "expired" : a.renewed ? "renewed" : "kept" }
+    return new Response(text, { status: res.status, headers })
+  }
+
   const usage = async (getAuth) => {
     let a
     try {
@@ -981,6 +1022,8 @@ export const TraeCNAuthPlugin = async ({ client }) => {
             let body = init.body ?? (r0 ? await r0.text() : undefined)
             if (body instanceof ArrayBuffer) body = new TextDecoder().decode(body)
             else if (ArrayBuffer.isView(body)) body = new TextDecoder().decode(new Uint8Array(body.buffer, body.byteOffset, body.byteLength))
+            const url = r0 ? r0.url : input instanceof URL ? input.href : String(input)
+            if (ownPage(url)) return ownRequest(getAuth, a0, url, init.method ?? r0?.method ?? "POST", body, init.signal ?? r0?.signal)
             const req = parseJSON(body)
             if (!Array.isArray(req.messages)) return errorResponse(400, "Trae CN: only chat completions are served")
             let a
