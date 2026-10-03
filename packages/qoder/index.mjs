@@ -340,15 +340,51 @@ function rateOf(raw) {
   return { rate, rateWas }
 }
 
+// windowsOf reads the context windows a listing entry offers, smallest
+// first, and the one Qoder's client picks unless asked for another:
+// context_config's entries ({"200k": {token_count: 200000, is_default:
+// true}, "1m": {token_count: 1000000}, …}), else available_context_windows,
+// as Qoder's client reads them (qodercli's catalog). Qoder's Context
+// setting (200K / 400K / 1M) offers them on Qwen3.8-Flash and the rest;
+// max_input_tokens (180K there) is only what a request that names none
+// gets.
+function windowsOf(raw) {
+  const n = (v) => (Number.isInteger(v) && v > 0 ? v : 0)
+  const windows = []
+  let def = 0
+  const cc = raw?.context_config ?? raw?.contextConfig
+  if (cc && typeof cc === "object" && !Array.isArray(cc)) {
+    for (const e of Object.values(cc)) {
+      const t = n(e?.token_count)
+      if (!t) continue
+      if (!windows.includes(t)) windows.push(t)
+      if (e.is_default === true || e.is_default === 1 || e.is_default === "1") def = t
+    }
+  }
+  if (!windows.length) {
+    const list = raw?.available_context_windows ?? raw?.availableContextWindows
+    for (const v of Array.isArray(list) ? list : []) if (n(v) && !windows.includes(v)) windows.push(v)
+    def = n(raw?.default_context_window ?? raw?.defaultContextWindow)
+    if (!windows.includes(def)) def = 0
+  }
+  windows.sort((a, b) => a - b)
+  return { windows, defaultWindow: def }
+}
+
 // modelInfo reads one entry of the listing's "chat" array: its efforts and
-// default from thinking_config (is_reasoning alone when it has none).
+// default from thinking_config (is_reasoning alone when it has none), and
+// its context: the largest window it offers (windowsOf), since a request
+// that needs more than the default is sent a larger one (windowFor).
 function modelInfo(raw) {
+  const { windows, defaultWindow } = windowsOf(raw)
   const m = {
     key: raw.key,
     source: raw.source ?? "",
     name: raw.display_name || raw.key,
     images: !!raw.is_vl,
-    context: raw.max_input_tokens || 0,
+    context: windows.length ? windows[windows.length - 1] : raw.max_input_tokens || 0,
+    windows,
+    defaultWindow,
     thinks: !!raw.is_reasoning,
     alwaysThinks: false,
     efforts: Array.isArray(raw.reasoning_efforts) ? [...raw.reasoning_efforts] : [],
@@ -533,6 +569,22 @@ function qoderMessages(msgs) {
   return out
 }
 
+// windowFor is the context window a request is sent (context_length) on a
+// model that offers several: the one Qoder's client picks by default
+// (max_input_tokens without one) while the request fits it, else the
+// smallest that holds it, else the largest. A larger window may cost more
+// (Qoder: changing the Context "may change the rate"), so it is asked for
+// only when the conversation needs it. The request's size is counted
+// generously, a token for every 3 bytes of its UTF-8 JSON, so a window is
+// raised a little early rather than late.
+function windowFor(chat, m) {
+  const base = m.defaultWindow || (m.config?.max_input_tokens > 0 ? m.config.max_input_tokens : 0) || m.context
+  if (!m.windows?.length) return m.context
+  const need = Math.ceil(Buffer.byteLength(JSON.stringify({ m: chat.messages ?? [], t: chat.tools ?? [] })) / 3)
+  if (base > 0 && need <= base) return base
+  return m.windows.find((w) => w >= need) ?? m.windows[m.windows.length - 1]
+}
+
 // qoderBody is the plaintext agent_chat_generation takes for a chat
 // completion request, for model m.
 function qoderBody(chat, m) {
@@ -544,7 +596,8 @@ function qoderBody(chat, m) {
   const [thinking, effort] = effortFor(chat.reasoning_effort, m)
   const params = { enable_thinking: thinking, max_tokens: chat.max_completion_tokens || chat.max_tokens || 32000 }
   if (effort) params.reasoning_effort = effort
-  if (m.context > 0) params.context_length = m.context
+  const window = windowFor(chat, m)
+  if (window > 0) params.context_length = window
   const body = {
     parameters: params,
     business: { product: "app", version: COSY_VERSION, type: "agent", id: hexID(), name: "magpie session", begin_at: Date.now(), stage: "start" },
@@ -1253,4 +1306,4 @@ export const QoderAuthPlugin = makePlugin(SITES.qoder)
 export const QoderCNAuthPlugin = makePlugin(SITES["qoder-cn"])
 
 // for tests
-export const _internal = { parseUsage, gfmt, when, failure, modelInfo, SITES, decodeBody, events }
+export const _internal = { parseUsage, gfmt, when, failure, modelInfo, qoderBody, SITES, decodeBody, events }

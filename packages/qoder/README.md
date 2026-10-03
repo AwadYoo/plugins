@@ -62,6 +62,10 @@ itself.
   - The nearest level to the one asked, the higher one on a tie.
   - The model's default when none is asked.
   - The lowest level for "none", when the model can't turn thinking off.
+- It picks the context window (`context_length`) from the model's own
+  windows (Qoder's Context setting: 200K, 400K, 1M): the default while the
+  request fits it, else the smallest that holds it, else the largest. A
+  larger window may cost more, so it is asked for only when needed.
 - It encodes the body with the client's codec and signs the call with the
   client's COSY envelope. The envelope carries:
   - the account, AES-encrypted, with the key wrapped by Qoder's RSA key;
@@ -89,7 +93,11 @@ itself.
 The `provider.models` hook reads the account's own list, as Qoder's client
 asks for it (`/algo/api/v2/model/list`). It keeps the enabled chat models
 and leaves out "auto" and "default", which route inside Qoder. It takes
-each model's reasoning levels from its `thinking_config`.
+each model's reasoning levels from its `thinking_config`, and its context
+from its `context_config`: the largest window it offers (Qoder's docs
+give Qwen3.8-Flash 200K, 400K and 1M), not `max_input_tokens` (180K
+there), which is only what a request naming no window gets. A model listed
+with no windows keeps `max_input_tokens`.
 
 The `config` hook declares the list as it was on 2026-09-30:
 
