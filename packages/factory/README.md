@@ -131,3 +131,20 @@ organization region and upstream API. Connectivity has been verified with
 Sonnet 4.6, Sonnet 5.5 and Opus 5.5. Two-turn Read tool calls with Claude
 Code's default tool set have been verified with Sonnet 4.6 and Sonnet 5.5,
 including Sonnet 5.5 selected through a routing group.
+
+## Tool schema compatibility
+
+Factory's Anthropic route rejects tool schemas with root-level `anyOf`,
+`oneOf` or `allOf`. The plugin nests those schemas under an internal
+`arguments` property instead of removing their branch constraints. It
+wraps examples and previous tool inputs too, then unwraps tool replies
+before returning them to OpenCode or magpie. Ordinary object schemas and
+OpenAI routes keep their existing behavior.
+
+Local schema pointers are rebased to the nested schema; `$id` resources
+and anchors retain their resolution scope, and literal data is unchanged.
+Recursive schema resources
+without `$id` fail explicitly because nesting would change their scope.
+Affected streaming tool arguments are buffered until their content block
+is complete. Other events, tool ids, usage and upstream errors pass through;
+an incomplete or invalid argument envelope fails instead of being executed.

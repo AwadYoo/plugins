@@ -4,6 +4,7 @@
 // built-in Factory account (internal/provider/factory*.go).
 
 import { STATUS_CODES } from "node:http"
+import { parseToolJSON, wrapAnthropicTools, unwrapAnthropicTools } from "./anthropic-tools.mjs"
 
 const PROVIDER = "factory"
 
@@ -676,7 +677,7 @@ function anthropicBody(body) {
     const text = typeof body === "string" ? body
       : body instanceof ArrayBuffer ? Buffer.from(body).toString("utf8")
       : ArrayBuffer.isView(body) ? Buffer.from(body.buffer, body.byteOffset, body.byteLength).toString("utf8") : ""
-    request = JSON.parse(text)
+    request = parseToolJSON(text)
   } catch {
     return body
   }
@@ -1095,10 +1096,12 @@ export const FactoryAuthPlugin = async ({ client }) => {
           // which Anthropic's SDK sends beside the bearer token
           if (path.includes("/llm/a/")) h.set("X-Api-Key", "placeholder")
           // another agent's request opens as droid's does (droidBody)
-          const out = path.includes("/llm/a/") && (path.endsWith("/messages") || path.endsWith("/messages/count_tokens"))
-            ? anthropicBody(body) : droidBody(path, body)
+          const anthropic = path.includes("/llm/a/") && (path.endsWith("/messages") || path.endsWith("/messages/count_tokens"))
+          const adapted = anthropic ? wrapAnthropicTools(anthropicBody(body)) : { body: droidBody(path, body), names: new Set() }
+          const out = adapted.body
           if (out !== body) h.delete("content-length")
-          return fetch(url, { ...init, method: init?.method ?? (input instanceof Request ? input.method : "POST"), headers: h, body: out })
+          const res = await fetch(url, { ...init, method: init?.method ?? (input instanceof Request ? input.method : "POST"), headers: h, body: out })
+          return path.endsWith("/messages") ? unwrapAnthropicTools(res, adapted.names) : res
         }
 
         return {
