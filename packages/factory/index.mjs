@@ -16,6 +16,10 @@ const CLIENT_ID = "client_01HNM792M5G5G1A2THWPXKFMXB"
 const VERSION = "0.231.0"
 // how long before an access token lapses it is renewed (droid: a minute)
 const REFRESH_LEAD = 2 * 60 * 1000
+// and how long before, magpie renews it ahead of time (auth.refresh): a
+// minute more, so under magpie the check before a request finds it fresh.
+// WorkOS's access tokens are short-lived, so not much more
+const MAGPIE_LEAD = 3 * 60 * 1000
 // how long an account whose whoami failed waits before asking again
 const ASK_AGAIN = 10 * 60 * 1000
 
@@ -757,6 +761,24 @@ export const FactoryAuthPlugin = async ({ client }) => {
     lock = run.catch(() => {})
     return run
   }
+  // renewed is what each refresh this process ran gave, by the refresh
+  // token it spent: a sign-in still holding that one (magpie not yet
+  // saving what auth.refresh gave, or a save that failed) goes on with
+  // the new tokens rather than spending the old one again
+  const renewed = new Map()
+  const took = (spent, c) => {
+    for (const [k, v] of renewed) if (v.expires > 0 && Date.now() >= v.expires) renewed.delete(k)
+    renewed.set(spent, { access: c.access, refresh: c.refresh, expires: c.expires, orgId: c.orgId, activeOrganizationId: c.activeOrganizationId, region: c.region, premBaseHost: c.premBaseHost })
+  }
+  // latest is c with the newest tokens this process got for it
+  const latest = (c) => {
+    for (let i = 0; i < 16 && c.refresh; i++) {
+      const got = renewed.get(c.refresh)
+      if (!got || got.access === c.access || (c.expires > 0 && got.expires > 0 && got.expires <= c.expires)) break
+      c = { ...c, ...got }
+    }
+    return c
+  }
   // when each account last asked whoami for its org, so one whoami can't
   // answer doesn't ask before every request, nor hold back the others
   const asked = new Map()
@@ -819,16 +841,17 @@ export const FactoryAuthPlugin = async ({ client }) => {
     // it was, the built-in's clearing of the account's lapse.
     const fresh = (renewed) =>
       locked(async () => {
-        const c = await current()
+        const c = latest(await current())
         if (c.key) return keyed(c) // an API key: nothing to renew, and no org with it
         if ((c.expires > 0 && Date.now() < c.expires - REFRESH_LEAD) || !c.refresh) return orgOf(c)
+        const spent = c.refresh
         let t
         try {
-          t = await renew(c.refresh, "")
+          t = await renew(spent, "")
         } catch (e) {
           // a hiccup while the token still runs: go on with it
           if (!refused(e) && c.expires > 0 && Date.now() < c.expires) return orgOf(c)
-          if (refused(e)) throw Object.assign(new Error(`${c.accountId || "the account"}'s Factory sign-in has expired — sign in again (${e.message})`), { lapsed: true })
+          if (refused(e)) throw lapsed(c, e)
           throw e
         }
         c.access = t.access_token
@@ -837,6 +860,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
         // droid asks whoami again for each new token, keeping the org it names
         await reconcile(c)
         ask(c)
+        took(spent, c)
         await save(c)
         renewed?.()
         return c
@@ -852,7 +876,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
       locked(async () => {
         if (status !== 403) return false
         const isOrg = orgRefused(status, text)
-        const c = await current()
+        const c = latest(await current())
         if (c.key) return false // an API key carries no org droid would send
         if (c.activeOrganizationId) {
           if (!isOrg) return false // the org was sent: the refusal is about something else
@@ -877,9 +901,10 @@ export const FactoryAuthPlugin = async ({ client }) => {
           org = await firstOrg(c)
         } catch {}
         if (!org) return false
+        const spent = c.refresh
         let t
         try {
-          t = await renew(c.refresh, org)
+          t = await renew(spent, org)
         } catch {
           return false
         }
@@ -887,6 +912,7 @@ export const FactoryAuthPlugin = async ({ client }) => {
         c.expires = expiry(t.access_token)
         c.orgId = org
         if (t.refresh_token) c.refresh = t.refresh_token
+        took(spent, c)
         await save(c)
         renewed?.()
         return true
@@ -928,6 +954,18 @@ export const FactoryAuthPlugin = async ({ client }) => {
     return { fresh, mendOrg, usage }
   }
 
+  // lapsed is WorkOS refusing c's refresh token for good: the account
+  // needs signing in again
+  const lapsed = (c, e) =>
+    Object.assign(new Error(`${c.accountId || "the account"}'s Factory sign-in has expired — sign in again (${e.message})`), { lapsed: true, signIn: "expired" })
+
+  // renewal is what of c magpie keeps over the stored sign-in
+  const renewal = (c) => {
+    const out = { access: c.access, refresh: c.refresh, expires: c.expires }
+    for (const k of ["orgId", "activeOrganizationId", "region", "premBaseHost"]) if (typeof c[k] === "string") out[k] = c[k]
+    return out
+  }
+
   return {
     config: async (config) => {
       config.provider ??= {}
@@ -951,6 +989,35 @@ export const FactoryAuthPlugin = async ({ client }) => {
         // droid's FACTORY_API_KEY: the key is the bearer, never renewed
         { type: "api", label: "Factory API key (fk-…)", placeholder: "fk-…" },
       ],
+      // magpie renews the sign-in MAGPIE_LEAD before its end, before its
+      // requests and usage ask for it, and saves what this gives. Under
+      // the same lock as the renewal before a request, so the two never
+      // spend one refresh token; that check stays for OpenCode, which
+      // doesn't call this
+      refreshLead: MAGPIE_LEAD,
+      async refresh(auth) {
+        if (auth?.type !== "oauth" || !auth.access || !auth.refresh) return undefined
+        return locked(async () => {
+          const c = latest({ ...auth })
+          // renewed here already, the store not yet saying so
+          if (c.access !== auth.access && c.expires > 0 && Date.now() < c.expires - MAGPIE_LEAD) return renewal(c)
+          const spent = c.refresh
+          let t
+          try {
+            t = await renew(spent, "")
+          } catch (e) {
+            if (refused(e)) throw lapsed(c, e)
+            throw e
+          }
+          c.access = t.access_token
+          c.expires = expiry(t.access_token)
+          if (t.refresh_token) c.refresh = t.refresh_token
+          await reconcile(c)
+          ask(c)
+          took(spent, c)
+          return renewal(c)
+        })
+      },
       // magpie's own hook: the account's limits
       async usage(getAuth) {
         return account(getAuth).usage()

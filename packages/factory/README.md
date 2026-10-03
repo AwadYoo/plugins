@@ -29,9 +29,18 @@ The sign-in is kept wherever the host keeps provider sign-ins:
 It holds WorkOS's access and refresh tokens, with the organization,
 region and host.
 
-**Refreshing.** The access token is renewed two minutes before it lapses.
-WorkOS rotates the refresh token, so the plugin never runs two refreshes
-at once.
+**Refreshing.**
+- magpie renews the access token three minutes before it lapses, through
+  the plugin's `auth.refresh`, once for the account and before its
+  requests and usage need it; magpie saves the new tokens. OpenCode
+  doesn't call that hook: there the token is renewed two minutes before it
+  lapses, before a request, and the plugin saves it.
+- WorkOS rotates the refresh token, so the plugin never runs two refreshes
+  at once, and never spends one refresh token twice: a request that comes
+  before magpie has saved a renewal goes on with the new tokens.
+- The account counts as signed out only when WorkOS refuses the refresh
+  token (a 4xx other than 429). Any other failure keeps the sign-in, and
+  the current token is used while it lasts.
 
 **Refusals.** If Factory refuses the organization a request names, the
 plugin asks `whoami` again and resends the request once. If the refusal
