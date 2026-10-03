@@ -474,7 +474,9 @@ function capacity(v) {
 const compact = (n) => (Number.isInteger(n) ? String(n) : n.toFixed(2).replace(/0+$/, "").replace(/\.$/, ""))
 
 // usageOf is the account's credits, from its resource summary: the plan's
-// credits used against what the cycle grants, as magpie's built-in said.
+// credits used against what the cycle grants, as magpie's built-in said —
+// the count itself too (amount of limit, in credits), for magpie to say it
+// as used or left beside the share (magpie#659).
 function usageOf(sum, plan) {
   const out = { plan: plan || (sum?.IsPaidUser ? "Pro" : "Free"), windows: [] }
   let total = 0, used = 0
@@ -482,7 +484,7 @@ function usageOf(sum, plan) {
     total += capacity(p?.CycleTotalCapacity)
     used += capacity(p?.CycleUsedCapacity)
   }
-  if (total > 0) out.windows.push({ name: "Credits", used: (100 * used) / total, display: `${compact(used)} / ${compact(total)}` })
+  if (total > 0) out.windows.push({ name: "Credits", used: (100 * used) / total, display: `${compact(used)} / ${compact(total)}`, amount: used, limit: total, unit: "credits" })
   return out
 }
 
