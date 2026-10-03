@@ -3,7 +3,7 @@
 import "./nonet.mjs"
 import { afterEach, expect, test } from "bun:test"
 import { TraeCNAuthPlugin, _internal } from "./index.mjs"
-import { fakeTrae, json, signedIn } from "./fake.mjs"
+import { fakeTrae, json, signedIn, sse } from "./fake.mjs"
 
 let f
 afterEach(() => f?.close())
@@ -58,7 +58,38 @@ test("the config declares the known models; the live list replaces them", async 
   const live = await hooks.provider.models(p, { auth: signedIn() })
   expect(Object.keys(live)).toEqual(["glm-5.2", "DeepSeek-V4-Pro"])
   expect(live["glm-5.2"].limit.context).toBe(200000)
-  expect(f.seen[0].json.function).toBe("chat_v3")
+  expect(f.seen.map((r) => r.json.function).sort()).toEqual(["chat_v3", "solo_work_lite"])
+})
+
+test("SOLO's models are listed too, and asked through SOLO's function (yetone/magpie#681)", async () => {
+  f = fakeTrae()
+  f.route("POST /api/ide/v1/get_detail_param", (r) => json({ config_info_list: r.json.function === "chat_v3"
+    ? [{ config_name: "glm-5.2", display_name: "GLM-5.2" }, { config_name: "DeepSeek-V4-Flash-Official", display_name: "DeepSeek-V4-Flash-Official" }]
+    : [{ config_name: "glm-5.2", display_name: "GLM-5.2" }, { config_name: "DeepSeek-V4.1-Flash", display_name: "DeepSeek-V4.1-Flash", context_window_size: { max: [1000000] } }] }))
+  f.route("POST /api/agent/v3/llm_utils_chat", (r) => sse([["output", { response: r.json.function }], ["done", {}]]))
+  const hooks = await TraeCNAuthPlugin({ client: {} })
+  const p = await given(hooks)
+  const live = await hooks.provider.models(p, { auth: signedIn() })
+  expect(Object.keys(live)).toEqual(["glm-5.2", "DeepSeek-V4-Flash-Official", "DeepSeek-V4.1-Flash"])
+  expect(live["DeepSeek-V4.1-Flash"].name).toBe("DeepSeek-V4.1-Flash")
+  expect(live["DeepSeek-V4.1-Flash"].limit.context).toBe(1000000)
+  const opts = await hooks.auth.loader(async () => signedIn())
+  const ask = async (model) => {
+    const res = await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }) })
+    return (await res.json()).choices[0].message.content
+  }
+  expect(await ask("DeepSeek-V4.1-Flash")).toBe("solo_work_lite")
+  expect(await ask("glm-5.2")).toBe("chat_v3")
+})
+
+test("one function's list failing leaves the other's", async () => {
+  f = fakeTrae()
+  f.route("POST /api/ide/v1/get_detail_param", (r) => r.json.function === "chat_v3"
+    ? json({ config_info_list: [{ config_name: "glm-5.2" }] })
+    : new Response("down", { status: 503 }))
+  const hooks = await TraeCNAuthPlugin({ client: {} })
+  const p = await given(hooks)
+  expect(Object.keys(await hooks.provider.models(p, { auth: signedIn() }))).toEqual(["glm-5.2"])
 })
 
 test("when the list can't be read, the known models stand", async () => {

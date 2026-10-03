@@ -727,6 +727,8 @@ export const TraeCNAuthPlugin = async ({ client }) => {
   const renewed = new Map()
   // the chat function that served each account last
   const fnOf = new Map()
+  // the first chat function whose model list has each model
+  const listedBy = new Map()
 
   const save = async (auth) => {
     try {
@@ -814,15 +816,37 @@ export const TraeCNAuthPlugin = async ({ client }) => {
     return out
   }
 
-  // liveModels is the account's model list, as the IDE asks for it
-  const liveModels = async (a) => {
+  // listOf is one function's model list, as the IDE asks for it
+  const listOf = async (a, fn) => {
     const r = await post(a, apiOf(a) + "/api/ide/v1/get_detail_param", {
-      function: FUNCTIONS[0], config_names: null, need_prompt: false, current_config_info: null, poly_prompt: true, mode_type: null, agent_type: null,
+      function: fn, config_names: null, need_prompt: false, current_config_info: null, poly_prompt: true, mode_type: null, agent_type: null,
     })
     if (r.status === 401 || lapsedCode(errorOf(r.v).code)) throw new Expired("Trae CN's sign-in has expired; sign in again")
     if (r.status !== 200) throw new Error(`Trae CN models: ${statusLine(r.status)}`)
     const list = r.v.config_info_list ?? r.v.data?.config_info_list ?? []
     return list.filter((m) => m?.config_name)
+  }
+
+  // liveModels is the account's model list: every chat function's, since
+  // SOLO lists models the classic IDE's chat_v3 doesn't (DeepSeek-V4.1-Flash
+  // came to SOLO first, yetone/magpie#681); a model listed by one function
+  // only is asked through that one. One function's list failing leaves the
+  // others'; all failing is the error.
+  const liveModels = async (a) => {
+    const got = await Promise.allSettled(FUNCTIONS.map((fn) => listOf(a, fn)))
+    const expired = got.find((g) => g.status === "rejected" && g.reason instanceof Expired)
+    if (expired) throw expired.reason
+    if (got.every((g) => g.status === "rejected")) throw got[0].reason
+    const out = new Map()
+    got.forEach((g, i) => {
+      if (g.status !== "fulfilled") return
+      for (const m of g.value) {
+        const id = String(m.config_name)
+        if (!out.has(id)) out.set(id, { m, fn: FUNCTIONS[i] })
+      }
+    })
+    for (const [id, { fn }] of out) listedBy.set(id, fn)
+    return [...out.values()].map((x) => x.m)
   }
 
   const modelOf = (provider, m) => {
@@ -889,7 +913,9 @@ export const TraeCNAuthPlugin = async ({ client }) => {
             }
             const signIn = a.renewed ? "renewed" : "kept"
             const who = a.uid || a.name
-            const fns = fnOf.has(who) ? [fnOf.get(who), ...FUNCTIONS.filter((f) => f !== fnOf.get(who))] : FUNCTIONS
+            // the function that lists the model first, then the one that
+            // served this account last, then the rest
+            const fns = [...new Set([listedBy.get(String(req.model)), fnOf.get(who), ...FUNCTIONS].filter(Boolean))]
             let last
             for (const fn of fns) {
               const res = await fetch(apiOf(a) + "/api/agent/v3/llm_utils_chat", {
