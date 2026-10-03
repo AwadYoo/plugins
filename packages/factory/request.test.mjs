@@ -283,12 +283,44 @@ test("leaves ordinary system messages and incomplete context outside the generat
     { role: "system", content: "Follow the user's instructions.\n\n" + context },
     { role: "system", content: context.replace(" - Platform", "   - Platform") },
     { role: "system", content: "You are powered by the model custom-model." },
-    { role: "system", content: [{ type: "text", text: context }] },
+    { role: "system", content: [{ type: "text", text: "Follow the user's instructions.\n\n" + context }] },
   ]) {
     const body = JSON.stringify({ system: droid, messages: [message] })
     await l.fetch(url, { method: "POST", body })
     expect(seen.at(-1).body).toBe(body)
   }
+})
+
+test("adapts Claude Code 2.1.288's system-role context sent as text blocks, as the string would be (#658)", async () => {
+  const { l, seen } = await loaded()
+  // the shape #658 captured from Claude Code 2.1.288
+  const context = "# Environment\nYou have been invoked in the following environment: \n - Platform: darwin\n\nYou are powered by the model named Opus 5.5. The exact model ID is claude-opus-5-5. Assistant knowledge cutoff is June 2026.\n\n<total_tokens>10000 tokens left</total_tokens>"
+  const adapted = context.replace("# Environment", "# Runtime context")
+    .replace("You have been invoked in the following environment:", "The session environment is:")
+    .replace("You are powered by the model named", "Current model name:")
+    .replace("The exact model ID is", "Model ID:")
+    .replace("Assistant knowledge cutoff is", "Model knowledge cutoff:")
+  const other = { type: "image", source: { type: "base64", media_type: "image/png", data: "x" } }
+  const plain = { type: "text", text: "Keep these instructions verbatim." }
+  const request = {
+    system: [{ type: "text", text: droid }],
+    messages: [{ role: "user", content: [{ type: "text", text: "你好" }] }, { role: "system", content: [{ type: "text", text: context, cache_control: { type: "ephemeral" } }, plain, other] }],
+    stream: true,
+  }
+  for (const endpoint of [url, url + "/count_tokens"]) {
+    await l.fetch(endpoint, { method: "POST", body: JSON.stringify(request) })
+    const sent = JSON.parse(seen.at(-1).body)
+    expect(sent).toEqual({ ...request, messages: [request.messages[0], { role: "system", content: [{ type: "text", text: adapted, cache_control: { type: "ephemeral" } }, plain, other] }] })
+    // the same text as a string comes out the same
+    await l.fetch(endpoint, { method: "POST", body: JSON.stringify({ ...request, messages: [request.messages[0], { role: "system", content: context }] }) })
+    expect(JSON.parse(seen.at(-1).body).messages[1].content).toBe(adapted)
+    // and adapting again changes nothing
+    await l.fetch(endpoint, { method: "POST", body: JSON.stringify(sent) })
+    expect(seen.at(-1).body).toBe(JSON.stringify(sent))
+  }
+  // folded into the user's turn on its way here
+  await l.fetch(url, { method: "POST", body: JSON.stringify({ system: droid, messages: [{ role: "user", content: [{ type: "text", text: "你好" }, { type: "text", text: context }] }] }) })
+  expect(JSON.parse(seen.at(-1).body).messages[0].content).toEqual([{ type: "text", text: "你好" }, { type: "text", text: adapted }])
 })
 
 test("system-role context adaptation is idempotent and preserves non-metadata paragraphs", async () => {
@@ -347,7 +379,7 @@ test("requires a model-update preamble and complete token metadata before adapti
     update.replace("15000000", "unknown"),
     "Explain this quoted metadata:\n\n" + update,
     model + "\n\nQuoted token marker: <total_tokens>15000000 tokens left</total_tokens>",
-    [{ type: "text", text: update }],
+    [{ type: "text", text: "Explain this quoted metadata:\n\n" + update }],
   ]) {
     const body = JSON.stringify({ system: droid, messages: [{ role: "system", content }] })
     await l.fetch(url, { method: "POST", body })

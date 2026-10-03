@@ -742,6 +742,20 @@ function anthropicBody(body) {
       }
       continue
     }
+    // Claude Code 2.1.288 also sends the same context as an array of text
+    // blocks (#658): each text block is adapted as the string would be,
+    // the blocks' other fields and any other block left as they are.
+    if (message?.role === "system" && Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block?.type !== "text" || typeof block.text !== "string") continue
+        const adapted = systemContext(block.text)
+        if (adapted !== block.text) {
+          block.text = adapted
+          changed = true
+        }
+      }
+      continue
+    }
     if (message?.role !== "user" || !Array.isArray(message.content)) continue
     for (const block of message.content) {
       if (block?.type === "tool_result") {
@@ -767,7 +781,7 @@ function anthropicBody(body) {
       if (block.text.startsWith(INSTRUCTIONS_REMINDER) && block.text.includes(GLOBAL_INSTRUCTIONS)) {
         block.text = block.text.replaceAll(GLOBAL_INSTRUCTIONS, "(global instructions)")
         changed = true
-      } else if (HOOK_OUTPUT.test(block.text)) {
+      } else if (HOOK_OUTPUT.test(block.text) || SYSTEM_ENV_CONTEXT.test(block.text)) {
         // a system message folded into the user's turn on its way here
         const adapted = systemContext(block.text)
         if (adapted !== block.text) {
