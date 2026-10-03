@@ -58,27 +58,31 @@ test("the config declares the known models; the live list replaces them", async 
   const live = await hooks.provider.models(p, { auth: signedIn() })
   expect(Object.keys(live)).toEqual(["glm-5.2", "DeepSeek-V4-Pro"])
   expect(live["glm-5.2"].limit.context).toBe(200000)
-  expect(f.seen.map((r) => r.json.function).sort()).toEqual(["chat_v3", "solo_work_lite"])
+  expect(f.seen.map((r) => r.json.function).sort()).toEqual(["chat_v3", "solo_agent", "solo_work_lite"])
 })
 
-test("SOLO's models are listed too, and asked through SOLO's function (yetone/magpie#681)", async () => {
+test("SOLO's and the TRAE agent's models are listed too, and asked through the function that lists them (yetone/magpie#681)", async () => {
   f = fakeTrae()
-  f.route("POST /api/ide/v1/get_detail_param", (r) => json({ config_info_list: r.json.function === "chat_v3"
-    ? [{ config_name: "glm-5.2", display_name: "GLM-5.2" }, { config_name: "DeepSeek-V4-Flash-Official", display_name: "DeepSeek-V4-Flash-Official" }]
-    : [{ config_name: "glm-5.2", display_name: "GLM-5.2" }, { config_name: "DeepSeek-V4.1-Flash", display_name: "DeepSeek-V4.1-Flash", context_window_size: { max: [1000000] } }] }))
+  const lists = {
+    chat_v3: [{ config_name: "glm-5.2", display_name: "GLM-5.2" }],
+    solo_work_lite: [{ config_name: "glm-5.2", display_name: "GLM-5.2" }, { config_name: "DeepSeek-V4-Flash-Official", display_name: "DeepSeek-V4-Flash-Official" }],
+    solo_agent: [{ config_name: "glm-5.2", display_name: "GLM-5.2" }, { config_name: "deepseek-v4.1-flash", display_name: "DeepSeek V4.1 Flash", context_window_size: { max: [1000000] } }],
+  }
+  f.route("POST /api/ide/v1/get_detail_param", (r) => json({ config_info_list: lists[r.json.function] ?? [] }))
   f.route("POST /api/agent/v3/llm_utils_chat", (r) => sse([["output", { response: r.json.function }], ["done", {}]]))
   const hooks = await TraeCNAuthPlugin({ client: {} })
   const p = await given(hooks)
   const live = await hooks.provider.models(p, { auth: signedIn() })
-  expect(Object.keys(live)).toEqual(["glm-5.2", "DeepSeek-V4-Flash-Official", "DeepSeek-V4.1-Flash"])
-  expect(live["DeepSeek-V4.1-Flash"].name).toBe("DeepSeek-V4.1-Flash")
-  expect(live["DeepSeek-V4.1-Flash"].limit.context).toBe(1000000)
+  expect(Object.keys(live)).toEqual(["glm-5.2", "DeepSeek-V4-Flash-Official", "deepseek-v4.1-flash"])
+  expect(live["deepseek-v4.1-flash"].name).toBe("DeepSeek V4.1 Flash")
+  expect(live["deepseek-v4.1-flash"].limit.context).toBe(1000000)
   const opts = await hooks.auth.loader(async () => signedIn())
   const ask = async (model) => {
     const res = await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }) })
     return (await res.json()).choices[0].message.content
   }
-  expect(await ask("DeepSeek-V4.1-Flash")).toBe("solo_work_lite")
+  expect(await ask("deepseek-v4.1-flash")).toBe("solo_agent")
+  expect(await ask("DeepSeek-V4-Flash-Official")).toBe("solo_work_lite")
   expect(await ask("glm-5.2")).toBe("chat_v3")
 })
 

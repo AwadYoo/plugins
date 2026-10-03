@@ -33,9 +33,9 @@ agent's `POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`:
   - The messages go as `{role, content: [{type: "text", text}]}`.
   - The model goes as `config_name` and `model`.
   - The function is the one whose model list has the model (`chat_v3`, the
-    classic IDE's, first; else `solo_work_lite`, SOLO's). If Trae answers
-    4001, 4023 or 1005, the plugin tries the other once and remembers which
-    one worked.
+    classic IDE's, first; else `solo_work_lite`, SOLO's Work mode; else
+    `solo_agent`, the TRAE agent's). If Trae answers 4001, 4023 or 1005,
+    the plugin tries the others once and remembers which one worked.
 - **Headers:** the IDE's: `Authorization: Cloud-IDE-JWT …`,
   `X-Cloudide-Token`, `x-app-id`, `x-ide-version`, the device headers and
   `x-uid`.
@@ -56,8 +56,9 @@ agent's `POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`:
   - Images aren't sent.
 
 The model list is the account's own, from `/api/ide/v1/get_detail_param`,
-asked for both functions and put together: SOLO lists models `chat_v3`
-doesn't (DeepSeek-V4.1-Flash). When neither can be read, the plugin uses the models Trae CN's `chat_v3` is
+asked for each of those functions and put together: SOLO and the TRAE
+agent list models `chat_v3` doesn't (deepseek-v4.1-flash is the TRAE
+agent's, `solo_agent`). When neither can be read, the plugin uses the models Trae CN's `chat_v3` is
 known to serve: GLM-5.2, GLM-5, Kimi K2.6, Qwen 3.7 Plus, DeepSeek V4 Pro
 and DeepSeek V4 Flash.
 

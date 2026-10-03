@@ -26,8 +26,10 @@ const SIGN_IN_TIMEOUT = 10 * 60 * 1000
 const EARLY_MS = 2 * 60 * 1000 // a token this close to its end is renewed before a request
 const LEAD_MS = 10 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
 const DAY = 24 * 3600 * 1000
-// the IDE's chat functions: the classic IDE's agent, then SOLO's
-const FUNCTIONS = ["chat_v3", "solo_work_lite"]
+// the IDE's chat functions: the classic IDE's agent, then SOLO's Work
+// mode, then the TRAE agent (solo_agent): Trae CN 3.3.104's agent-type map
+// files its models under "trae", and only that one has deepseek-v4.1-flash
+const FUNCTIONS = ["chat_v3", "solo_work_lite", "solo_agent"]
 
 const MODEL = { attachment: false, tool_call: true, reasoning: true, temperature: true, limit: { context: 128_000, output: 32_000 }, modalities: { input: ["text"], output: ["text"] } }
 // what Trae CN's chat_v3 is known to serve; the live list replaces it
@@ -689,7 +691,7 @@ async function openai(req, it) {
   return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } })
 }
 
-// a model or function this account's chat_v3 doesn't take: SOLO's may
+// a model or function this account's chat_v3 doesn't take: another may
 const wrongFunction = (code) => ["4001", "4023", "1005"].includes(String(code))
 
 // ---- usage ------------------------------------------------------------------------
@@ -828,8 +830,8 @@ export const TraeCNAuthPlugin = async ({ client }) => {
   }
 
   // liveModels is the account's model list: every chat function's, since
-  // SOLO lists models the classic IDE's chat_v3 doesn't (DeepSeek-V4.1-Flash
-  // came to SOLO first, yetone/magpie#681); a model listed by one function
+  // SOLO lists models the classic IDE's chat_v3 doesn't (deepseek-v4.1-flash
+  // came to the TRAE agent's first, yetone/magpie#681); a model listed by one function
   // only is asked through that one. One function's list failing leaves the
   // others'; all failing is the error.
   const liveModels = async (a) => {
