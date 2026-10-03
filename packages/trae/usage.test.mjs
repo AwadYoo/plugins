@@ -58,7 +58,77 @@ test("the config declares the known models; the live list replaces them", async 
   const live = await hooks.provider.models(p, { auth: signedIn() })
   expect(Object.keys(live)).toEqual(["glm-5.2", "DeepSeek-V4-Pro"])
   expect(live["glm-5.2"].limit.context).toBe(200000)
-  expect(f.seen.map((r) => r.json.function).sort()).toEqual(["chat_v3", "solo_agent", "solo_work_lite"])
+  // no batch list (404 here): one function at a time
+  expect(f.seen[0].path).toBe("/api/ide/v1/batch_get_detail_param")
+  expect(f.seen.slice(1).map((r) => r.json.function).sort()).toEqual(["chat_v3", "solo_agent", "solo_agent_lite", "solo_work_lite"])
+})
+
+// what batch_get_detail_param answered TRAE SOLO CN, cut down: each
+// function's own list; deepseek-v4.1-flash is the TRAE agent's (solo_agent),
+// where it names its __dev model; chat_v3 lists it without one
+const BATCH = { function_configs: [
+  { function: "chat_v3", config_info_list: [
+    { config_name: "glm-5.2", usage: "chat_completion", display_config: { display_name: "GLM-5.2" }, context_window_tokens: { dev: 200000, max: 1000000 }, model_detail_list: [{ model_name: "glm-5.2__dev", max_tokens: 32000 }] },
+    { config_name: "deepseek-v4.1-flash", usage: "chat_completion", display_config: { display_name: "DeepSeek-V4-Flash 正式版" } },
+    { config_name: "summary", usage: "summary" },
+    { config_name: "custom_model_200k", usage: "chat_completion" },
+    { config_name: "kimi-k2", usage: "chat_completion", config_switch: false },
+  ] },
+  { function: "solo_agent", config_info_list: [
+    { config_name: "glm-5.2", usage: "chat_completion", display_config: { display_name: "GLM-5.2" }, model_detail_list: [{ model_name: "glm-5.2__dev" }] },
+    { config_name: "deepseek-v4.1-flash", usage: "chat_completion", display_config: { display_name: "DeepSeek-V4.1-Flash", multimodal: true }, context_window_tokens: { dev: 200000, max: 1000000 }, model_detail_list: [{ model_name: "deepseek-v4.1-flash__max", max_tokens: 128000 }, { model_name: "deepseek-v4.1-flash__dev", max_tokens: 64000 }] },
+  ] },
+  { function: "builder", config_info_list: [{ config_name: "builder-only", usage: "chat_completion" }] },
+] }
+
+test("the lists are asked in one batch, as TRAE SOLO CN asks them, and DeepSeek V4.1 Flash is the TRAE agent's (yetone/magpie#681)", async () => {
+  f = fakeTrae()
+  f.route("POST /api/ide/v1/batch_get_detail_param", () => json(BATCH))
+  f.route("POST /api/agent/v3/llm_utils_chat", (r) => sse([["output", { response: r.json.function + " " + (r.json.model_name ?? "-") }], ["done", {}]]))
+  const hooks = await TraeCNAuthPlugin({ client: {} })
+  const p = await given(hooks)
+  const live = await hooks.provider.models(p, { auth: signedIn() })
+  // one ask, the client SOLO CN is
+  expect(f.seen.map((r) => r.path)).toEqual(["/api/ide/v1/batch_get_detail_param"])
+  const r = f.seen[0]
+  expect(r.json).toEqual({
+    functions: ["chat_v3", "solo_work_lite", "solo_agent", "solo_agent_lite"], agent_type: "", current_config_info: { config_name: "", is_custom_model: false },
+    mode_type: 0, access_type: 0, ab_force_vids: "", ab_autotest_advanced_mode: 0, show_custom_model: true,
+  })
+  expect(r.headers.get("x-ide-version")).toBe("0.1.69")
+  expect(r.headers.get("x-ide-version-code")).toBe("20260917")
+  expect(r.headers.get("x-app-version-code")).toBe("20260917")
+  // the IDE's helpers, custom-model slots, configs switched off and other functions' models aren't models to pick
+  expect(Object.keys(live)).toEqual(["glm-5.2", "deepseek-v4.1-flash"])
+  const m = live["deepseek-v4.1-flash"]
+  expect(m.name).toBe("DeepSeek-V4.1-Flash")
+  expect(m.limit).toEqual({ context: 200000, output: 64000 })
+  expect(live["glm-5.2"].limit).toEqual({ context: 200000, output: 32000 })
+  const opts = await hooks.auth.loader(async () => signedIn())
+  const ask = async (model) => {
+    const res = await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }) })
+    return (await res.json()).choices[0].message.content
+  }
+  // asked through the function that serves it, with the model it names there
+  expect(await ask("deepseek-v4.1-flash")).toBe("solo_agent deepseek-v4.1-flash__dev")
+  expect(await ask("glm-5.2")).toBe("chat_v3 glm-5.2__dev")
+})
+
+test("a batch answered with no lists falls back to one function at a time", async () => {
+  f = fakeTrae()
+  f.route("POST /api/ide/v1/batch_get_detail_param", () => json({ code: 0 }))
+  f.route("POST /api/ide/v1/get_detail_param", (r) => json({ config_info_list: r.json.function === "solo_agent" ? [{ config_name: "deepseek-v4.1-flash" }] : [] }))
+  const hooks = await TraeCNAuthPlugin({ client: {} })
+  const p = await given(hooks)
+  expect(Object.keys(await hooks.provider.models(p, { auth: signedIn() }))).toEqual(["deepseek-v4.1-flash"])
+})
+
+test("signed out asking the batch marks the account", async () => {
+  f = fakeTrae()
+  f.route("POST /api/ide/v1/batch_get_detail_param", () => json({ code: 1001, message: "not login" }, 401))
+  const hooks = await TraeCNAuthPlugin({ client: {} })
+  const p = await given(hooks)
+  await expect(hooks.provider.models(p, { auth: signedIn() })).rejects.toThrow("sign in again")
 })
 
 test("SOLO's and the TRAE agent's models are listed too, and asked through the function that lists them (yetone/magpie#681)", async () => {

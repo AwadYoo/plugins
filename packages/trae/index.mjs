@@ -18,8 +18,13 @@ const HOSTS = {
 }
 const CLIENT_ID = "ono9krqynydwx5" // Trae CN's IDE
 const APP_ID = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
-const IDE_VERSION = "3.3.65"
+const IDE_VERSION = "3.3.65" // named to the authorization page
 const IDE_VERSION_CODE = "20260401"
+// the client the model host is told it serves: TRAE SOLO CN 0.1.69, as its
+// ai-agent names itself (same app id). Trae offers a model only to clients
+// new enough for it, and an April IDE was offered no deepseek-v4.1-flash.
+const CLIENT_VERSION = "0.1.69"
+const CLIENT_VERSION_CODE = "20260917"
 const PLUGIN_VERSION = "2.3.24254"
 const BRAND = "ASUS TUF Gaming A15 FA507RM_FA507RM"
 const SIGN_IN_TIMEOUT = 10 * 60 * 1000
@@ -27,9 +32,9 @@ const EARLY_MS = 2 * 60 * 1000 // a token this close to its end is renewed befor
 const LEAD_MS = 10 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
 const DAY = 24 * 3600 * 1000
 // the IDE's chat functions: the classic IDE's agent, then SOLO's Work
-// mode, then the TRAE agent (solo_agent): Trae CN 3.3.104's agent-type map
-// files its models under "trae", and only that one has deepseek-v4.1-flash
-const FUNCTIONS = ["chat_v3", "solo_work_lite", "solo_agent"]
+// mode, then the TRAE agent (solo_agent, which has deepseek-v4.1-flash),
+// then SOLO Lite's agent
+const FUNCTIONS = ["chat_v3", "solo_work_lite", "solo_agent", "solo_agent_lite"]
 
 const MODEL = { attachment: false, tool_call: true, reasoning: true, temperature: true, limit: { context: 128_000, output: 32_000 }, modalities: { input: ["text"], output: ["text"] } }
 // what Trae CN's chat_v3 is known to serve; the live list replaces it
@@ -332,8 +337,10 @@ function ideHeaders(a, extra = {}) {
     "x-device-id": a.deviceId,
     "x-machine-id": a.machineId,
     "x-request-id": randomUUID(),
-    "x-ide-version": IDE_VERSION,
-    "x-ide-version-code": IDE_VERSION_CODE,
+    "x-app-version": CLIENT_VERSION,
+    "x-app-version-code": CLIENT_VERSION_CODE,
+    "x-ide-version": CLIENT_VERSION,
+    "x-ide-version-code": CLIENT_VERSION_CODE,
     "x-ide-version-type": "stable",
     "x-device-cpu": "AMD",
     "x-device-brand": BRAND,
@@ -421,13 +428,16 @@ const nativeTools = (tools) =>
     return { type: "function", function: { name: f.name, description: f.description ?? "", parameters: typeof f.parameters === "string" ? f.parameters : JSON.stringify(f.parameters ?? {}) } }
   })
 
-function chatBody(req, fn) {
+// chatBody is the request for llm_utils_chat; modelName is the model the
+// function's list names for the config (its __dev one), when it named one
+function chatBody(req, fn, modelName) {
   const session = randomUUID()
   const body = {
     messages: traeMessages(req),
     function: fn,
     config_name: req.model,
     model: req.model,
+    ...(modelName ? { model_name: modelName } : {}),
     stream: true, // Trae answers in SSE either way
     request_id: session,
     session_id: session,
@@ -694,6 +704,24 @@ async function openai(req, it) {
 // a model or function this account's chat_v3 doesn't take: another may
 const wrongFunction = (code) => ["4001", "4023", "1005"].includes(String(code))
 
+// ---- the model lists ------------------------------------------------------------
+
+// chatModel: an entry of a function's list that is a model to chat with.
+// The lists also hold the IDE's own helpers (summary, fast_apply, title
+// generation: usage other than chat_completion), configs switched off, and
+// the slots of custom models, which need a provider bound in the IDE.
+function chatModel(m) {
+  const id = String(m?.config_name ?? "")
+  if (!id || /^custom_model/i.test(id)) return false
+  if (m.usage && m.usage !== "chat_completion") return false
+  if (m.config_switch === false) return false
+  if (m.is_custom_model === true || m.display_config?.is_custom_model === true) return false
+  return true
+}
+
+// devModel is the model an entry serves requests with: its __dev one
+const devModel = (m) => (Array.isArray(m?.model_detail_list) ? m.model_detail_list : []).find((d) => /__dev$/.test(String(d?.model_name ?? "")))
+
 // ---- usage ------------------------------------------------------------------------
 
 // credits adds up the account's entitlement packs as the IDE shows them:
@@ -729,8 +757,10 @@ export const TraeCNAuthPlugin = async ({ client }) => {
   const renewed = new Map()
   // the chat function that served each account last
   const fnOf = new Map()
-  // the first chat function whose model list has each model
+  // the chat function whose model list has each model, and the __dev
+  // model it names there
   const listedBy = new Map()
+  const modelNames = new Map()
 
   const save = async (auth) => {
     try {
@@ -818,6 +848,27 @@ export const TraeCNAuthPlugin = async ({ client }) => {
     return out
   }
 
+  // batchLists is every chat function's model list in one ask, as TRAE
+  // SOLO CN's ai-agent asks (batch_get_detail_param): {function: entries}.
+  // null when Trae answers it with no lists.
+  const batchLists = async (a) => {
+    const r = await post(a, apiOf(a) + "/api/ide/v1/batch_get_detail_param", {
+      functions: FUNCTIONS, agent_type: "", current_config_info: { config_name: "", is_custom_model: false },
+      mode_type: 0, access_type: 0, ab_force_vids: "", ab_autotest_advanced_mode: 0, show_custom_model: true,
+    })
+    if (r.status === 401 || lapsedCode(errorOf(r.v).code)) throw new Expired("Trae CN's sign-in has expired; sign in again")
+    if (r.status !== 200) throw new Error(`Trae CN models: ${statusLine(r.status)}`)
+    const groups = r.v.function_configs ?? r.v.data?.function_configs
+    if (!Array.isArray(groups)) return null
+    const out = {}
+    for (const g of groups) {
+      const fn = String(g?.function ?? "")
+      if (!FUNCTIONS.includes(fn) || !Array.isArray(g.config_info_list)) continue
+      out[fn] = [...(out[fn] ?? []), ...g.config_info_list.filter((m) => m?.config_name)]
+    }
+    return Object.keys(out).length ? out : null
+  }
+
   // listOf is one function's model list, as the IDE asks for it
   const listOf = async (a, fn) => {
     const r = await post(a, apiOf(a) + "/api/ide/v1/get_detail_param", {
@@ -834,28 +885,54 @@ export const TraeCNAuthPlugin = async ({ client }) => {
   // came to the TRAE agent's first, yetone/magpie#681); a model listed by one function
   // only is asked through that one. One function's list failing leaves the
   // others'; all failing is the error.
+  //
+  // The lists come from batch_get_detail_param, as TRAE SOLO CN asks them;
+  // when that gives none, from get_detail_param, one function at a time.
+  // A model several functions list is asked through the first whose entry
+  // names a __dev model (one Trae serves), else the first.
   const liveModels = async (a) => {
-    const got = await Promise.allSettled(FUNCTIONS.map((fn) => listOf(a, fn)))
-    const expired = got.find((g) => g.status === "rejected" && g.reason instanceof Expired)
-    if (expired) throw expired.reason
-    if (got.every((g) => g.status === "rejected")) throw got[0].reason
+    let lists = null
+    try {
+      lists = await batchLists(a)
+    } catch (e) {
+      if (e instanceof Expired) throw e
+    }
+    if (!lists) {
+      const got = await Promise.allSettled(FUNCTIONS.map((fn) => listOf(a, fn)))
+      const expired = got.find((g) => g.status === "rejected" && g.reason instanceof Expired)
+      if (expired) throw expired.reason
+      if (got.every((g) => g.status === "rejected")) throw got[0].reason
+      lists = {}
+      got.forEach((g, i) => {
+        if (g.status === "fulfilled") lists[FUNCTIONS[i]] = g.value
+      })
+    }
     const out = new Map()
-    got.forEach((g, i) => {
-      if (g.status !== "fulfilled") return
-      for (const m of g.value) {
+    for (const fn of FUNCTIONS) {
+      for (const m of lists[fn] ?? []) {
+        if (!chatModel(m)) continue
         const id = String(m.config_name)
-        if (!out.has(id)) out.set(id, { m, fn: FUNCTIONS[i] })
+        const was = out.get(id)
+        if (!was || (!devModel(was.m) && devModel(m))) out.set(id, { m, fn })
       }
-    })
-    for (const [id, { fn }] of out) listedBy.set(id, fn)
+    }
+    for (const [id, { m, fn }] of out) {
+      listedBy.set(id, fn)
+      const dev = devModel(m)
+      if (dev) modelNames.set(id, { fn, name: dev.model_name })
+      else modelNames.delete(id)
+    }
     return [...out.values()].map((x) => x.m)
   }
 
   const modelOf = (provider, m) => {
     const id = String(m.config_name)
     const was = provider.models?.[id] ?? {}
-    const ctx = Number(m.context_window_size?.max?.[0] ?? m.context_window_size?.max ?? m.context_window_tokens?.max ?? m.prompt_max_tokens) || was.limit?.context || MODEL.limit.context
-    return { ...MODEL, ...was, id, providerID: ID, name: String(m.display_name || m.display_model_name || was.name || id), limit: { context: ctx, output: was.limit?.output ?? MODEL.limit.output }, api: was.api ?? { id, url: HOSTS.api, npm: "@ai-sdk/openai-compatible" } }
+    // context_window_tokens: dev is what a request gets, max only in Max mode
+    const ctx = Number(m.context_window_tokens?.dev ?? m.context_window_size?.max?.[0] ?? m.context_window_size?.max ?? m.context_window_tokens?.max ?? m.prompt_max_tokens) || was.limit?.context || MODEL.limit.context
+    const out = Number(devModel(m)?.max_tokens) || was.limit?.output || MODEL.limit.output
+    const name = m.display_config?.display_name || m.display_name || m.display_model_name || was.name || id
+    return { ...MODEL, ...was, id, providerID: ID, name: String(name), limit: { context: ctx, output: out }, api: was.api ?? { id, url: HOSTS.api, npm: "@ai-sdk/openai-compatible" } }
   }
 
   return {
@@ -919,11 +996,12 @@ export const TraeCNAuthPlugin = async ({ client }) => {
             // served this account last, then the rest
             const fns = [...new Set([listedBy.get(String(req.model)), fnOf.get(who), ...FUNCTIONS].filter(Boolean))]
             let last
+            const named = modelNames.get(String(req.model))
             for (const fn of fns) {
               const res = await fetch(apiOf(a) + "/api/agent/v3/llm_utils_chat", {
                 method: "POST",
                 headers: ideHeaders(a, { Accept: "text/event-stream", "X-Request-ID": randomUUID() }),
-                body: JSON.stringify(chatBody(req, fn)),
+                body: JSON.stringify(chatBody(req, fn, named?.fn === fn ? named.name : "")),
                 signal: init.signal ?? r0?.signal,
               })
               if (!res.ok) {

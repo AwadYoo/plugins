@@ -31,14 +31,17 @@ agent's `POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`:
 
 - **Request:**
   - The messages go as `{role, content: [{type: "text", text}]}`.
-  - The model goes as `config_name` and `model`.
-  - The function is the one whose model list has the model (`chat_v3`, the
-    classic IDE's, first; else `solo_work_lite`, SOLO's Work mode; else
-    `solo_agent`, the TRAE agent's). If Trae answers 4001, 4023 or 1005,
-    the plugin tries the others once and remembers which one worked.
-- **Headers:** the IDE's: `Authorization: Cloud-IDE-JWT …`,
-  `X-Cloudide-Token`, `x-app-id`, `x-ide-version`, the device headers and
-  `x-uid`.
+  - The model goes as `config_name` and `model`, and as `model_name` the
+    `__dev` model the function's list names for it, when it names one.
+  - The function is the one whose model list has the model, the first that
+    names a `__dev` model for it (in the order `chat_v3`, the classic IDE's;
+    `solo_work_lite`, SOLO's Work mode; `solo_agent`, the TRAE agent's;
+    `solo_agent_lite`). If Trae answers 4001, 4023 or 1005, the plugin tries
+    the others once and remembers which one worked.
+- **Headers:** TRAE SOLO CN 0.1.69's (`x-ide-version`/`x-app-version`
+  0.1.69, version code 20260917; Trae offers a model only to clients new
+  enough for it): `Authorization: Cloud-IDE-JWT …`, `X-Cloudide-Token`,
+  `x-app-id`, the device headers and `x-uid`.
 - **Answer:** Trae always answers in its own SSE events:
   - `output` gives `response`/`content` and `reasoning_content`/`reasoning`.
   - `token_usage`, `done` and `error` mark usage, the end and failures.
@@ -55,10 +58,16 @@ agent's `POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`:
   - Earlier calls and their results go back in as text.
   - Images aren't sent.
 
-The model list is the account's own, from `/api/ide/v1/get_detail_param`,
-asked for each of those functions and put together: SOLO and the TRAE
-agent list models `chat_v3` doesn't (deepseek-v4.1-flash is the TRAE
-agent's, `solo_agent`). When neither can be read, the plugin uses the models Trae CN's `chat_v3` is
+The model list is the account's own, from
+`/api/ide/v1/batch_get_detail_param`, every function's list in one ask, as
+TRAE SOLO CN asks it (`/api/ide/v1/get_detail_param`, one function at a
+time, when the batch gives none). The lists are put together: SOLO and the
+TRAE agent list models `chat_v3` doesn't (deepseek-v4.1-flash is the TRAE
+agent's, `solo_agent`). Left out are the IDE's helpers (`usage` other than
+`chat_completion`: summary, fast_apply…), configs switched off and the
+custom-model slots. Context is the list's `context_window_tokens.dev`
+(`max` is Max mode's), output the `__dev` model's `max_tokens`. When no
+list can be read, the plugin uses the models Trae CN's `chat_v3` is
 known to serve: GLM-5.2, GLM-5, Kimi K2.6, Qwen 3.7 Plus, DeepSeek V4 Pro
 and DeepSeek V4 Flash.
 
