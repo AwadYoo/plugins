@@ -726,6 +726,7 @@ async function* events(body) {
       yield { error: failure(Number(env.statusCodeValue), inner || payload) }
       return
     }
+    if (inner.trim() === "[DONE]") break
     let chunk
     try {
       chunk = JSON.parse(inner)
@@ -749,12 +750,19 @@ async function* events(body) {
         yield { tool: { index: ++index, id: tc.id || "call_" + hexID(), name: tc.function?.name ?? "", args: tc.function?.arguments ?? "" } }
       } else if (tc.function?.arguments) yield { args: { index, text: tc.function.arguments } }
     }
-    fr = chunk?.choices?.[0]?.finish_reason ?? ""
-    if (fr) {
-      const u = chunk.usage
-      if (u) usage = { prompt_tokens: u.prompt_tokens ?? 0, completion_tokens: u.completion_tokens ?? 0, total_tokens: (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0) }
-      break
-    }
+    fr = chunk?.choices?.[0]?.finish_reason || fr
+    // the usage comes in a chunk of its own after the finish, with no
+    // choices, as the built-in read it (qoder.go): every request was
+    // counted as 0 tokens when the finish ended the reading
+    const u = chunk?.usage
+    if (u)
+      usage = {
+        prompt_tokens: u.prompt_tokens ?? 0,
+        completion_tokens: u.completion_tokens ?? 0,
+        total_tokens: (u.prompt_tokens ?? 0) + (u.completion_tokens ?? 0),
+        ...(u.prompt_tokens_details?.cached_tokens ? { prompt_tokens_details: { cached_tokens: u.prompt_tokens_details.cached_tokens } } : {}),
+        ...(u.completion_tokens_details?.reasoning_tokens ? { completion_tokens_details: { reasoning_tokens: u.completion_tokens_details.reasoning_tokens } } : {}),
+      }
   }
   yield* flushed()
   yield { stop: a.sawTool ? "tool_calls" : fr === "length" ? "length" : "stop", usage }
@@ -1245,4 +1253,4 @@ export const QoderAuthPlugin = makePlugin(SITES.qoder)
 export const QoderCNAuthPlugin = makePlugin(SITES["qoder-cn"])
 
 // for tests
-export const _internal = { parseUsage, gfmt, when, failure, modelInfo, SITES, decodeBody }
+export const _internal = { parseUsage, gfmt, when, failure, modelInfo, SITES, decodeBody, events }
