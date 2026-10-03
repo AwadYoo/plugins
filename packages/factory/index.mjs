@@ -604,7 +604,20 @@ const SYSTEM_MODEL_CONTEXT = /(^|\n\n)You are powered by the model (?:named )?[^
 const SYSTEM_MODEL_UPDATE = /^You are powered by the model (?:named )?[^\n<>]+\.(?=\n\n|$)/
 const SYSTEM_ENV_UPDATE = /^# Environment update\n(?: {1,2}- [^\n]*\n)+(?=\n|$)/
 const SYSTEM_TOKEN_CONTEXT = /(?:^|\n\n)<total_tokens>\d+ tokens left<\/total_tokens>(?=\n\n|$)/
+// A SessionStart hook's output comes ahead of the generated context in the
+// same message (Claude Code 2.1.288 with a hook installed, #634): the
+// context after it is adapted as it would be on its own, the hook's output
+// is left as it is.
+const HOOK_OUTPUT = /^SessionStart:[^\n]* hook success:/
+const HOOK_CONTEXT = "\n# Environment\nYou have been invoked in the following environment:"
 function systemContext(text) {
+  if (HOOK_OUTPUT.test(text)) {
+    const at = text.indexOf(HOOK_CONTEXT)
+    return at < 0 ? text : text.slice(0, at + 1) + generatedContext(text.slice(at + 1))
+  }
+  return generatedContext(text)
+}
+function generatedContext(text) {
   const environment = SYSTEM_ENV_CONTEXT.test(text)
   if (!environment && !((SYSTEM_MODEL_UPDATE.test(text) || SYSTEM_ENV_UPDATE.test(text)) && SYSTEM_TOKEN_CONTEXT.test(text))) return text
   let out = text.replace(SYSTEM_MODEL_CONTEXT, (paragraph) => paragraph
@@ -623,6 +636,22 @@ function systemContext(text) {
   }
   return out
 }
+
+// The model line inside a system prompt (Claude Desktop's, #634) is the
+// same generated sentence as in a reminder; only that line changes.
+const SYSTEM_MODEL_LINE = /(^|\n)You are powered by the model [^\n<>]+/g
+function systemModelLine(text) {
+  return text.replace(SYSTEM_MODEL_LINE, (line) => line
+    .replace("You are powered by the model named", "Current model name:")
+    .replace("You are powered by the model", "Current model:")
+    .replace("The exact model ID is", "Model ID:")
+    .replace("Assistant knowledge cutoff is", "Model knowledge cutoff:"))
+}
+
+// The reminder carrying CLAUDE.md files names the global one with a phrase
+// Factory refuses; only that phrase in the generated reminder changes.
+const INSTRUCTIONS_REMINDER = "<system-reminder>\nCodebase and user instructions are shown below"
+const GLOBAL_INSTRUCTIONS = "(user's private global instructions for all projects)"
 
 // Factory also refuses these fixed client phrases when they are quoted in
 // tool output, e.g. while reading this adapter's source. Keep the original
@@ -676,6 +705,12 @@ function anthropicBody(body) {
     if (block?.type === "text" && CLAUDE_IDENTITIES.has(block.text)) {
       block.text = DROID_LINE
       changed = true
+    } else if (block?.type === "text") {
+      const adapted = systemModelLine(block.text)
+      if (adapted !== block.text) {
+        block.text = adapted
+        changed = true
+      }
     }
     kept.push(block)
   }
@@ -728,7 +763,17 @@ function anthropicBody(body) {
         continue
       }
       if (block?.type !== "text" || typeof block.text !== "string") continue
-      if (ENV_REMINDER.test(block.text)) {
+      if (block.text.startsWith(INSTRUCTIONS_REMINDER) && block.text.includes(GLOBAL_INSTRUCTIONS)) {
+        block.text = block.text.replaceAll(GLOBAL_INSTRUCTIONS, "(global instructions)")
+        changed = true
+      } else if (HOOK_OUTPUT.test(block.text)) {
+        // a system message folded into the user's turn on its way here
+        const adapted = systemContext(block.text)
+        if (adapted !== block.text) {
+          block.text = adapted
+          changed = true
+        }
+      } else if (ENV_REMINDER.test(block.text)) {
         block.text = block.text.replace("# Environment", "# Runtime context")
           .replace("You have been invoked in the following environment:", "The session environment is:")
         changed = true

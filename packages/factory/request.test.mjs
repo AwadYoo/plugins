@@ -419,3 +419,45 @@ test("leaves ordinary tool results and fixed phrases outside tool-result content
   await l.fetch(url, { method: "POST", body })
   expect(seen[0].body).toBe(body)
 })
+
+// #634: shapes Claude Code 2.1.288 and Claude Desktop send that Factory refused.
+test("adapts runtime context after a SessionStart hook's output, as a system message or folded into the user's turn", async () => {
+  const { l, seen } = await loaded()
+  const hook = "SessionStart:startup hook success: Memory loaded.\n# Environment notes from the hook stay as they are.\n"
+  const context = "# Environment\nYou have been invoked in the following environment: \n - Primary working directory: /tmp/project\n - Platform: darwin\n\nYou are powered by the model named Sonnet 5.5. The exact model ID is factory/claude-sonnet-5-5.\n\nThe following skills are available for use with the Skill tool:\n\n" + configSkill
+  const adapted = context.replace("# Environment", "# Runtime context")
+    .replace("You have been invoked in the following environment:", "The session environment is:")
+    .replace("You are powered by the model named", "Current model name:")
+    .replace("The exact model ID is", "Model ID:")
+    .replace("not Claude", "not the assistant")
+  const text = hook + "\n" + context
+  for (const message of [{ role: "system", content: text }, { role: "user", content: [{ type: "text", text: "Reply OK." }, { type: "text", text }] }]) {
+    await l.fetch(url, { method: "POST", body: JSON.stringify({ system: droid, messages: [message] }) })
+    const got = JSON.parse(seen.at(-1).body).messages[0]
+    const out = typeof got.content === "string" ? got.content : got.content[1].text
+    expect(out).toBe(hook + "\n" + adapted)
+    await l.fetch(url, { method: "POST", body: seen.at(-1).body })
+    expect(seen.at(-1).body).toBe(seen.at(-2).body)
+  }
+  // a hook's output with no generated context after it is left alone
+  const body = JSON.stringify({ system: droid, messages: [{ role: "system", content: hook + "\nYou are powered by the model named X." }] })
+  await l.fetch(url, { method: "POST", body })
+  expect(seen.at(-1).body).toBe(body)
+})
+
+test("renames the global CLAUDE.md in the instructions reminder only", async () => {
+  const { l, seen } = await loaded()
+  const reminder = "<system-reminder>\nCodebase and user instructions are shown below. Be sure to adhere to these instructions.\n\nContents of /home/u/.claude/CLAUDE.md (user's private global instructions for all projects):\n\nUse tabs.\n</system-reminder>"
+  const pasted = "Why does Claude Code write (user's private global instructions for all projects)?"
+  await l.fetch(url, { method: "POST", body: JSON.stringify({ system: droid, messages: [{ role: "user", content: [{ type: "text", text: reminder }, { type: "text", text: pasted }] }] }) })
+  const content = JSON.parse(seen.at(-1).body).messages[0].content
+  expect(content[0].text).toBe(reminder.replace("(user's private global instructions for all projects)", "(global instructions)"))
+  expect(content[1].text).toBe(pasted)
+})
+
+test("adapts the model line inside Claude Desktop's system prompt", async () => {
+  const { l, seen } = await loaded()
+  const prompt = "<application_details>\nClaude Desktop.\n</application_details>\nYou are powered by the model named Sonnet 5.5. The exact model ID is factory/claude-sonnet-5-5.\nKeep the rest verbatim."
+  await l.fetch(url, { method: "POST", body: JSON.stringify({ system: [{ type: "text", text: "You are a Claude agent, built on Anthropic's Claude Agent SDK." }, { type: "text", text: prompt }], messages: [{ role: "user", content: "hi" }] }) })
+  expect(JSON.parse(seen.at(-1).body).system).toEqual([{ type: "text", text: droid }, { type: "text", text: prompt.replace("You are powered by the model named", "Current model name:").replace("The exact model ID is", "Model ID:") }])
+})
