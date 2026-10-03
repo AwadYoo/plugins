@@ -32,7 +32,9 @@ const CHAT_PATH = "/algo/api/v2/service/pro/sse/agent_chat_generation?FetchKeys=
 const MODELS_PATH = "/algo/api/v2/model/list?Encode=1"
 const COSY_VERSION = "1.1.49"
 const SIGN_IN_TIMEOUT = 15 * 60 * 1000
-const REFRESH_LEAD = 5 * 60 * 1000
+const REFRESH_LEAD = 5 * 60 * 1000 // a chat token this close to its end is refreshed before a request
+const RENEW_LEAD = 10 * 60 * 1000 // and this close, magpie renews it ahead of time (auth.refresh)
+const KEEP_SPENT_MS = 60 * 60 * 1000 // how long what a spent refresh token gave is remembered
 const DAY = 24 * 60 * 60 * 1000
 const CHAT = "@ai-sdk/openai-compatible"
 
@@ -842,6 +844,13 @@ function signed(res, renewed) {
   return new Response(res.body, { status: res.status, statusText: res.statusText, headers })
 }
 
+// changed is the fields of b that differ from a's: what auth.refresh gives.
+function changed(a, b) {
+  const out = {}
+  for (const k of ["access", "refresh", "expires", "deviceToken", "deviceRefresh"]) if (b[k] !== a[k]) out[k] = b[k]
+  return out
+}
+
 // ---- usage --------------------------------------------------------------------
 //
 // The account's allowance as magpie's built-in Qoder account shows it
@@ -995,6 +1004,38 @@ const makePlugin = (site) => async ({ client }) => {
     lock = run.catch(() => {})
     return run
   }
+  // spent is what each refresh token this process spent gave, by that
+  // token: the chat pair it renewed. magpie saves what auth.refresh gives
+  // only once the hook has returned, and a request may read the account in
+  // between, or the hook be handed the account as it was before a request
+  // renewed it: either follows spent rather than spending the token again.
+  const spent = new Map()
+  const latest = (a) => {
+    for (let i = 0; i < 16 && a?.refresh; i++) {
+      const s = spent.get(a.refresh)
+      if (!s) break
+      a = { ...a, ...s.got }
+    }
+    return a
+  }
+  const spend = (refresh, got) => {
+    const now = Date.now()
+    for (const [k, v] of spent) if (now - v.at > KEEP_SPENT_MS) spent.delete(k)
+    spent.set(refresh, { got, at: now })
+    return got
+  }
+  // renew spends a's chat refresh token, under the lock: the fields it
+  // changes, recorded in spent.
+  const renew = async (a) => {
+    if (a.deviceChat) {
+      // the device token is the chat token: renewed as a device token,
+      // both pairs being the one pair
+      const dt = await refreshDevice(site, a.refresh, true)
+      return spend(a.refresh, { access: dt.token, refresh: dt.refresh, expires: dt.expires, deviceToken: dt.token, deviceRefresh: dt.refresh })
+    }
+    const jt = await refreshJob(site, a.refresh, a.accountId || a.email || a.uid)
+    return spend(a.refresh, { access: jt.token, refresh: jt.refresh_token, expires: expiresAt(jt) })
+  }
   // each account's listing, the model configs a request carries
   const listings = new Map()
   // the accounts fresh renewed: the built-in took the lapse mark off on a
@@ -1013,19 +1054,12 @@ const makePlugin = (site) => async ({ client }) => {
   // its end.
   const fresh = (getAuth) =>
     locked(async () => {
-      const a = await getAuth()
-      if (a?.type !== "oauth" || !a.access || !a.uid) throw new SignInGone(`${site.name}: not signed in`)
+      const stored = await getAuth()
+      if (stored?.type !== "oauth" || !stored.access || !stored.uid) throw new SignInGone(`${site.name}: not signed in`)
+      // renewed already (by magpie's auth.refresh), the store not yet saying so
+      const a = latest(stored)
       if (a.expires - Date.now() > REFRESH_LEAD) return a
-      let next
-      if (a.deviceChat) {
-        // the device token is the chat token: renewed as a device token,
-        // both pairs being the one pair
-        const dt = await refreshDevice(site, a.refresh, true)
-        next = { ...a, access: dt.token, refresh: dt.refresh, expires: dt.expires, deviceToken: dt.token, deviceRefresh: dt.refresh }
-      } else {
-        const jt = await refreshJob(site, a.refresh, a.accountId || a.email || a.uid)
-        next = { ...a, access: jt.token, refresh: jt.refresh_token, expires: expiresAt(jt) }
-      }
+      const next = { ...a, ...(await renew(a)) }
       await client.auth.set({ path: { id: ID }, body: next })
       renewals.add(next)
       return next
@@ -1044,12 +1078,12 @@ const makePlugin = (site) => async ({ client }) => {
   // the one saved since, else a rotated one, saved.
   const deviceToken = (getAuth, attempted) =>
     locked(async () => {
-      const a = await getAuth()
+      const a = latest(await getAuth())
       if (a?.deviceToken !== attempted) return a?.deviceToken
       const dt = await refreshDevice(site, a.deviceRefresh, !!a.deviceChat)
       const next = { ...a, deviceToken: dt.token, deviceRefresh: dt.refresh }
       // the pair it spent was the chat pair too
-      if (a.deviceChat) Object.assign(next, { access: dt.token, refresh: dt.refresh, expires: dt.expires })
+      if (a.deviceChat) Object.assign(next, spend(a.refresh, { access: dt.token, refresh: dt.refresh, expires: dt.expires, deviceToken: dt.token, deviceRefresh: dt.refresh }))
       await client.auth.set({ path: { id: ID }, body: next })
       return dt.token
     })
@@ -1115,6 +1149,28 @@ const makePlugin = (site) => async ({ client }) => {
   return {
     auth: {
       provider: ID,
+      // magpie renews the chat token RENEW_LEAD before its end, once for
+      // the account, before its requests, models and usage ask for it; the
+      // check before each request (REFRESH_LEAD) stays for OpenCode, which
+      // doesn't call this. The device token of a job-token account has no
+      // end on record: usage rotates it once Qoder refuses it, as before.
+      refreshLead: RENEW_LEAD,
+      async refresh(auth) {
+        if (auth?.type !== "oauth" || !auth.access || !auth.uid || !String(auth.refresh ?? "").trim()) return undefined
+        return locked(async () => {
+          // a request renewed it meanwhile (or magpie hasn't saved this
+          // hook's last answer): what that gave, not a second refresh
+          const a = latest(auth)
+          if (a.access !== auth.access && a.expires - Date.now() > RENEW_LEAD) return changed(auth, a)
+          try {
+            // magpie saves what this gives
+            return changed(auth, { ...a, ...(await renew(a)) })
+          } catch (e) {
+            if (e?.expired) throw Object.assign(new Error(e.message), { signIn: "expired" })
+            throw e
+          }
+        })
+      },
       async loader(getAuth) {
         const a = await getAuth()
         if (a?.type !== "oauth") return {}
