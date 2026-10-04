@@ -43,6 +43,13 @@ const SCOPES = ["codewhisperer:completions", "codewhisperer:analysis", "codewhis
 const IDE_UA = "KiroIDE-1.1.70-" + createHash("sha256").update("magpie:" + hostname()).digest("hex")
 const DESKTOP_UA = "Kiro-Desktop/0.2.13 (darwin; arm64)"
 const SIGN_IN_TIMEOUT = 10 * 60 * 1000
+// A Builder ID sign-in has no profile of its own, and Kiro won't list one
+// for it (List-Available-Profiles is a 403, "AWS Builder ID is not supported
+// for this operation"); the Kiro IDE and kiro-cli name this service profile
+// for it instead, so its models, usage and chat are asked with it too.
+const BUILDER_ID_START = "https://view.awsapps.com/start"
+const BUILDER_ID_PROFILE = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+const isBuilderID = (provider) => String(provider ?? "").toLowerCase() === "builderid"
 
 const env = (k) => process.env[k] ?? ""
 const home = () => env("HOME") || homedir()
@@ -118,6 +125,8 @@ async function readCLI() {
       if (kind === "social") c.method = "social"
       else if (kind === "odic") {
         c.method = "idc"
+        // as kiro-cli tells them apart: Builder ID's start URL, or none
+        c.builderID = !m.start_url || m.start_url === BUILDER_ID_START
         const reg = get("kirocli:odic:device-registration")
         if (reg) [c.clientId, c.clientSecret] = [reg.client_id ?? "", reg.client_secret ?? ""]
       } else {
@@ -145,7 +154,7 @@ async function readIDE() {
   }
   if (!t?.accessToken) return null
   const c = { access: t.accessToken, refresh: t.refreshToken ?? "", expires: time(t.expiresAt), region: t.region || "us-east-1",
-    profile: t.profileArn ?? "", method: "idc", idePath: path }
+    profile: t.profileArn ?? "", method: "idc", idePath: path, builderID: isBuilderID(t.provider) }
   if (t.clientIdHash) {
     try {
       const reg = JSON.parse(await readFile(join(ideDir(), t.clientIdHash + ".json"), "utf8"))
@@ -289,6 +298,7 @@ class KiroError extends Error {
     } catch {}
     super(msg ? `Kiro: ${msg} (${status})` : `Kiro: ${STATUS_TEXT[status] ?? ""}`)
     this.status = status
+    this.body = String(body ?? "")
   }
 }
 
@@ -309,7 +319,7 @@ async function managementCall(region, a, method, query, body) {
 }
 
 // profileOf finds the profile a sign-in that doesn't name one uses: an API
-// key's own, or the first Kiro lists in either of its regions.
+// key's own, Builder ID's, or the first Kiro lists in either of its regions.
 async function profileOf(c) {
   if (c.method === "apikey") {
     const res = await fetch(management("us-east-1") + "/", {
@@ -327,6 +337,7 @@ async function profileOf(c) {
     if (!arn) throw new Error("Kiro didn't say which profile the API key is for")
     return arn
   }
+  if (c.builderID) return BUILDER_ID_PROFILE
   let last
   for (const region of ["us-east-1", "eu-central-1"]) {
     try {
@@ -334,6 +345,8 @@ async function profileOf(c) {
       const arn = (out?.profiles ?? []).find((p) => p?.arn)?.arn
       if (arn) return arn
     } catch (e) {
+      // a Builder ID sign-in the token didn't say was one
+      if (c.method === "idc" && e?.status === 403 && e.body.includes("Builder ID")) return BUILDER_ID_PROFILE
       last = e
     }
   }
@@ -396,7 +409,7 @@ async function credOf(auth) {
   if (!auth.access) return null
   return { access: auth.access, refresh: auth.refresh ?? "", expires: auth.expires ?? 0, method: auth.method || "social",
     region: auth.region || "us-east-1", profile: auth.profileArn ?? "", clientId: auth.clientId ?? "", clientSecret: auth.clientSecret ?? "",
-    own: true }
+    builderID: isBuilderID(auth.loginProvider), own: true }
 }
 
 // Account holds the credentials in use, refreshing them when near their
@@ -1275,7 +1288,7 @@ async function browserSignIn() {
           grantType: "authorization_code", redirectUri: awsRedirect, code: q.get("code"), codeVerifier: aws.verifier })
         if (!t.accessToken) throw new Error("AWS sent back no token")
         c = { access: t.accessToken, refresh: t.refreshToken ?? "", expires: expiry(t.expiresIn), method: "idc", loginProvider: aws.provider,
-          region: aws.region, clientId: aws.clientId, clientSecret: aws.clientSecret, profile: "" }
+          region: aws.region, clientId: aws.clientId, clientSecret: aws.clientSecret, profile: "", builderID: isBuilderID(aws.provider) }
       } else if (q.get("state") !== state) {
         // not ours: someone else's page, or a stale tab
         return html(200, page(false, "This link isn't from this sign-in", "Start it again."))
