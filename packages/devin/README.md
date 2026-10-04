@@ -18,11 +18,14 @@ two ways to get one:
   `~/.local/share/devin/`; `%APPDATA%\devin\` on Windows). The file is only
   read, never changed.
 
-When the CLI is installed, the plugin names the account with
-`devin auth status` (its email and tier). The CLI runs with a data folder
-of the plugin's own, `~/.cache/opencode-devin-auth/<hash of the token>/`,
-so the CLI's own sign-in is never touched. Without the CLI the account is
-named "Devin".
+The plugin names the account as Devin does when asked with the token
+(`GetUserStatus`: its email and tier). When Devin can't tell, and the CLI
+is installed, it asks `devin auth status`, run with a data folder of the
+plugin's own, `~/.cache/opencode-devin-auth/<hash of the token>/`, so the
+CLI's own sign-in is never touched. A CLI that reads another
+`credentials.toml` than that folder's (on Windows it reads
+`%APPDATA%\devin\` whatever it is run with) isn't asked: it would name
+its own account. Otherwise the account is named "Devin".
 
 The token is kept where OpenCode keeps sign-ins (`auth.json`; in magpie,
 `plugin-auth.json`) as `{ "type": "api", "key", "metadata": { "email", "plan" } }`.
@@ -69,7 +72,10 @@ Devin's own agent.
 
 The `config` hook declares Devin's list as of 2026-09-30 (87 models).
 Once signed in, and with the CLI installed, the `provider.models` hook
-replaces it with the account's own, from `devin models list`. The list is
+replaces it with the account's own, from `devin models list`, when the CLI
+answers for the account: it reads the plugin's data folder for it, and
+names the account Devin names the token's. When it doesn't (on Windows),
+the account keeps the declared list. The list is
 cached for 5 minutes; after a failed read, the plugin tries again after 1
 minute.
 

@@ -9,10 +9,10 @@ import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { createServer, STATUS_CODES } from "node:http"
 import { gunzipSync } from "node:zlib"
 import { spawn } from "node:child_process"
-import { existsSync, readFileSync, statSync } from "node:fs"
+import { existsSync, readFileSync, realpathSync, statSync } from "node:fs"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { homedir } from "node:os"
-import { join } from "node:path"
+import { isAbsolute, join, relative, resolve } from "node:path"
 
 const ID = "devin"
 const CHAT = "@ai-sdk/openai-compatible"
@@ -425,25 +425,54 @@ function runCLI(home, ...args) {
 // or Devin's servers refused the account's token.
 const signedOut = (out) => ["Not logged in", "Authentication required", "Invalid token", "try logging out and logging in again"].some((s) => out.includes(s))
 
+// statusField is a field of `devin auth status`'s report, "" without it.
+function statusField(out, key) {
+  for (const l of out.split(/\r?\n/)) {
+    const t = l.trim()
+    if (t.startsWith(key + ":")) return t.slice(key.length + 1).trim()
+  }
+  return ""
+}
+
 // parseStatus reads `devin auth status`'s report: its User's Email (or
 // Name), its Account's Tier (or Plan).
 function parseStatus(out) {
   if (!out.includes("Logged in")) return null
-  const field = (key) => {
-    for (const l of out.split("\n")) {
-      const t = l.trim()
-      if (t.startsWith(key + ":")) return t.slice(key.length + 1).trim()
-    }
-    return ""
-  }
+  const field = (key) => statusField(out, key)
   return { user: field("Email") || field("Name"), plan: field("Tier") || field("Plan") }
 }
 
+// inside says file is in dir, whichever way either is spelled.
+function inside(file, dir) {
+  const real = (p) => {
+    let r
+    try {
+      r = realpathSync(p)
+    } catch {
+      r = resolve(p)
+    }
+    return process.platform === "win32" ? r.toLowerCase() : r
+  }
+  const rel = relative(real(dir), real(file))
+  return rel !== "" && !rel.startsWith("..") && !isAbsolute(rel)
+}
+
+// readsHome says the CLI's report is of the credentials.toml in home: the
+// devin CLI on Windows reads %APPDATA%\devin\ whatever APPDATA it is run
+// with (#17), and so answers for its own account, not home's. A report that
+// names no file is taken at its word.
+function readsHome(out, home) {
+  const file = statusField(out, "File")
+  return !home || !file || inside(file, home)
+}
+
 // identity is who the CLI says is signed in in home: {user, plan}, null
-// when it says nobody is, undefined when it can't tell (no CLI, no answer).
+// when it says nobody is, undefined when it can't tell (no CLI, no answer,
+// a CLI that read another credentials.toml than home's).
 async function identity(home) {
   try {
     const { out } = await runCLI(home, "auth", "status")
+    if (!readsHome(out, home)) return undefined
     const st = parseStatus(out)
     if (st?.user) return st
     if (signedOut(out)) return null
@@ -451,18 +480,77 @@ async function identity(home) {
   return undefined
 }
 
+// tierName words a teamsTier as `devin auth status` says it:
+// TEAMS_TIER_DEVIN_PRO is "Devin Pro", TEAMS_TIER_DEVIN_TEAMS_V2 "Devin
+// Teams" (the CLI leaves the tier's version out).
+const tierName = (t) =>
+  String(t ?? "")
+    .replace(/^TEAMS_TIER_/, "")
+    .split("_")
+    .filter((w) => w && w !== "UNSPECIFIED" && !/^V\d+$/.test(w))
+    .map((w) => w[0] + w.slice(1).toLowerCase())
+    .join(" ")
+
+// whoByKey is whose key it is, as GetUserStatus (usage's) says, asked with
+// the key itself: {user, plan}, null when Devin refuses the key, undefined
+// when it can't tell.
+async function whoByKey(key, server) {
+  let res, text
+  try {
+    res = await userStatus(key, server || SERVER)
+    text = await res.text()
+  } catch {
+    return undefined
+  }
+  if (res.status === 401 || failure(res.status, text).status === 401) return null
+  if (!res.ok) return undefined
+  let u
+  try {
+    u = JSON.parse(text || "{}")?.userStatus ?? {}
+  } catch {
+    return undefined
+  }
+  const user = u.email || u.name
+  if (!user) return undefined
+  const info = u.planStatus?.planInfo ?? {}
+  return { user, plan: tierName(u.teamsTier || info.teamsTier) || info.planName || "" }
+}
+
+// cliAnswersFor says whether the CLI, run with home as its data folder,
+// answers for key's account: it reads home's credentials.toml, and the
+// account it names is the one Devin says the key is. undefined when it
+// can't tell.
+async function cliAnswersFor(key, server, home) {
+  let out
+  try {
+    ;({ out } = await runCLI(home, "auth", "status"))
+  } catch {
+    return undefined
+  }
+  if (!readsHome(out, home)) return false
+  const cli = parseStatus(out)?.user
+  if (!cli) return true
+  const who = await whoByKey(key, server)
+  return !who?.user || who.user.toLowerCase() === cli.toLowerCase()
+}
+
 // Each account's model list as the CLI last gave it, kept FRESH; one past
 // its time is served while it is read again, one that failed is asked
-// again after RETRY.
+// again after RETRY. A CLI that doesn't answer for the account (#17: on
+// Windows it lists its own account's) is never asked for it: the account
+// has Devin's list as of SNAPSHOT.
 const lists = new Map()
 
 async function familiesFor(key, server, wait = true) {
   let c = lists.get(key)
-  if (!c) lists.set(key, (c = { families: null, at: 0, failed: 0, asking: null }))
+  if (!c) lists.set(key, (c = { families: null, at: 0, failed: 0, asking: null, cli: undefined }))
   const ask = () =>
     (c.asking ??= (async () => {
       try {
-        const { out } = await runCLI(await homeFor(key, server), "models", "list", "--format", "json")
+        const home = await homeFor(key, server)
+        if (c.cli === undefined) c.cli = await cliAnswersFor(key, server, home)
+        if (c.cli === false) return
+        const { out } = await runCLI(home, "models", "list", "--format", "json")
         const fams = parseFamilies(out)
         if (!fams.length) throw new Error("devin models list: no models")
         Object.assign(c, { families: fams, at: Date.now(), failed: 0 })
@@ -473,10 +561,10 @@ async function familiesFor(key, server, wait = true) {
       }
     })())
   if (c.families) {
-    if (Date.now() - c.at >= FRESH && Date.now() - c.failed >= RETRY && cliPath()) ask()
+    if (Date.now() - c.at >= FRESH && Date.now() - c.failed >= RETRY && c.cli !== false && cliPath()) ask()
     return c.families
   }
-  if (cliPath() && Date.now() - c.failed >= RETRY) {
+  if (c.cli !== false && cliPath() && Date.now() - c.failed >= RETRY) {
     const p = ask()
     if (wait) await p
   }
@@ -515,12 +603,16 @@ async function exchange(code, verifier, redirect) {
   return { key, webapp: r.devinWebappHost, api: r.devinApiUrl }
 }
 
-// success names a key's account as the CLI does, in a data folder of the
-// plugin's own; a CLI that says nobody is signed in with it fails it, and
-// without the CLI the account is just "Devin".
+// success names a key's account as Devin does when asked with the key
+// (GetUserStatus), or, when Devin can't tell, as the CLI does in a data
+// folder of the plugin's own: never by the CLI alone, which on Windows
+// names its own account whatever key it is given (#17). A key Devin or the
+// CLI says nobody is signed in with fails it; with neither able to tell,
+// the account is just "Devin".
 async function success(key, server) {
-  const who = await identity(await homeFor(key, server))
-  if (who === null) throw new Error("Devin didn't take the sign-in: `devin auth status` says nobody is signed in with it")
+  let who = await whoByKey(key, server)
+  if (who === undefined) who = await identity(await homeFor(key, server))
+  if (who === null) throw new Error("Devin didn't take the sign-in: nobody is signed in with the token it gave")
   const metadata = { email: who?.user || "Devin" }
   if (who?.plan) metadata.plan = who.plan
   if (server && server !== SERVER) metadata.server = server
@@ -1116,9 +1208,19 @@ async function complete({ key, server, families }, chat, signal) {
 
 // ---- the plugin ---------------------------------------------------------------------
 
-// serverOf is the API server an account's requests go to:
-// WINDSURF_API_SERVER_URL moves it, as it does the CLI's.
 // ---- usage -----------------------------------------------------------------
+
+// userStatus asks GetUserStatus about the key's account.
+function userStatus(key, server) {
+  return fetch(server + "/exa.seat_management_pb.SeatManagementService/GetUserStatus", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
+    body: JSON.stringify({
+      metadata: { ideName: "devin-cli", ideVersion: CLI_VERSION, extensionName: "devin-cli", extensionVersion: CLI_VERSION, apiKey: key, locale: "en", os: osName() },
+    }),
+    signal: AbortSignal.timeout(15_000),
+  })
+}
 
 // usage is the account's plan and how much of its quota is gone, as
 // GetUserStatus (what the CLI's /usage reads) tells them: the plan's name
@@ -1128,14 +1230,7 @@ async function complete({ key, server, families }, chat, signal) {
 // zero, so a quota with a reset and no share left is used up. magpie's
 // built-in Devin account showed none of this.
 async function usage(key, server) {
-  const res = await fetch(server + "/exa.seat_management_pb.SeatManagementService/GetUserStatus", {
-    method: "POST",
-    headers: { "Content-Type": "application/json", "Connect-Protocol-Version": "1" },
-    body: JSON.stringify({
-      metadata: { ideName: "devin-cli", ideVersion: CLI_VERSION, extensionName: "devin-cli", extensionVersion: CLI_VERSION, apiKey: key, locale: "en", os: osName() },
-    }),
-    signal: AbortSignal.timeout(15_000),
-  })
+  const res = await userStatus(key, server)
   const text = await res.text()
   if (res.status === 401 || failure(res.status, text).status === 401)
     return { error: "Devin's sign-in has expired — sign in again", windows: [] }
@@ -1167,6 +1262,8 @@ async function usage(key, server) {
   return out
 }
 
+// serverOf is the API server an account's requests go to:
+// WINDSURF_API_SERVER_URL moves it, as it does the CLI's.
 const serverOf = (auth) => (process.env.WINDSURF_API_SERVER_URL || auth?.metadata?.server || SERVER).replace(/\/+$/, "")
 
 // live is the key and server an account has now: one taken from the CLI's
@@ -1251,4 +1348,4 @@ export async function DevinAuthPlugin() {
 }
 
 // for tests
-export const _internal = { seesImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readCredentials, credentials, fields, frame, PB, events, frames }
+export const _internal = { seesImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames }
