@@ -81,3 +81,51 @@ test("the list's failures read as the built-in's", async () => {
   expect(await fail(Response.json({ data: [] }))).toBe(`${url}: no models listed`)
   expect(await fail(Response.json({ data: [{ id: "claude-opus-5-5" }, { id: "gpt-6-sol" }] }))).toBe("Command Code listed no models for the Go plan")
 })
+
+// Command Code's list says nothing of pictures, and magpie's plugin host
+// takes a model whose capabilities.input.image is a boolean as the plugin's
+// answer, over models.dev's (internal/plugin/host.js, imageSaid): a false
+// said for every model left each one of a moved plan without image input
+// (ARNO on magpie 0.1.810). A model the plugin knows takes pictures says
+// so; of one it doesn't know, nothing is said, and magpie answers from
+// models.dev as the built-in does.
+test("a model says it takes pictures when known, and nothing when not", async () => {
+  const pro = { type: "api", key: "pro-key", metadata: { plan: "Pro" } }
+  globalThis.fetch = async (url) => {
+    const path = new URL(String(url)).pathname
+    if (path === "/alpha/billing/subscriptions") return Response.json({ success: true, data: { planId: "individual-pro-monthly", status: "active" } })
+    if (path === "/provider/v1/models") return new Response(list, { status: 200 })
+    return new Response("", { status: 404 })
+  }
+  const hooks = await CommandCodePlugin()
+  const ms = await hooks.provider.models({ models: {} }, { auth: pro })
+  expect(Object.keys(ms).length).toBe(86)
+  const said = (id) => ms[id].capabilities.input.image
+  // Claude, the default list's and the CLI's table's
+  for (const id of ["claude-opus-5-5", "claude-haiku-4-5-20251001", "gpt-6-sol", "gpt-6-luna", "moonshotai/Kimi-K3", "Qwen/Qwen3.8-Flash", "stealth/pixel-canary", "MiniMaxAI/MiniMax-M3"]) {
+    expect(said(id)).toBe(true)
+    expect(ms[id].capabilities.attachment).toBe(true)
+  }
+  // text alone, or not known: not said either way
+  for (const id of ["deepseek/deepseek-v4-pro", "zai-org/GLM-5.3", "MiniMaxAI/MiniMax-M2.7", "tencent/hy4-preview"]) {
+    expect(said(id)).toBeUndefined()
+    expect("image" in ms[id].capabilities.input).toBe(false)
+  }
+  for (const m of Object.values(ms)) expect(said(m.id) === true || said(m.id) === undefined).toBe(true)
+
+  // a list that says, is taken at its word
+  globalThis.fetch = async (url) => {
+    const path = new URL(String(url)).pathname
+    if (path === "/alpha/billing/subscriptions") return Response.json({ success: true, data: { planId: "individual-pro-monthly", status: "active" } })
+    return Response.json({ data: [{ id: "claude-opus-5-5", modalities: { input: ["text"] } }, { id: "x/seer", modalities: { input: ["text", "image"] } }] })
+  }
+  _internal.subsSeen.clear()
+  const said2 = await (await CommandCodePlugin()).provider.models({ models: {} }, { auth: { ...pro, key: "pro-key-2" } })
+  expect(said2["claude-opus-5-5"].capabilities.input.image).toBe(false)
+  expect(said2["x/seer"].capabilities.input.image).toBe(true)
+
+  // Go: the table's pictures, nothing said of the rest
+  const { ms: g } = await models(list)
+  expect(g["moonshotai/Kimi-K3"].capabilities.input.image).toBe(true)
+  expect(g["zai-org/GLM-5.2"].capabilities.input).not.toHaveProperty("image")
+})

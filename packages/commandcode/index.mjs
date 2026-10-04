@@ -34,16 +34,17 @@ const RESPONSES = "@ai-sdk/openai" // the Responses API, which magpie speaks to 
 // ---- models -------------------------------------------------------------------
 
 // The plan's models when its list can't be asked: Claude on Messages, the
-// rest on chat completions.
+// rest on chat completions. Pictures as models.dev has them (DeepSeek V4
+// and GLM-5.3 read text alone, so say nothing).
 const MODELS = [
-  { id: "claude-sonnet-5", name: "Claude Sonnet 5", context: 1_000_000 },
-  { id: "claude-opus-5-5", name: "Claude Opus 5.5", context: 1_000_000 },
-  { id: "gpt-6-sol", name: "GPT-6 Sol", context: 1_050_000 },
+  { id: "claude-sonnet-5", name: "Claude Sonnet 5", context: 1_000_000, images: true },
+  { id: "claude-opus-5-5", name: "Claude Opus 5.5", context: 1_000_000, images: true },
+  { id: "gpt-6-sol", name: "GPT-6 Sol", context: 1_050_000, images: true },
   { id: "deepseek/deepseek-v4-pro", name: "DeepSeek V4 Pro", context: 1_000_000 },
   { id: "deepseek/deepseek-v4-flash", name: "DeepSeek V4 Flash", context: 1_000_000 },
-  { id: "moonshotai/Kimi-K3", name: "Kimi K3", context: 1_000_000 },
+  { id: "moonshotai/Kimi-K3", name: "Kimi K3", context: 1_000_000, images: true },
   { id: "zai-org/GLM-5.3", name: "GLM-5.3", context: 1_000_000 },
-  { id: "MiniMaxAI/MiniMax-M3", name: "MiniMax M3", context: 1_000_000 },
+  { id: "MiniMaxAI/MiniMax-M3", name: "MiniMax M3", context: 1_000_000, images: true },
 ]
 
 // The models the Go plan is let use, as the CLI's own table has it
@@ -155,9 +156,14 @@ function configModel(m) {
 }
 
 // runtimeModel is a model as OpenCode's provider.models hook returns it.
+// Whether it takes pictures is said only when known (m.images a boolean):
+// Command Code's list doesn't say, and a false said for every model
+// unknown is taken by magpie as the plan's answer, over models.dev's,
+// which the built-in asks for a model its list says nothing of
+// (yetone/magpie: every model of the plan without image input).
 function runtimeModel(m) {
   const npm = m.npm ?? (isClaude(m.id) ? MESSAGES : CHAT)
-  const input = { text: true, image: !!m.images, audio: false, video: false, pdf: false }
+  const input = { text: true, ...(typeof m.images === "boolean" ? { image: m.images } : {}), audio: false, video: false, pdf: false }
   return {
     id: m.id,
     providerID: ID,
@@ -185,16 +191,22 @@ function runtimeModel(m) {
 // liveModels is the Provider API's list, with the APIs each model is
 // served on (its Claude models on /messages alone, the open ones on
 // /chat/completions and /responses, some on /responses alone); the default list's names and
-// windows fill in what it leaves out.
+// windows fill in what it leaves out. The list says nothing of pictures:
+// a model takes them as the default list or the CLI's table (GO_MODELS)
+// says, and every Claude model does; of any other nothing is said, and
+// magpie answers from models.dev.
 async function liveModels(key) {
   const res = await fetch(BASE + "/models", { headers: { Authorization: `Bearer ${key}`, "x-api-key": key } })
   if (!res.ok) throw new Error(`models: ${res.status}`)
   const body = await res.json()
   const known = Object.fromEntries(MODELS.map((m) => [m.id, m]))
+  const table = Object.fromEntries(GO_MODELS.map((m) => [m.id, m]))
   const out = []
   for (const m of body?.data ?? []) {
     if (!m?.id) continue
     const k = known[m.id]
+    let images = Array.isArray(m.modalities?.input) ? m.modalities.input.includes("image") : undefined
+    if (images === undefined) images = k?.images ?? table[m.id]?.images ?? (isClaude(m.id) || undefined)
     const eps = (m.supported_endpoints ?? []).map((e) => String(e).replace(/\/$/, "").replace(/^\/v1/, ""))
     let npm = isClaude(m.id) ? MESSAGES : CHAT
     // the first of the APIs it is served on, in magpie's order (chat
@@ -205,7 +217,7 @@ async function liveModels(key) {
       id: m.id,
       name: m.name && m.name !== m.id ? m.name : m.display_name || k?.name || m.id,
       context: Number.isFinite(ctx) && ctx > 0 ? ctx : k?.context ?? 0,
-      images: (m.modalities?.input ?? []).includes("image") || undefined,
+      images,
       npm,
     })
   }

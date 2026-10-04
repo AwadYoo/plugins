@@ -72,6 +72,11 @@ the account's own:
   The Go models carry their reasoning levels, and a requested level is
   fitted to the nearest one the model has.
 
+The `/models` list doesn't say which models take images. A model is marked
+as taking them when it is a Claude model, or when the default list or the
+CLI's table says so. For any other model the plugin says nothing either
+way, and magpie answers from models.dev, as its built-in did.
+
 ## Not included
 
 - Usage and quota (`/alpha/billing/credits`, the 5-hour and weekly windows).
