@@ -211,3 +211,35 @@ test("a model chat_v3 gives another's name is named and asked as SOLO lists it (
   // named alike everywhere: kept on chat_v3, as before
   expect(await ask("DeepSeek-V4-Flash-Official")).toBe("chat_v3 DeepSeek-V4-Flash-Official__dev")
 })
+
+// ARNO on magpie's Discord: Trae CN's DeepSeek V4.1 Flash said a 32K reply
+// limit, one Trae never gave: a model whose list names no max_tokens says
+// none (0), and magpie tells agents models.dev's. One Trae gives is kept,
+// and a request asking more than it is held to it.
+test("a reply limit is Trae's own or none, and a request is held to Trae's", async () => {
+  f = fakeTrae()
+  f.route("POST /api/ide/v1/batch_get_detail_param", () => json({ function_configs: [
+    { function: "chat_v3", config_info_list: [
+      { config_name: "glm-5.2", usage: "chat_completion", model_detail_list: [{ model_name: "glm-5.2__dev", max_tokens: 32000 }] },
+      { config_name: "deepseek-v4.1-flash", usage: "chat_completion", context_window_tokens: { dev: 200000 }, model_detail_list: [{ model_name: "deepseek-v4.1-flash__dev" }] },
+      { config_name: "kimi-k2.6", usage: "chat_completion" },
+    ] },
+  ] }))
+  f.route("POST /api/agent/v3/llm_utils_chat", (r) => sse([["output", { response: String(r.json.max_tokens) }], ["done", {}]]))
+  const hooks = await TraeCNAuthPlugin({ client: {} })
+  const p = await given(hooks)
+  expect(p.models["kimi-k2.6"].limit.output).toBe(0)
+  expect(p.models["DeepSeek-V4-Flash"].limit.output).toBe(0)
+  const live = await hooks.provider.models(p, { auth: signedIn() })
+  expect(live["glm-5.2"].limit.output).toBe(32000)
+  expect(live["deepseek-v4.1-flash"].limit).toEqual({ context: 200000, output: 0 })
+  expect(live["kimi-k2.6"].limit.output).toBe(0)
+  const opts = await hooks.auth.loader(async () => signedIn())
+  const ask = async (model, max_tokens) => {
+    const res = await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ model, max_tokens, messages: [{ role: "user", content: "hi" }] }) })
+    return (await res.json()).choices[0].message.content
+  }
+  expect(await ask("glm-5.2", 131072)).toBe("32000")
+  expect(await ask("glm-5.2", 8000)).toBe("8000")
+  expect(await ask("deepseek-v4.1-flash", 384000)).toBe("384000")
+})

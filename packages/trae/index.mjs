@@ -39,12 +39,15 @@ const DAY = 24 * 3600 * 1000
 // then SOLO Lite's agent
 const FUNCTIONS = ["chat_v3", "solo_work_lite", "solo_agent", "solo_agent_lite"]
 
-const MODEL = { attachment: false, tool_call: true, reasoning: true, temperature: true, limit: { context: 128_000, output: 32_000 }, modalities: { input: ["text"], output: ["text"] } }
+// a reply limit of 0 is one Trae doesn't say: magpie then takes models.dev's
+// for the model (magpie's catalog), where a made-up 32K told agents a far
+// smaller one than DeepSeek V4.1 Flash's (ARNO on magpie's Discord)
+const MODEL = { attachment: false, tool_call: true, reasoning: true, temperature: true, limit: { context: 128_000, output: 0 }, modalities: { input: ["text"], output: ["text"] } }
 // what Trae CN's chat_v3 is known to serve; the live list replaces it
 const MODELS = {
   "glm-5.2": { name: "GLM-5.2", ...MODEL, limit: { context: 200_000, output: 32_000 } },
   "glm-5": { name: "GLM-5", ...MODEL },
-  "kimi-k2.6": { name: "Kimi K2.6", ...MODEL, limit: { context: 256_000, output: 32_000 } },
+  "kimi-k2.6": { name: "Kimi K2.6", ...MODEL, limit: { context: 256_000, output: 0 } },
   "qwen-3.7-plus": { name: "Qwen 3.7 Plus", ...MODEL },
   "DeepSeek-V4-Pro": { name: "DeepSeek V4 Pro", ...MODEL },
   "DeepSeek-V4-Flash": { name: "DeepSeek V4 Flash", ...MODEL },
@@ -444,8 +447,10 @@ const nativeTools = (tools) =>
   })
 
 // chatBody is the request for llm_utils_chat; modelName is the model the
-// function's list names for the config (its __dev one), when it named one
-function chatBody(req, fn, modelName) {
+// function's list names for the config (its __dev one), when it named one,
+// and most the max_tokens it gives that model (0: none given), which a
+// request asking more is held to
+function chatBody(req, fn, modelName, most = 0) {
   const session = randomUUID()
   const body = {
     messages: traeMessages(req),
@@ -458,7 +463,7 @@ function chatBody(req, fn, modelName) {
     session_id: session,
   }
   const max = req.max_completion_tokens ?? req.max_tokens
-  if (Number.isFinite(max) && max > 0) body.max_tokens = Math.floor(max)
+  if (Number.isFinite(max) && max > 0) body.max_tokens = most > 0 ? Math.min(Math.floor(max), most) : Math.floor(max)
   if (typeof req.temperature === "number") body.temperature = req.temperature
   if (Array.isArray(req.tools) && req.tools.length && req.tool_choice !== "none") {
     body.tools = nativeTools(req.tools)
@@ -1197,7 +1202,7 @@ export const TraeCNAuthPlugin = async ({ client }) => {
     for (const [id, { m, fn }] of out) {
       listedBy.set(id, fn)
       const dev = devModel(m)
-      if (dev) modelNames.set(id, { fn, name: dev.model_name })
+      if (dev) modelNames.set(id, { fn, name: dev.model_name, most: Number(dev.max_tokens) || 0 })
       else modelNames.delete(id)
     }
     return [...out.values()].map((x) => x.m)
@@ -1208,7 +1213,7 @@ export const TraeCNAuthPlugin = async ({ client }) => {
     const was = provider.models?.[id] ?? {}
     // context_window_tokens: dev is what a request gets, max only in Max mode
     const ctx = Number(m.context_window_tokens?.dev ?? m.context_window_size?.max?.[0] ?? m.context_window_size?.max ?? m.context_window_tokens?.max ?? m.prompt_max_tokens) || was.limit?.context || MODEL.limit.context
-    const out = Number(devModel(m)?.max_tokens) || was.limit?.output || MODEL.limit.output
+    const out = Number(devModel(m)?.max_tokens) || was.limit?.output || 0
     const name = m.display_config?.display_name || m.display_name || m.display_model_name || was.name || id
     return { ...MODEL, ...was, id, providerID: ID, name: String(name), limit: { context: ctx, output: out }, api: was.api ?? { id, url: HOSTS.api, npm: "@ai-sdk/openai-compatible" } }
   }
@@ -1281,7 +1286,7 @@ export const TraeCNAuthPlugin = async ({ client }) => {
               const res = await fetch(apiOf(a) + "/api/agent/v3/llm_utils_chat", {
                 method: "POST",
                 headers: ideHeaders(a, { Accept: "text/event-stream", "X-Request-ID": randomUUID() }),
-                body: JSON.stringify(chatBody(req, fn, named?.fn === fn ? named.name : "")),
+                body: JSON.stringify(chatBody(req, fn, named?.fn === fn ? named.name : "", named?.fn === fn ? named.most : 0)),
                 signal: init.signal ?? r0?.signal,
               })
               if (!res.ok) {
