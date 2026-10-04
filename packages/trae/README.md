@@ -105,8 +105,9 @@ magpie's usage card shows the account's credits:
 - **Source:** `api.trae.cn/trae/api/v2/pay/ide_user_ent_usage`.
 - **What it adds up:** each entitlement pack's `credits_limit` (-1 means
   unlimited) and what the pack has used.
-- **What it shows:** credits left as the balance, and the share used as a
-  window.
+- **What it shows:** one Credits window: the credits used of the packs'
+  total, with the share, which magpie shows as used or left like
+  WorkBuddy's.
 
 ## Daily check-in
 

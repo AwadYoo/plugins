@@ -881,8 +881,11 @@ export const TraeCNAuthPlugin = async ({ client }) => {
     const out = { plan: r.v.is_credits_billing ? "Credits" : "Free", user: a.name || a.uid, signIn }
     if (c.unlimited) out.balance = "unlimited"
     else if (c.limit > 0) {
-      out.balance = `${round(Math.max(0, c.limit - c.used))} of ${round(c.limit)} credits left`
-      const w = { name: "Credits", used: Math.max(0, Math.min(100, (c.used / c.limit) * 100)) }
+      // the count rides on the window (amount of limit, in credits), as
+      // WorkBuddy's does, so magpie says it in the window's row, used or
+      // left, in its own words and number format, rather than as an
+      // English balance line beside it (yetone/magpie#694)
+      const w = { name: "Credits", used: Math.max(0, Math.min(100, (c.used / c.limit) * 100)), amount: round(c.used), limit: round(c.limit), unit: "credits" }
       if (c.until) w.resetsAt = new Date(c.until).toISOString()
       out.windows = [w]
     }

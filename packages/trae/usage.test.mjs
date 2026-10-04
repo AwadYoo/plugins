@@ -22,8 +22,8 @@ test("credits are the packs' limits and what they used", async () => {
   expect(u.plan).toBe("Free")
   expect(u.user).toBe("Ann")
   expect(u.signIn).toBe("kept")
-  expect(u.balance).toBe("300 of 400 credits left")
-  expect(u.windows).toEqual([{ name: "Credits", used: 25, resetsAt: new Date(1790000000 * 1000).toISOString() }])
+  expect(u.balance).toBeUndefined() // the window carries the count (yetone/magpie#694)
+  expect(u.windows).toEqual([{ name: "Credits", used: 25, amount: 100, limit: 400, unit: "credits", resetsAt: new Date(1790000000 * 1000).toISOString() }])
 })
 
 test("unlimited packs say so", () => {
