@@ -366,42 +366,6 @@ function ideHeaders(a, extra = {}) {
   }
 }
 
-// ugHeaders are the headers Trae CN's IDE sends its growth pages
-// (api.trae.cn/trae/api/v2/ug/…, the daily check-in) with, and no others:
-// its eb()/fb() (Trae CN 3.3.104's out/main.js) send Content-Type, the
-// Cloud-IDE-JWT and the device (x-device-id, x-device-brand,
-// x-device-type, x-os-version, x-app-version), none of the chat's
-// x-uid, x-app-id, x-ide-token and the like
-function ugHeaders(a, extra = {}) {
-  return {
-    "Content-Type": "application/json",
-    Authorization: `Cloud-IDE-JWT ${a.token}`,
-    "x-device-id": a.deviceId,
-    "x-device-brand": BRAND,
-    "x-device-type": "windows",
-    "x-os-version": "Windows 10",
-    "x-app-version": CLIENT_VERSION,
-    ...extra,
-  }
-}
-
-// ugBody is the body the IDE posts a growth page: {req_source: 1}, its
-// own (2 is SOLO Lite's), where magpie gave none or {}; anything else
-// given goes as it is
-function ugBody(body) {
-  const s = typeof body === "string" ? body.trim() : ""
-  if (s === "" || s === "{}") return JSON.stringify({ req_source: 1 })
-  return s
-}
-
-const ugPage = (url) => {
-  try {
-    return new URL(url).pathname.startsWith("/trae/api/v2/ug/")
-  } catch {
-    return false
-  }
-}
-
 // Trae's chat takes text only and has no turn for a tool call or its
 // result. The agent's tools are named to it natively and in a system
 // prompt that asks for each call as a tagged block; earlier calls and
@@ -922,13 +886,14 @@ export const TraeCNAuthPlugin = async ({ client }) => {
       if (e instanceof Expired) return errorResponse(401, `${a0.name || a0.uid}: ${e.message}`, "expired")
       throw e
     }
-    // the check-in goes as the IDE sends it (ugHeaders, ugBody); Trae's
-    // other pages with the chat's headers
-    const ug = ugPage(url)
+    // Trae's pages, the check-in among them, go with the chat's headers and
+    // the body given ({}): 0.1.7 sent the check-in with the IDE's growth
+    // headers and {req_source: 1} instead, and a check-in that worked on
+    // 0.1.6 failed from then on (yetone/magpie#808)
     const res = await fetch(url, {
       method,
-      headers: ug ? ugHeaders(a, { Accept: "application/json" }) : ideHeaders(a, { Accept: "application/json" }),
-      body: method === "GET" || method === "HEAD" ? undefined : ug ? ugBody(body) : typeof body === "string" ? body : "{}",
+      headers: ideHeaders(a, { Accept: "application/json" }),
+      body: method === "GET" || method === "HEAD" ? undefined : typeof body === "string" ? body : "{}",
       signal: signal ?? AbortSignal.timeout(20_000),
     })
     const text = await res.text()
