@@ -14,7 +14,7 @@ const API_EU = "https://api.eu.factory.ai"
 // droid's WorkOS client, production
 const CLIENT_ID = "client_01HNM792M5G5G1A2THWPXKFMXB"
 // the droid release the requests say they are
-const VERSION = "0.231.0"
+const VERSION = "0.233.0"
 // how long before an access token lapses it is renewed (droid: a minute)
 const REFRESH_LEAD = 2 * 60 * 1000
 // and how long before, magpie renews it ahead of time (auth.refresh): a
