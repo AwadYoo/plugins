@@ -227,3 +227,22 @@ test("a block DeepSeek closes with its own tags, or writes as its own invoke, is
   ])
   expect(c.at(-2).choices[0].finish_reason).toBe("tool_calls")
 })
+
+test("a <tool_call> with only DeepSeek's closing tags after it says nothing; one wrapping its invoke is the call (magpie#823 again)", () => {
+  // Dazzle-sys' pi screenshot: the whole reply, cut short
+  const junk = "<tool_call>\n</｜DSML｜parameter>\n</｜DSML｜invoke>\n</"
+  for (const cut of [5, 14, 30, junk.length]) {
+    const t = new _internal.TextTools()
+    const out = [t.push(junk.slice(0, cut)), t.push(junk.slice(cut)), t.push("", true)]
+    expect(out.map((o) => o.text).join("")).toBe("")
+    expect(out.flatMap((o) => o.calls)).toEqual([])
+  }
+  const wrapped = 'Looking.<tool_call>\n<｜DSML｜invoke name="bash">\n<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>\n</｜DSML｜invoke>\n</tool_call>'
+  const t = new _internal.TextTools()
+  const out = [t.push(wrapped.slice(0, 20)), t.push(wrapped.slice(20)), t.push("", true)]
+  expect(out.map((o) => o.text).join("")).toBe("Looking.")
+  expect(out.flatMap((o) => o.calls).map((c) => [c.name, JSON.parse(c.arguments)])).toEqual([["bash", { command: "ls" }]])
+  // a block that's text, not tags, stays as it was
+  const u = new _internal.TextTools()
+  expect([u.push("<tool_call>hello</tool_call> ok"), u.push("", true)].map((o) => o.text).join("")).toBe("<tool_call>hello</tool_call> ok")
+})

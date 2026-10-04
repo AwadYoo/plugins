@@ -557,6 +557,11 @@ class TextTools {
         const m = this.buf.match(LEFTOVER)
         if (m) this.buf = this.buf.slice(m[0].length)
         if (!this.buf || (!end && MARKS.some((k) => k.startsWith(this.buf)))) break
+        // a tag cut short at the end (</), after the others: dropped too
+        if (end && this.buf.length > 1 && MARKS.some((k) => k.startsWith(this.buf.trimEnd()))) {
+          this.buf = ""
+          break
+        }
         this.after = false
       }
       const i = this.buf.indexOf(OPEN)
@@ -597,6 +602,16 @@ class TextTools {
         continue
       }
       const o = objectEnd(this.buf, i + OPEN.length)
+      const inner = this.buf.slice(i + OPEN.length).trimStart()
+      if (inner.startsWith("<") || (end && !inner)) {
+        // no JSON in it: DeepSeek's own invoke, or only the closes of one
+        // (magpie#823 again); the opener is dropped and what follows read
+        // as it is
+        text += this.buf.slice(0, i)
+        this.buf = inner
+        this.after = true
+        continue
+      }
       const v = o > 0 ? looseJSON(this.buf.slice(i + OPEN.length, o)) : null
       if (v?.name) {
         text += this.buf.slice(0, i)
