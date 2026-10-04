@@ -610,16 +610,60 @@ class TextTools {
 function nativeCall(tc) {
   const f = tc?.function ?? tc?.function_call ?? tc
   const name = f?.name ?? tc?.tool_name ?? ""
-  if (!name) return null
-  const a = f?.arguments ?? tc?.params ?? tc?.input ?? tc?.parameters ?? {}
-  return { id: tc?.id || tc?.tool_call_id || "", name: String(name), arguments: typeof a === "string" ? a : JSON.stringify(a) }
+  const index = Number.isInteger(tc?.index) ? tc.index : null
+  if (!name && index === null && !tc?.id) return null
+  const a = f?.arguments ?? f?.args ?? tc?.params ?? tc?.input ?? tc?.parameters ?? ""
+  return { id: tc?.id || tc?.tool_call_id || "", index, name: String(name), arguments: typeof a === "string" ? a : JSON.stringify(a) }
+}
+
+// NativeCalls puts together the tool calls Trae streams: a call comes in
+// several events under one id (or index), each with the arguments so far
+// or only the new piece, so a call is sent on once the answer is whole,
+// not from its first event (#799: bash's command cut to `echo "T`)
+class NativeCalls {
+  constructor() {
+    this.calls = []
+  }
+  push(tc) {
+    const c = nativeCall(tc)
+    if (!c) return
+    let o = this.calls.find((x) => (c.id && x.id === c.id) || (!c.id && c.index !== null && x.index === c.index))
+    if (!o && !c.id && c.index === null)
+      o = this.calls.findLast((x) => x.name === c.name && (x.arguments === c.arguments || (!done(x.arguments) && c.arguments.startsWith(x.arguments))))
+    if (!o) {
+      if (!c.name) return
+      this.calls.push({ ...c })
+      return
+    }
+    if (!o.name) o.name = c.name
+    if (c.index !== null && o.index === null) o.index = c.index
+    const prev = o.arguments
+    const next = c.arguments
+    if (!next || prev.startsWith(next)) return // nothing new
+    if (next.startsWith(prev) || done(prev)) o.arguments = next // the arguments so far
+    else o.arguments = prev + next // a piece
+  }
+  take() {
+    return this.calls.filter((c) => c.name).map(({ id, name, arguments: a }) => ({ id: id || callId(), name, arguments: a || "{}" }))
+  }
+}
+
+// done says arguments are a whole JSON value already
+function done(a) {
+  if (!a) return false
+  try {
+    JSON.parse(a)
+    return true
+  } catch {
+    return false
+  }
 }
 
 // parts turns Trae's events into what the answer is made of: text,
 // reasoning, tool calls, the token counts, the finish, or an error.
 async function* parts(events) {
   const tt = new TextTools()
-  const seen = new Set()
+  const nc = new NativeCalls()
   for await (const { event, data } of events) {
     const name = eventName(event)
     const d = data && typeof data === "object" ? data : {}
@@ -650,20 +694,14 @@ async function* parts(events) {
       if (r.text) yield { text: r.text }
       for (const c of r.calls) yield { call: { ...c, id: callId() } }
     }
-    for (const tc of Array.isArray(d.tool_calls) ? d.tool_calls : []) {
-      const c = nativeCall(tc)
-      if (!c) continue
-      const key = c.id || c.name + c.arguments
-      if (seen.has(key)) continue
-      seen.add(key)
-      yield { call: { ...c, id: c.id || callId() } }
-    }
+    for (const tc of Array.isArray(d.tool_calls) ? d.tool_calls : []) nc.push(tc)
     const u = tokensOf(d.usage)
     if (u) yield { usage: u }
   }
   const r = tt.push("", true)
   if (r.text) yield { text: r.text }
   for (const c of r.calls) yield { call: { ...c, id: callId() } }
+  for (const c of nc.take()) yield { call: c }
 }
 
 // first reads events up to the first that is the answer's, so an answer

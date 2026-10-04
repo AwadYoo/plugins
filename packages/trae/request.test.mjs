@@ -90,6 +90,29 @@ test("a stream: text, reasoning, a tool block split across events, a native call
   expect(c.at(-1)).toBe("[DONE]")
 })
 
+test("a native call streamed over several events goes on whole (#799)", async () => {
+  f = fakeTrae()
+  f.route("POST /api/agent/v3/llm_utils_chat", () => sse([
+    // the arguments so far, each event
+    ["output", { tool_calls: [{ id: "b1", index: 0, function: { name: "bash", arguments: "" } }] }],
+    ["output", { tool_calls: [{ id: "b1", index: 0, function: { name: "bash", arguments: '{"command":"echo \\"T' } }] }],
+    ["output", { tool_calls: [{ id: "b1", index: 0, function: { name: "bash", arguments: '{"command":"echo \\"Trae\\""}' } }] }],
+    // only the new piece, the name only at first
+    ["output", { tool_calls: [{ id: "r1", index: 1, function: { name: "read", arguments: '{"filePath":"C:/Users/j' } }] }],
+    ["output", { tool_calls: [{ index: 1, function: { arguments: 'oe/a.txt"}' } }] }],
+    // a whole call sent again
+    ["output", { tool_calls: [{ id: "r1", index: 1, function: { name: "read", arguments: '{"filePath":"C:/Users/joe/a.txt"}' } }] }],
+    ["done", {}],
+  ]))
+  const res = await ask({ model: "glm-5", stream: true, tools: TOOLS, messages: [{ role: "user", content: "hi" }] })
+  const c = await chunks(res)
+  const calls = c.filter((x) => x !== "[DONE]" && x.choices?.length).flatMap((x) => x.choices[0].delta.tool_calls ?? [])
+  expect(calls.map((t) => [t.id, t.function.name, JSON.parse(t.function.arguments)])).toEqual([
+    ["b1", "bash", { command: 'echo "Trae"' }],
+    ["r1", "read", { filePath: "C:/Users/joe/a.txt" }],
+  ])
+})
+
 test("no stream asked: one chat completion", async () => {
   f = fakeTrae()
   f.route("POST /api/agent/v3/llm_utils_chat", () => sse([["output", { content: "Hel" }], ["output", { content: "lo" }], ["done", {}]]))
