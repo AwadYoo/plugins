@@ -412,10 +412,20 @@ async function fetchRecommended() {
 	return parseFeed(env && typeof env === "object" && "data" in env ? env.data : env)
 }
 
+// tokens is a positive whole count of tokens, or undefined
+function tokens(...vs) {
+	for (const v of vs) {
+		const n = typeof v === "string" ? Number(v) : v
+		if (Number.isFinite(n) && n > 0) return Math.floor(n)
+	}
+	return undefined
+}
+
 // fetchCloudModels is Cline's whole cloud catalog, which its clients load
 // beside the recommended feed (loadCloudModels reads /ai/cline/models): the
-// usage-billed models the recommended feed doesn't name. Entries carry an id
-// and a display name.
+// usage-billed models the recommended feed doesn't name. Entries carry an id,
+// a display name and, OpenRouter's way, the window (context_length, or its
+// top provider's).
 async function fetchCloudModels() {
 	let res
 	try {
@@ -436,7 +446,12 @@ async function fetchCloudModels() {
 		if (!id) return []
 		const given = firstOf(e.display_name, e.displayName, e.name)
 		const last = id.split("/").pop()
-		return [{ id, name: given && given !== id && given !== last ? given : prettify(id), free: false, pass: id.startsWith("cline-pass/") }]
+		const context = tokens(e.context_length, e.top_provider?.context_length, e.context)
+		// the reply limit is left out: OpenRouter's max_completion_tokens can
+		// be most of the window (kimi-k3: 943718 of 1048576), and an agent
+		// keeps that much of the window free for the reply, so it would
+		// compact a tenth of the way in
+		return [{ id, name: given && given !== id && given !== last ? given : prettify(id), free: false, pass: id.startsWith("cline-pass/"), ...(context && { context }) }]
 	})
 }
 
@@ -444,7 +459,13 @@ async function fetchCloudModels() {
 // recommended feed is required, the cloud catalog is what it adds.
 async function fetchFeed() {
 	const [rec, cloud] = await Promise.all([fetchRecommended(), fetchCloudModels().catch(() => [])])
-	const ms = [...rec]
+	// a recommended model takes the catalog's window for it: the recommended
+	// feed gives none
+	const sizes = new Map(cloud.map((m) => [m.id, m]))
+	const ms = rec.map((m) => {
+		const c = sizes.get(m.id)
+		return c?.context ? { ...m, context: c.context } : m
+	})
 	const seen = new Set(ms.map((m) => m.id))
 	for (const m of cloud) {
 		if (seen.has(m.id)) continue
@@ -470,6 +491,9 @@ const runtimeModel = (m) => ({
 	headers: {},
 	options: {},
 	cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+	// 0 where Cline's catalog doesn't list the model (its cline-free/… and
+	// cline-pass/… ids): magpie then gives the window models.dev has for the
+	// model after the prefix
 	limit: { context: m.context ?? 0, output: 0 },
 	capabilities: {
 		temperature: true,

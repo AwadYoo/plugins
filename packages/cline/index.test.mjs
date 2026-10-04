@@ -699,6 +699,28 @@ test("the models hook merges the cloud catalog with the recommended feed", async
 	expect(out["cline-free/mimo-v2.6-flash"].name).toBe("MiMo V2.6 Flash (free)")
 })
 
+test("the models hook gives each model the window Cline's catalog has for it, and no reply limit", async () => {
+	const { client: c } = client()
+	const hooks = await ClinePlugin({ client: c })
+	serve([
+		["/ai/cline/recommended-models", () => Response.json({ recommended: [{ id: "anthropic/claude-sonnet-5.5" }], free: [{ id: "cline-free/mimo-v2.6-flash" }] })],
+		["/ai/cline/models", () => Response.json({ data: [
+			{ id: "anthropic/claude-sonnet-5.5", context: 0, context_length: 1000000, top_provider: { context_length: 1000000, max_completion_tokens: 128000 } },
+			{ id: "inclusionai/ling-3.1-flash", context_length: "262144", top_provider: { max_completion_tokens: 32768 } },
+			{ id: "only/top", top_provider: { context_length: 200000 } },
+			{ id: "no/size", context_length: null },
+		] })],
+	])
+	const out = await hooks.provider.models({ models: {} })
+	expect(out["anthropic/claude-sonnet-5.5"].limit).toEqual({ context: 1000000, output: 0 })
+	expect(out["inclusionai/ling-3.1-flash"].limit).toEqual({ context: 262144, output: 0 })
+	expect(out["only/top"].limit).toEqual({ context: 200000, output: 0 })
+	// one the catalog doesn't list, or lists without a size, says none: magpie
+	// gives it models.dev's for the model after its prefix
+	expect(out["cline-free/mimo-v2.6-flash"].limit).toEqual({ context: 0, output: 0 })
+	expect(out["no/size"].limit).toEqual({ context: 0, output: 0 })
+})
+
 test("prettify reads a model id as a name", () => {
 	expect(prettify("anthropic/claude-sonnet-5.5")).toBe("Claude Sonnet 5.5")
 	expect(prettify("openai/gpt-6-astra")).toBe("GPT 6 Astra")

@@ -64,6 +64,13 @@ recommended list, Cline's own default (`anthropic/claude-sonnet-5`) among it.
 Cline's `clineCloud` group is left out, as Cline's own clients leave it out
 unless they opt in.
 
+Each model's context window is the cloud catalog's (`context_length`). Its
+reply limit is left unsaid: the catalog's `max_completion_tokens` can be most
+of the window, and an agent keeps that much free for the reply. The `cline-free/…`
+and `cline-pass/…` models aren't in that catalog, so they say none, and magpie
+takes the window models.dev gives the model after the prefix
+(`cline-free/mimo-v2.6-flash` is `mimo-v2.6-flash`).
+
 - The **free** group (`cline-free/…`, `stealth/…`) costs nothing — the names
   say "(free)". They are gated on the client surface a request claims; the
   plugin claims what it is, and the gate takes it. If Cline ever narrows that
