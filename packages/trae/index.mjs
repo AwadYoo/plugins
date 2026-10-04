@@ -534,25 +534,79 @@ const callId = () => "call_" + randomBytes(12).toString("hex") + (callSeq++).toS
 
 // TextTools splits the model's text into what the agent sees and the tool
 // calls it wrote as blocks, holding back the start of a block until it
-// is whole
+// is whole. A block is ours (<tool_call>{…}</tool_call>), its JSON taken
+// once whole even when DeepSeek closes it with its own tags in place of
+// </tool_call>, or DeepSeek's (<｜DSML｜invoke name="…">, magpie#823); the
+// tags left around a call are dropped.
 class TextTools {
   constructor() {
     this.buf = ""
+    this.after = false
   }
   push(s, end = false) {
     this.buf += s
     let text = ""
     const calls = []
     for (;;) {
+      if (this.after) {
+        const m = this.buf.match(LEFTOVER)
+        if (m) this.buf = this.buf.slice(m[0].length)
+        if (!this.buf || (!end && MARKS.some((k) => k.startsWith(this.buf)))) break
+        this.after = false
+      }
       const i = this.buf.indexOf(OPEN)
-      if (i < 0) break
+      const d = this.buf.search(DSML_AT)
+      if (i < 0 && d < 0) break
+      if (d >= 0 && (i < 0 || d < i)) {
+        text += this.buf.slice(0, d)
+        this.buf = this.buf.slice(d)
+        const tag = this.buf.match(DSML_TAG)
+        if (!tag) {
+          // a tag not closed yet; at the end, or with another tag after it,
+          // a stray one dropped
+          const next = this.buf.indexOf("<", 1)
+          if (next < 0 && !end) break
+          this.buf = next < 0 ? "" : this.buf.slice(next)
+          continue
+        }
+        const inv = tag[0].match(DSML_INVOKE)
+        if (!inv) {
+          // function_calls, a parameter's close, any other tag: dropped,
+          // with the blanks after it
+          this.buf = this.buf.slice(tag[0].length)
+          this.after = true
+          continue
+        }
+        const body = this.buf.slice(tag[0].length)
+        const c = body.match(DSML_CLOSE)
+        const n = body.search(DSML_INVOKE_AT)
+        let stop = c ? c.index : n >= 0 ? n : -1
+        if (n >= 0 && n < stop) stop = n
+        if (stop < 0) {
+          if (!end) break
+          stop = body.length
+        }
+        calls.push({ name: inv[1], arguments: dsmlArgs(body.slice(0, stop)) })
+        this.buf = body.slice(c && c.index === stop ? stop + c[0].length : stop)
+        this.after = true
+        continue
+      }
+      const o = objectEnd(this.buf, i + OPEN.length)
+      const v = o > 0 ? looseJSON(this.buf.slice(i + OPEN.length, o)) : null
+      if (v?.name) {
+        text += this.buf.slice(0, i)
+        calls.push({ name: String(v.name), arguments: callArgs(v) })
+        this.buf = this.buf.slice(o)
+        this.after = true
+        continue
+      }
       const j = this.buf.indexOf(CLOSE, i + OPEN.length)
       if (j < 0) break
       text += this.buf.slice(0, i)
       const raw = this.buf.slice(i + OPEN.length, j).trim()
       this.buf = this.buf.slice(j + CLOSE.length)
-      const v = looseJSON(raw) ?? {}
-      if (v.name) calls.push({ name: String(v.name), arguments: callArgs(v) })
+      const w = looseJSON(raw) ?? {}
+      if (w.name) calls.push({ name: String(w.name), arguments: callArgs(w) })
       else text += OPEN + raw + CLOSE
     }
     if (end) {
@@ -560,14 +614,72 @@ class TextTools {
       this.buf = ""
     } else {
       // keep back an opened block, or what may be the start of one
-      const i = this.buf.indexOf(OPEN)
-      let keep = i >= 0 ? this.buf.length - i : 0
-      if (!keep) for (let k = Math.min(OPEN.length - 1, this.buf.length); k > 0; k--) if (OPEN.startsWith(this.buf.slice(-k))) { keep = k; break }
+      const at = [this.buf.indexOf(OPEN), this.buf.search(DSML_AT)].filter((x) => x >= 0)
+      let keep = at.length ? this.buf.length - Math.min(...at) : 0
+      if (!keep) for (let k = Math.min(MARK_MAX - 1, this.buf.length); k > 0; k--) if (MARKS.some((m) => m.startsWith(this.buf.slice(-k)))) { keep = k; break }
       text += this.buf.slice(0, this.buf.length - keep)
       this.buf = this.buf.slice(this.buf.length - keep)
     }
     return { text, calls }
   }
+}
+
+// DeepSeek's tags, with its full-width bar or a plain one
+const DSML = String.raw`<\s*\/?\s*[|｜][\s|｜]*DSML[\s|｜]*`
+const DSML_AT = new RegExp(DSML)
+const DSML_TAG = new RegExp("^" + DSML + "[^<>]*>")
+const DSML_INVOKE = new RegExp(String.raw`^<\s*[|｜][\s|｜]*DSML[\s|｜]*invoke\s+name\s*=\s*"([^"]+)"\s*>`)
+const DSML_INVOKE_AT = new RegExp(String.raw`<\s*[|｜][\s|｜]*DSML[\s|｜]*invoke\s+name\s*=`)
+const DSML_CLOSE = new RegExp(String.raw`<\s*\/\s*[|｜][\s|｜]*DSML[\s|｜]*invoke\s*>`)
+const DSML_PARAM = new RegExp(String.raw`<\s*[|｜][\s|｜]*DSML[\s|｜]*parameter\s+name\s*=\s*"([^"]+)"((?:\s+\w+\s*=\s*"[^"]*")*)\s*>([\s\S]*?)` + DSML + String.raw`parameter\s*>`, "g")
+// what is left after a call: blanks, our close, DeepSeek's tags but the
+// next call's
+const LEFTOVER = new RegExp(String.raw`^(?:\s+|<\/tool_calls?>|<tool_calls>|` + DSML + String.raw`(?![\s|｜]*invoke\b)[^<>]*>)+`)
+// what text may be the start of, so held back
+const MARKS = [OPEN, CLOSE, "<｜DSML｜", "<|DSML|", "</｜DSML｜", "</|DSML|"]
+const MARK_MAX = Math.max(...MARKS.map((m) => m.length))
+
+// dsmlArgs is the arguments of a DSML invoke as JSON: a parameter marked
+// string="true" is its text, any other its JSON (its text when not JSON)
+function dsmlArgs(body) {
+  const args = {}
+  for (const p of body.matchAll(DSML_PARAM)) {
+    if (/string\s*=\s*"true"/.test(p[2])) {
+      args[p[1]] = p[3]
+      continue
+    }
+    try {
+      args[p[1]] = JSON.parse(p[3].trim())
+    } catch {
+      args[p[1]] = p[3]
+    }
+  }
+  return JSON.stringify(args)
+}
+
+// objectEnd is where the JSON object starting at from (after blanks) ends:
+// past its closing brace, -1 when it isn't whole yet, -2 when there's none
+function objectEnd(s, from) {
+  let k = from
+  while (k < s.length && /\s/.test(s[k])) k++
+  if (k >= s.length) return -1
+  if (s[k] !== "{") return -2
+  let depth = 0
+  let str = false
+  let esc = false
+  for (; k < s.length; k++) {
+    const ch = s[k]
+    if (str) {
+      if (esc) esc = false
+      else if (ch === "\\") esc = true
+      else if (ch === '"') str = false
+      continue
+    }
+    if (ch === '"') str = true
+    else if (ch === "{") depth++
+    else if (ch === "}" && --depth === 0) return k + 1
+  }
+  return -1
 }
 
 // looseJSON reads a JSON object as a model writes one: a string holding a

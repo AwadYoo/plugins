@@ -199,3 +199,31 @@ test("looseJSON reads raw control characters in strings only", () => {
   expect(_internal.looseJSON('{"a":\n1}')).toEqual({ a: 1 })
   expect(_internal.looseJSON('{"a":"x')).toBe(null)
 })
+
+test("a block DeepSeek closes with its own tags, or writes as its own invoke, is a call; its tags don't reach the agent (magpie#823)", async () => {
+  // as Dazzle-sys' screenshot had it, in pieces
+  const hermes = '<tool_call>{"name":"bash","arguments":{"command":"cd /e/Project && echo \\"### $spec\\"; done"}}</｜DSML｜parameter>\n</｜DSML｜invoke'
+  const t = new _internal.TextTools()
+  const out = [t.push("Checking. " + hermes.slice(0, 30)), t.push(hermes.slice(30, 95)), t.push(hermes.slice(95)), t.push("", true)]
+  expect(out.map((o) => o.text).join("")).toBe("Checking. ")
+  expect(out.flatMap((o) => o.calls).map((c) => [c.name, JSON.parse(c.arguments)])).toEqual([["bash", { command: 'cd /e/Project && echo "### $spec"; done' }]])
+
+  f = fakeTrae()
+  const dsml = '<｜DSML｜function_calls>\n<｜DSML｜invoke name="read">\n<｜DSML｜parameter name="path" string="true">a b.py</｜DSML｜parameter>\n<｜DSML｜parameter name="limit" string="false">20</｜DSML｜parameter>\n</｜DSML｜invoke>\n<|DSML|invoke name="read"><|DSML|parameter name="path" string="true">c</|DSML|parameter></|DSML|invoke>\n</｜DSML｜function_calls>'
+  f.route("POST /api/agent/v3/llm_utils_chat", () => sse([
+    ["output", { response: "Reading. " + dsml.slice(0, 50) }],
+    ["output", { response: dsml.slice(50, 140) }],
+    ["output", { response: dsml.slice(140) }],
+    ["done", {}],
+  ]))
+  const res = await ask({ model: "glm-5", stream: true, tools: TOOLS, messages: [{ role: "user", content: "hi" }] })
+  const c = await chunks(res)
+  const deltas = c.filter((x) => x !== "[DONE]" && x.choices?.length).map((x) => x.choices[0].delta)
+  expect(deltas.map((d) => d.content ?? "").join("")).toBe("Reading. ")
+  const calls = deltas.flatMap((d) => d.tool_calls ?? [])
+  expect(calls.map((t) => [t.function.name, JSON.parse(t.function.arguments)])).toEqual([
+    ["read", { path: "a b.py", limit: 20 }],
+    ["read", { path: "c" }],
+  ])
+  expect(c.at(-2).choices[0].finish_reason).toBe("tool_calls")
+})
