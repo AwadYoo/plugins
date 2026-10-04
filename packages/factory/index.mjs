@@ -46,6 +46,7 @@ const MODELS = [
   ["claude-sonnet-5", "Sonnet 5", ANTHROPIC, "anthropic", 872000, 128000, E5, true],
   ["claude-sonnet-4-6", "Sonnet 4.6", ANTHROPIC, "anthropic", 931000, 64000, ["low", "medium", "high", "max"], true],
   ["claude-haiku-4-5-20251001", "Haiku 4.5", ANTHROPIC, "anthropic", 0, 0, ["low", "medium", "high"], true],
+  ["gpt-6.1-sol", "GPT-6.1 Sol", RESPONSES, "openai", 1050000, 128000, E5, true],
   ["gpt-6-sol", "GPT-6 Sol", RESPONSES, "openai", 1050000, 128000, E6, true],
   ["gpt-6-astra", "GPT-6 Astra", RESPONSES, "openai", 1050000, 128000, E5, true],
   ["gpt-6-luna", "GPT-6 Luna", RESPONSES, "openai", 1050000, 128000, E6, true],
