@@ -551,8 +551,8 @@ class TextTools {
       text += this.buf.slice(0, i)
       const raw = this.buf.slice(i + OPEN.length, j).trim()
       this.buf = this.buf.slice(j + CLOSE.length)
-      const v = parseJSON(raw)
-      if (v.name) calls.push({ name: String(v.name), arguments: typeof v.arguments === "string" ? v.arguments : JSON.stringify(v.arguments ?? v.input ?? v.parameters ?? {}) })
+      const v = looseJSON(raw) ?? {}
+      if (v.name) calls.push({ name: String(v.name), arguments: callArgs(v) })
       else text += OPEN + raw + CLOSE
     }
     if (end) {
@@ -570,14 +570,62 @@ class TextTools {
   }
 }
 
+// looseJSON reads a JSON object as a model writes one: a string holding a
+// raw newline or tab (a file's content written out, #799) is read as if
+// they were escaped. null when it isn't one even so.
+function looseJSON(s) {
+  for (const t of [s, escapeRaw(s)]) {
+    try {
+      const v = JSON.parse(t)
+      if (v && typeof v === "object" && !Array.isArray(v)) return v
+    } catch {}
+  }
+  return null
+}
+
+// escapeRaw escapes the control characters inside JSON strings
+function escapeRaw(s) {
+  let out = ""
+  let str = false
+  let esc = false
+  for (const ch of String(s ?? "")) {
+    if (str && !esc && ch < " ") {
+      out += ch === "\n" ? "\\n" : ch === "\r" ? "\\r" : ch === "\t" ? "\\t" : "\\u" + ch.charCodeAt(0).toString(16).padStart(4, "0")
+      continue
+    }
+    if (str && ch === "\\" && !esc) esc = true
+    else {
+      if (ch === '"' && !esc) str = !str
+      esc = false
+    }
+    out += ch
+  }
+  return out
+}
+
+// callArgs is a tagged block's arguments as JSON: under arguments (an
+// object, or a string of one), input or parameters, else the block's other
+// keys, as a model that writes them beside the name means them (#799: a
+// write that went out as {})
+function callArgs(v) {
+  let a = v.arguments ?? v.input ?? v.parameters
+  if (a === undefined) {
+    const { name, type, id, ...rest } = v
+    a = rest
+  }
+  if (typeof a === "string") return a.trim() ? (looseJSON(a) ? JSON.stringify(looseJSON(a)) : a) : "{}"
+  return JSON.stringify(a ?? {})
+}
+
 // nativeCall is a tool call as Trae's events carry one
 function nativeCall(tc) {
   const f = tc?.function ?? tc?.function_call ?? tc
   const name = f?.name ?? tc?.tool_name ?? ""
   const index = Number.isInteger(tc?.index) ? tc.index : null
-  if (!name && index === null && !tc?.id) return null
   const a = f?.arguments ?? f?.args ?? tc?.params ?? tc?.input ?? tc?.parameters ?? ""
-  return { id: tc?.id || tc?.tool_call_id || "", index, name: String(name), arguments: typeof a === "string" ? a : JSON.stringify(a) }
+  const args = typeof a === "string" ? a : JSON.stringify(a)
+  if (!name && index === null && !tc?.id && !args) return null
+  return { id: tc?.id || tc?.tool_call_id || "", index, name: String(name), arguments: args }
 }
 
 // NativeCalls puts together the tool calls Trae streams: a call comes in
@@ -594,6 +642,12 @@ class NativeCalls {
     let o = this.calls.find((x) => (c.id && x.id === c.id) || (!c.id && c.index !== null && x.index === c.index))
     if (!o && !c.id && c.index === null)
       o = this.calls.findLast((x) => x.name === c.name && (x.arguments === c.arguments || (!done(x.arguments) && c.arguments.startsWith(x.arguments))))
+    // a piece with nothing to say whose it is (or an index its call's
+    // first event didn't give) belongs to the call still being written
+    if (!o && !c.name && !c.id) {
+      o = this.calls.findLast((x) => !done(x.arguments))
+      if (o && c.index !== null && o.index !== null && o.index !== c.index) o = null
+    }
     if (!o) {
       if (!c.name) return
       this.calls.push({ ...c })
@@ -608,7 +662,10 @@ class NativeCalls {
     else o.arguments = prev + next // a piece
   }
   take() {
-    return this.calls.filter((c) => c.name).map(({ id, name, arguments: a }) => ({ id: id || callId(), name, arguments: a || "{}" }))
+    return this.calls.filter((c) => c.name).map(({ id, name, arguments: a }) => {
+      const v = a && !done(a) ? looseJSON(a) : null
+      return { id: id || callId(), name, arguments: v ? JSON.stringify(v) : a || "{}" }
+    })
   }
 }
 
@@ -1154,4 +1211,4 @@ export const TraeCNAuthPlugin = async ({ client }) => {
 }
 
 // for tests
-export const _internal = { HOSTS, MODELS, TextTools, traeMessages, chatBody, credits, whenOf, newDevice }
+export const _internal = { HOSTS, MODELS, TextTools, NativeCalls, looseJSON, traeMessages, chatBody, credits, whenOf, newDevice }

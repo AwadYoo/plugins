@@ -166,3 +166,36 @@ test("out of quota (4008) is a 429, the account kept", async () => {
   expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
   expect((await res.json()).error.message).toBe("Trae CN: quota exceeded")
 })
+
+test("a tool block with a file's content written out raw, or its arguments beside the name, goes on whole (#799)", async () => {
+  f = fakeTrae()
+  const block = '<tool_call>{"name":"write","arguments":{"path":"a.py","content":"import sys\n\tprint(\\"hi\\")\n"}}</tool_call>'
+  f.route("POST /api/agent/v3/llm_utils_chat", () => sse([
+    ["output", { response: "Writing it. " + block }],
+    ["output", { response: '<tool_call>{"name":"read","path":"a.py"}</tool_call>' }],
+    ["done", {}],
+  ]))
+  const res = await ask({ model: "glm-5", stream: true, tools: TOOLS, messages: [{ role: "user", content: "hi" }] })
+  const c = await chunks(res)
+  const deltas = c.filter((x) => x !== "[DONE]" && x.choices?.length).map((x) => x.choices[0].delta)
+  expect(deltas.map((d) => d.content ?? "").join("")).toBe("Writing it. ")
+  const calls = deltas.flatMap((d) => d.tool_calls ?? [])
+  expect(calls.map((t) => [t.function.name, JSON.parse(t.function.arguments)])).toEqual([
+    ["write", { path: "a.py", content: 'import sys\n\tprint("hi")\n' }],
+    ["read", { path: "a.py" }],
+  ])
+})
+
+test("a native call's pieces that say neither id nor name join the call being written (#799)", () => {
+  const nc = new _internal.NativeCalls()
+  nc.push({ id: "w1", function: { name: "write", arguments: '{"path":"a.py",' } })
+  nc.push({ index: 0, function: { arguments: '"content":"x\ny"' } })
+  nc.push({ function: { arguments: "}" } })
+  expect(nc.take().map((t) => [t.id, t.name, JSON.parse(t.arguments)])).toEqual([["w1", "write", { path: "a.py", content: "x\ny" }]])
+})
+
+test("looseJSON reads raw control characters in strings only", () => {
+  expect(_internal.looseJSON('{"a":"x\ny","b":"\\"q\\""}')).toEqual({ a: "x\ny", b: '"q"' })
+  expect(_internal.looseJSON('{"a":\n1}')).toEqual({ a: 1 })
+  expect(_internal.looseJSON('{"a":"x')).toBe(null)
+})
