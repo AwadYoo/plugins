@@ -114,13 +114,15 @@ magpie's usage card shows the account's credits:
 Trae CN gives credits for a daily check-in (每日签到). magpie can press it
 once a day for each account (Settings, or the switch on the usage card).
 It asks Trae CN's own pages through
-this plugin's fetch, which sends them as the account: its Cloud-IDE-JWT
-(renewed first when near its end) and its device id.
+this plugin's fetch, which sends them as the account, as Trae CN's IDE
+does: its Cloud-IDE-JWT (renewed first when near its end) and its
+device's headers (`x-device-id`, `x-device-brand`, `x-device-type`,
+`x-os-version`, `x-app-version`), and no others.
 
 - **Status:** `POST api.trae.cn/trae/api/v2/ug/checkin_credits/status`,
-  body `{}`: `enable`, `checked_in`, `credits`.
+  body `{"req_source":1}`: `enable`, `checked_in`, `credits`.
 - **Claim:** `POST api.trae.cn/trae/api/v2/ug/checkin_credits/claim`,
-  body `{}`, only while it is on and today's isn't in.
+  body `{"req_source":1}`, only while it is on and today's isn't in.
 - **What comes back:** Trae's answer as it is. A 401 or code 1001 marks
   the account for a new sign-in. Code 9095 means this device has checked
   in today; nothing sends another device id to get round it.
