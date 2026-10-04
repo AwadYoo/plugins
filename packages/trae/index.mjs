@@ -930,7 +930,8 @@ export const TraeCNAuthPlugin = async ({ client }) => {
   // The lists come from batch_get_detail_param, as TRAE SOLO CN asks them;
   // when that gives none, from get_detail_param, one function at a time.
   // A model several functions list is asked through the first whose entry
-  // names a __dev model (one Trae serves), else the first.
+  // names a __dev model (one Trae serves) and isn't misnamed, else the
+  // first that names one, else the first.
   const liveModels = async (a) => {
     let lists = null
     try {
@@ -948,13 +949,35 @@ export const TraeCNAuthPlugin = async ({ client }) => {
         if (g.status === "fulfilled") lists[FUNCTIONS[i]] = g.value
       })
     }
+    // a function can give a model another's name: chat_v3 calls
+    // deepseek-v4.1-flash "DeepSeek-V4-Flash 正式版", as it does
+    // DeepSeek-V4-Flash-Official, where SOLO's lists call it
+    // DeepSeek-V4.1-Flash (yetone/magpie#681) — Trae's usage page then books
+    // it under that name too. Such an entry is misnamed: its name is another
+    // model's in the same list, and other lists name it otherwise.
+    const nameOf = (m) => String(m.display_config?.display_name || m.display_name || m.display_model_name || m.config_name)
+    const names = new Map() // id → the names its lists give it
+    for (const fn of FUNCTIONS) {
+      for (const m of lists[fn] ?? []) {
+        if (!chatModel(m)) continue
+        const id = String(m.config_name)
+        names.set(id, (names.get(id) ?? new Set()).add(nameOf(m)))
+      }
+    }
+    const misnamed = (fn, m) => {
+      const id = String(m.config_name), name = nameOf(m)
+      return names.get(id).size > 1 && (lists[fn] ?? []).some((o) => chatModel(o) && String(o.config_name) !== id && nameOf(o) === name)
+    }
+    // a function's entry is worth more when it names a __dev model, then
+    // when it isn't misnamed; the first of the best is taken
+    const worth = (fn, m) => (devModel(m) ? 2 : 0) + (misnamed(fn, m) ? 0 : 1)
     const out = new Map()
     for (const fn of FUNCTIONS) {
       for (const m of lists[fn] ?? []) {
         if (!chatModel(m)) continue
         const id = String(m.config_name)
         const was = out.get(id)
-        if (!was || (!devModel(was.m) && devModel(m))) out.set(id, { m, fn })
+        if (!was || worth(fn, m) > was.worth) out.set(id, { m, fn, worth: worth(fn, m) })
       }
     }
     for (const [id, { m, fn }] of out) {

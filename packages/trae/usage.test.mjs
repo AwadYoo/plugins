@@ -173,3 +173,41 @@ test("when the list can't be read, the known models stand", async () => {
   const p = await given(hooks)
   expect(await hooks.provider.models(p, { auth: signedIn() })).toBe(p.models)
 })
+
+// as Trae CN answered the reporter (yetone/magpie#681): chat_v3 lists
+// deepseek-v4.1-flash with its __dev model but under DeepSeek-V4-Flash-Official's
+// name, and Trae's usage page books it under that name; SOLO's lists name it
+// DeepSeek-V4.1-Flash
+const SAME_NAME = { function_configs: [
+  { function: "chat_v3", config_info_list: [
+    { config_name: "deepseek-v4.1-flash", usage: "chat_completion", display_config: { display_name: "DeepSeek-V4-Flash 正式版" }, model_detail_list: [{ model_name: "deepseek-v4.1-flash__dev" }, { model_name: "deepseek-v4.1-flash__max" }] },
+    { config_name: "DeepSeek-V4-Flash-Official", usage: "chat_completion", display_config: { display_name: "DeepSeek-V4-Flash 正式版" }, model_detail_list: [{ model_name: "DeepSeek-V4-Flash-Official__dev" }] },
+  ] },
+  { function: "solo_work_lite", config_info_list: [
+    { config_name: "deepseek-v4.1-flash", usage: "chat_completion", display_config: { display_name: "DeepSeek-V4.1-Flash" }, model_detail_list: [{ model_name: "deepseek-v4.1-flash__dev" }] },
+    { config_name: "DeepSeek-V4-Flash-Official", usage: "chat_completion", display_config: { display_name: "DeepSeek-V4-Flash 正式版" }, model_detail_list: [{ model_name: "DeepSeek-V4-Flash-Official__dev" }] },
+  ] },
+  { function: "solo_agent", config_info_list: [
+    { config_name: "deepseek-v4.1-flash", usage: "chat_completion", display_config: { display_name: "DeepSeek-V4.1-Flash" }, model_detail_list: [{ model_name: "deepseek-v4.1-flash__dev" }] },
+  ] },
+] }
+
+test("a model chat_v3 gives another's name is named and asked as SOLO lists it (yetone/magpie#681)", async () => {
+  f = fakeTrae()
+  f.route("POST /api/ide/v1/batch_get_detail_param", () => json(SAME_NAME))
+  f.route("POST /api/agent/v3/llm_utils_chat", (r) => sse([["output", { response: r.json.function + " " + (r.json.model_name ?? "-") }], ["done", {}]]))
+  const hooks = await TraeCNAuthPlugin({ client: {} })
+  const p = await given(hooks)
+  const live = await hooks.provider.models(p, { auth: signedIn() })
+  expect(live["deepseek-v4.1-flash"].name).toBe("DeepSeek-V4.1-Flash")
+  expect(live["DeepSeek-V4-Flash-Official"].name).toBe("DeepSeek-V4-Flash 正式版")
+  const opts = await hooks.auth.loader(async () => signedIn())
+  const ask = async (model) => {
+    const res = await opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }) })
+    return (await res.json()).choices[0].message.content
+  }
+  // the first list that names it rightly, with its __dev model
+  expect(await ask("deepseek-v4.1-flash")).toBe("solo_work_lite deepseek-v4.1-flash__dev")
+  // named alike everywhere: kept on chat_v3, as before
+  expect(await ask("DeepSeek-V4-Flash-Official")).toBe("chat_v3 DeepSeek-V4-Flash-Official__dev")
+})
