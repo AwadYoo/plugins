@@ -576,11 +576,14 @@ function qoderMessages(msgs) {
 // (Qoder: changing the Context "may change the rate"), so it is asked for
 // only when the conversation needs it. The request's size is counted
 // generously, a token for every 3 bytes of its UTF-8 JSON, so a window is
-// raised a little early rather than late.
-function windowFor(chat, m) {
+// raised a little early rather than late, and the reply's max_tokens is
+// counted in it: a window holds the prompt and the reply, so a
+// conversation of 180K asking 32K for the reply is sent 400K, not the 200K
+// it would overflow while magpie says the model takes 1M (yetone/magpie#700).
+function windowFor(chat, m, reply = 0) {
   const base = m.defaultWindow || (m.config?.max_input_tokens > 0 ? m.config.max_input_tokens : 0) || m.context
   if (!m.windows?.length) return m.context
-  const need = Math.ceil(Buffer.byteLength(JSON.stringify({ m: chat.messages ?? [], t: chat.tools ?? [] })) / 3)
+  const need = Math.ceil(Buffer.byteLength(JSON.stringify({ m: chat.messages ?? [], t: chat.tools ?? [] })) / 3) + Math.max(0, reply)
   if (base > 0 && need <= base) return base
   return m.windows.find((w) => w >= need) ?? m.windows[m.windows.length - 1]
 }
@@ -596,7 +599,7 @@ function qoderBody(chat, m) {
   const [thinking, effort] = effortFor(chat.reasoning_effort, m)
   const params = { enable_thinking: thinking, max_tokens: chat.max_completion_tokens || chat.max_tokens || 32000 }
   if (effort) params.reasoning_effort = effort
-  const window = windowFor(chat, m)
+  const window = windowFor(chat, m, params.max_tokens)
   if (window > 0) params.context_length = window
   const body = {
     parameters: params,

@@ -49,3 +49,15 @@ test("a request is sent the default window while it fits, a larger one when it d
   expect(sent(700000 * 3)).toBe(1000000)
   expect(sent(1200000 * 3)).toBe(1000000)
 })
+
+// a window holds the reply too: a prompt that fits 200K alone but not with
+// the max_tokens asked for the reply is sent the next window (yetone/magpie#700)
+test("the reply's max_tokens is counted in the window a request needs", () => {
+  const m = { ..._internal.modelInfo(flash), config: flash }
+  const ctx = (max_tokens) =>
+    _internal.qoderBody({ max_tokens, messages: [{ role: "user", content: "a".repeat(180000 * 3) }] }, m).parameters.context_length
+  expect(ctx(1000)).toBe(200000)
+  expect(ctx(32000)).toBe(400000)
+  // none asked: the 32000 Qoder is sent counts
+  expect(_internal.qoderBody({ messages: [{ role: "user", content: "a".repeat(180000 * 3) }] }, m).parameters.context_length).toBe(400000)
+})
