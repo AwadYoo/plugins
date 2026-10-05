@@ -13,8 +13,9 @@
 // model's name in replies.
 
 export function onRequest(body, ctx) {
-  // Gemini's model is in the request's path, not its body
-  if (ctx.protocol === "gemini" || typeof body.model !== "string") return
+  // the gateway puts a Gemini request's model in its body too (the URL's
+  // model, which it reads from there as for every other API)
+  if (body.model === null || typeof body.model !== "string") return
   const to = map(body.model, rules(ctx.options))
   if (to === body.model) return
   ctx.state.asked = body.model
@@ -37,6 +38,11 @@ export function onEvent(ev, ctx) {
     ev.response.model = asked
     return ev
   }
+  // Gemini names it in modelVersion
+  if (typeof ev.modelVersion === "string" && ev.modelVersion !== asked) {
+    ev.modelVersion = asked
+    return ev
+  }
 }
 
 export function onResponse(body, ctx) {
@@ -48,6 +54,10 @@ export function onResponse(body, ctx) {
   }
   if (body.response && typeof body.response.model === "string") {
     body.response.model = asked
+    return body
+  }
+  if (typeof body.modelVersion === "string" && body.modelVersion !== asked) {
+    body.modelVersion = asked
     return body
   }
 }

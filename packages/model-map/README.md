@@ -20,6 +20,6 @@ Install it from magpie's **Plugins › Discover**, or with `magpie plugin add @m
 
 The target has to be a model magpie can route: a model of one of your providers, or one of magpie's own ids (`deepseek/deepseek-chat`, for example).
 
-**Gemini.** A Gemini request names its model in the URL, not in the body, so this middleware leaves Gemini requests alone.
+**Gemini.** A Gemini request names its model in the URL; magpie moves it into the body before the middleware runs, so it is mapped like any other API, and the reply's `modelVersion` names the model asked for again.
 
 中文：New API 的「模型重定向」，作为 magpie 网关中间件。回复里的模型名会还原成 agent 请求时用的名字。
