@@ -65,6 +65,14 @@ Magpie plugin contract. No new UI page or test framework is introduced.
 - When the plugin maps gift model quotas.
 - Then the exhausted sibling does not make that gift entry appear exhausted.
 
+### Allow a live sibling bucket on a gift-only account
+
+- Given an account with no coding plan and two live gift plans (ZCode Trust Build and ZCode Start Plan) whose buckets both serve GLM-5.3-Flash.
+- And the Start Plan's bucket is spent while Trust Build's has quota.
+- When the plugin reports the account's usage.
+- Then GLM-5.3-Flash and its trial entry count on Trust Build's bucket alone.
+- And the spent Start Plan bucket stays on the card, set aside, so it doesn't mark the model or the account as used up.
+
 ### Keep plain models on the coding plan
 
 - Given a caller uses an existing model ID without the Trial suffix.

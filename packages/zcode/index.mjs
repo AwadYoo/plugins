@@ -538,12 +538,36 @@ const NO_START = "this account has no GLM Coding Plan, and ZCode's Start Plan ha
 async function startUsage(s) {
   const g = await giftOf(s)
   if (!g) return { error: NO_START }
-  for (const w of g.windows) {
-    if (w.models?.length) w.models = [...w.models, ...w.models.map(giftID)]
-    delete w._plan
-    delete w._spent
-  }
+  const best = bestBuckets(g.windows)
+  g.windows = g.windows.map(({ _plan, _spent, ...w }, i) => {
+    if (!w.models?.length) return w
+    // a model two plans give (Trust Build's and the Start Plan's Flash)
+    // counts on the bucket ZCode spends now; the other stays on the card
+    // without holding the model up (ganlerk, Discord)
+    const models = w.models.filter((m) => best.get(m.toLowerCase()) === i)
+    if (!models.length) {
+      delete w.models
+      return { ...w, aside: true }
+    }
+    return { ...w, models: [...models, ...models.map(giftID)] }
+  })
   return g
+}
+
+// bestBuckets is, for each model the gift's buckets serve, the index of
+// the one a request spends: a live one before a spent one, the least
+// used of those. The server picks among an account's buckets itself
+// (ZCode sends no plan with a request), so one spent bucket doesn't stop
+// a model another still has.
+function bestBuckets(windows) {
+  const best = new Map()
+  windows.forEach((w, i) => {
+    for (const m of w.models ?? []) {
+      const key = m.toLowerCase(), old = best.get(key), prev = windows[old]
+      if (old === undefined || (prev._spent && !w._spent) || (prev._spent === w._spent && w.used < prev.used)) best.set(key, i)
+    }
+  })
+  return best
 }
 
 // dualUsage shows both pools but only the pool a request can use counts
@@ -571,13 +595,7 @@ async function dualUsage(s) {
       const notModels = gift.allModels.map((m) => giftID(m).toLowerCase())
       if (notModels.length) out.windows = out.windows.map((w) => w.aside ? w : { ...w, notModels })
       // Several buckets may serve one model: one spent sibling cannot block it.
-      const best = new Map()
-      g.windows.forEach((w, i) => {
-        for (const m of w.models ?? []) {
-          const key = m.toLowerCase(), old = best.get(key), prev = g.windows[old]
-          if (old === undefined || (prev._spent && !w._spent) || (prev._spent === w._spent && w.used < prev.used)) best.set(key, i)
-        }
-      })
+      const best = bestBuckets(g.windows)
       out.windows.push(...g.windows.map(({ _plan: p, _spent, ...w }, i) => {
         const selected = gift.allModels.filter((m) => best.get(m.toLowerCase()) === i)
         const models = selected.map(giftID)

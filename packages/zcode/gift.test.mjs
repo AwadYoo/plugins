@@ -186,3 +186,28 @@ test("a grant ending before the normal route TTL is removed on the next model re
     clock.mockRestore()
   }
 })
+
+test("a gift-only account's spent Start Plan bucket doesn't hold up a model its Trust Build still has", async () => {
+  // ganlerk's account (Discord): Trust Build's GLM-5.3-Flash 14.5% used,
+  // the Start Plan's GLM-5.3-Flash all used, its GLM-5.3 untouched
+  balance.plans = [
+    { plan_id: "trust", user_plan_id: "t1", name: "ZCode Trust Build", status: "active", ends_at: now + 86400 },
+    { plan_id: "start", user_plan_id: "s1", name: "ZCode Start Plan", status: "active", ends_at: now + 7 * 86400 },
+  ]
+  balance.balances = [
+    { plan_id: "start", user_plan_id: "s1", show_name: "GLM-5.3", capabilities: ["model:GLM-5.3"], total_units: 3_000_000, used_units: 0, remaining_units: 3_000_000 },
+    { plan_id: "start", user_plan_id: "s1", show_name: "GLM-5.3-Flash", capabilities: ["model:GLM-5.3-Flash"], total_units: 5_000_000, used_units: 5_000_000, remaining_units: 0 },
+    { plan_id: "trust", user_plan_id: "t1", show_name: "GLM-5.3-Flash", capabilities: ["model:GLM-5.3-Flash"], total_units: 100_000_000, used_units: 14_501_196, remaining_units: 85_498_804, expires_at: now + 3600 },
+  ]
+  const only = { type: "oauth", access: jwt, refresh: JSON.stringify({ ...state, key: undefined, plan: undefined }), expires: 0 }
+  const u = await (await hooks()).auth.usage(async () => only, { id: "zcode" })
+  const counting = (m) => u.windows.filter((w) => !w.aside && w.models?.some((x) => x.toLowerCase() === m.toLowerCase()))
+  for (const m of ["GLM-5.3-Flash", "GLM-5.3-Flash-Trial"]) {
+    expect(counting(m)).toHaveLength(1)
+    expect(counting(m)[0].used).toBeCloseTo(14.5, 1)
+  }
+  expect(counting("GLM-5.3")[0].used).toBe(0)
+  // the spent bucket is still on the card, as ZCode shows it
+  expect(u.windows.find((w) => w.used === 100)).toMatchObject({ name: "GLM-5.3-Flash", aside: true })
+  expect(u.windows).toHaveLength(3)
+})

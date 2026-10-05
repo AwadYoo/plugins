@@ -112,3 +112,9 @@ A gift plan's models appear again as `<model>-Trial` entries, so a
 request can spend the gift's quota on purpose. A trial entry is listed
 while any live bucket serves its model, spent buckets included (a spent
 entry answers 429 rather than vanishing mid-session).
+
+Two plans can give one model (ZCode Trust Build and the Start Plan both
+give GLM-5.3-Flash). The server picks the bucket, so the usage card
+counts the model on its live bucket, the least used, and sets a spent
+sibling aside. A spent sibling never makes the model, or the account,
+look used up while another bucket still has quota.
