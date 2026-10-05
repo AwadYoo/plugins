@@ -529,6 +529,42 @@ function ideHeaders(a, site, extra = {}) {
   }
 }
 
+// ugUA is the User-Agent a growth page (/trae/api/v2/ug/…: the daily
+// check-in) is sent with: TRAE SOLO CN's Electron shell, as its version
+// is named. Bun's own (Bun/1.x) reads as a script, and Trae answers a
+// script's check-in with 9074 「当前参与用户太多，请稍后再试」 however
+// seldom it asks (yetone/magpie#808; qilimixingkong/trae-checkin found
+// the same).
+const ugUA = (site) =>
+  `Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) TRAE-SOLO-CN/${site.clientVersion} Chrome/120.0.6099.291 Electron/28.2.10 Safari/537.36`
+
+// ugHeaders are the headers Trae CN's IDE (3.3.104) sends a growth page
+// with, and only those: its JWT, then its device (fb: x-device-id,
+// x-device-brand, x-device-type, x-os-version, x-app-version), not the
+// chat's tokens and versions.
+function ugHeaders(a, site, extra = {}) {
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Cloud-IDE-JWT ${a.token}`,
+    "User-Agent": ugUA(site),
+    "x-device-id": a.deviceId,
+    "x-device-brand": site.brand,
+    "x-device-type": "Windows",
+    "x-os-version": "10.0.22631",
+    "x-app-version": site.clientVersion,
+    ...extra,
+  }
+}
+
+// ugPage: url is one of Trae's growth pages (the check-in)
+const ugPage = (url) => {
+  try {
+    return new URL(url).pathname.startsWith("/trae/api/v2/ug/")
+  } catch {
+    return false
+  }
+}
+
 // Trae's chat takes text only and has no turn for a tool call or its
 // result. The agent's tools are named to it natively and in a system
 // prompt that asks for each call as a tagged block; earlier calls and
@@ -1461,14 +1497,18 @@ const makePlugin = (site) => async ({ client }) => {
       if (e instanceof Expired) return errorResponse(401, `${a0.name || a0.uid}: ${e.message}`, "expired")
       throw e
     }
-    // Trae's pages, the check-in among them, go with the chat's headers and
-    // the body given ({}): 0.1.7 sent the check-in with the IDE's growth
-    // headers and {req_source: 1} instead, and a check-in that worked on
-    // 0.1.6 failed from then on (yetone/magpie#808)
+    // a growth page (the check-in) goes as the IDE sends it: its headers,
+    // a client's User-Agent, and {req_source: 1} for an empty body. Every
+    // check-in sent with Bun's User-Agent came back 9074, with the chat's
+    // headers and {} (0.1.6, 0.1.9) as with the IDE's (0.1.7)
+    // (yetone/magpie#808). Other pages go with the chat's headers.
+    const ug = ugPage(url)
+    let sent = method === "GET" || method === "HEAD" ? undefined : typeof body === "string" ? body : "{}"
+    if (ug && sent !== undefined && /^\s*(\{\s*\})?\s*$/.test(sent)) sent = JSON.stringify({ req_source: 1 })
     const res = await fetch(url, {
       method,
-      headers: ideHeaders(a, site, { Accept: "application/json" }),
-      body: method === "GET" || method === "HEAD" ? undefined : typeof body === "string" ? body : "{}",
+      headers: ug ? ugHeaders(a, site, { Accept: "application/json" }) : ideHeaders(a, site, { Accept: "application/json" }),
+      body: sent,
       signal: signal ?? AbortSignal.timeout(20_000),
     })
     const text = await res.text()

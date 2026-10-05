@@ -192,16 +192,23 @@ Trae CN gives credits for a daily check-in (每日签到); Trae Global has no
 such page, so this is CN only. magpie can press it
 once a day for each account (Settings, or the switch on the usage card).
 It asks Trae CN's own pages through
-this plugin's fetch, which sends them as the account: its Cloud-IDE-JWT
-(renewed first when near its end) and its device id.
+this plugin's fetch, which sends them as the account, as Trae CN's IDE
+(3.3.104) sends them: its Cloud-IDE-JWT (renewed first when near its
+end), its device (`x-device-id`, `x-device-brand`, `x-device-type`,
+`x-os-version`, `x-app-version`) and a client's User-Agent (TRAE SOLO
+CN's Electron shell). Since 0.2.1: Bun's own User-Agent and the chat's
+headers got 9074 「当前参与用户太多，请稍后再试」 every time
+(yetone/magpie#808).
 
 - **Status:** `POST api.trae.cn/trae/api/v2/ug/checkin_credits/status`,
-  body `{}`: `enable`, `checked_in`, `credits`.
+  body `{"req_source":1}` (magpie's `{}` is sent as that): `enable`,
+  `checked_in`, `credits`.
 - **Claim:** `POST api.trae.cn/trae/api/v2/ug/checkin_credits/claim`,
-  body `{}`, only while it is on and today's isn't in.
+  the same, only while it is on and today's isn't in.
 - **What comes back:** Trae's answer as it is. A 401 or code 1001 marks
   the account for a new sign-in. Code 9095 means this device has checked
-  in today; nothing sends another device id to get round it.
+  in today; nothing sends another device id to get round it, nor to get
+  round a 9074.
 
 Only `api.trae.cn`'s `/trae/api/` pages are sent this way; any other URL
 that isn't a chat request is still refused (400). Needs 0.1.4 or later.
