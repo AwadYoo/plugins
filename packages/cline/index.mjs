@@ -674,7 +674,34 @@ function usageOf(me, balance) {
 
 // ---- the plugin --------------------------------------------------------------------
 
-export const ClinePlugin = async ({ client } = {}) => {
+// pinned is the upstream a DeepSeek model of Cline's is pinned to when the
+// pinUpstream option is on (magpie's built-in ClinePass has the same tick):
+// Cline's gateway otherwise picks among the providers serving the model, and
+// some answer DeepSeek's models worse than DeepSeek's own API. A cline-free/
+// model is left to Cline, as is every model that isn't DeepSeek's.
+function pinned(on, model) {
+	if (!on || typeof model !== "string" || model.startsWith("cline-free/")) return ""
+	return model.slice(model.lastIndexOf("/") + 1).toLowerCase().startsWith("deepseek") ? "deepseek" : ""
+}
+
+// pinBody is the request's body with providerOptions.gateway.only set to the
+// pinned upstream, written in at the end so the rest of the body — the
+// prefix a cache matches — is the client's byte for byte. A body that has
+// providerOptions of its own is the client's to keep.
+function pinBody(body, chat, on) {
+	const up = pinned(on, chat?.model)
+	if (!up || chat.providerOptions !== undefined) return body
+	const end = body.lastIndexOf("}")
+	if (end < 0) return body
+	const head = body.slice(0, end)
+	const sep = /[{,]\s*$/.test(head) ? "" : ","
+	return head + sep + `"providerOptions":${JSON.stringify({ gateway: { only: [up] } })}` + body.slice(end)
+}
+
+// isOn is whether an option is set: true, or "true" in a config written by hand
+const isOn = (v) => v === true || v === "true"
+
+export const ClinePlugin = async ({ client } = {}, options = {}) => {
 	// the accounts fresh renewed this run: the sign-in mark comes off on the
 	// renewed token, whatever the request then met
 	const renewals = new WeakSet()
@@ -845,8 +872,11 @@ export const ClinePlugin = async ({ client } = {}) => {
 					return out
 				}),
 
-			async loader(getAuth) {
+			async loader(getAuth, provider) {
 				const a = await getAuth()
+				// pinUpstream: the plugin's own option, or the provider's in
+				// OpenCode's config (provider.cline.options.pinUpstream)
+				const pin = isOn(options?.pinUpstream) || isOn(provider?.options?.pinUpstream)
 				if (a?.type !== "oauth" && a?.type !== "api") return {}
 				return {
 					baseURL: API,
@@ -862,6 +892,7 @@ export const ClinePlugin = async ({ client } = {}) => {
 							body = await bodyText(input, init)
 							const chat = JSON.parse(body)
 							if (!chat || typeof chat !== "object" || Array.isArray(chat)) throw new Error("not a chat completion")
+							body = pinBody(body, chat, pin)
 						} catch {
 							return errorResponse({ status: 400, message: "a request that isn't a chat completion" })
 						}
@@ -939,6 +970,8 @@ export const _internal = {
 	failure,
 	errorResponse,
 	bodyText,
+	pinned,
+	pinBody,
 	unwrapped,
 	clientHeaders,
 	deviceAuthorize,

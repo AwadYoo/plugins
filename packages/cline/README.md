@@ -53,6 +53,21 @@ apart too. The model list is read from
 needs a sign-in); usage reads `/api/v1/users/me` and the account's `/balance`
 (its balance is counted in millionths of a dollar).
 
+### DeepSeek models only through DeepSeek's own API
+
+Cline's gateway picks among the providers that serve a model. With the
+`pinUpstream` option on, a request for a DeepSeek model (`cline-pass/deepseek-…`,
+not the `cline-free/` ones) carries `"providerOptions": {"gateway": {"only":
+["deepseek"]}}`, so it is answered by DeepSeek's own API only — the same as
+magpie's built-in ClinePass tick. Other models, and a request with
+`providerOptions` of its own, go as sent. It is off by default. Turn it on:
+
+- in magpie: the provider's editor › Upstream › tick "DeepSeek models only
+  through DeepSeek's own upstream";
+- in OpenCode: `"provider": {"cline": {"options": {"pinUpstream": true}}}` in
+  `opencode.json`, or the plugin's own options:
+  `"plugin": [["@magpie-community/opencode-cline-auth", {"pinUpstream": true}]]`.
+
 ## Models
 
 The list is Cline's own, merged from the two feeds its clients read: the
