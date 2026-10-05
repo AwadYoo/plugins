@@ -79,6 +79,14 @@ the account keeps the declared list. The list is
 cached for 5 minutes; after a failed read, the plugin tries again after 1
 minute.
 
+Which models take images is what Devin tells its CLI's model picker
+(`GetCliModelConfigs`, each model's `supports_images`), asked once signed
+in, with or without the CLI, and cached as the list is: `swe-2`, `swe-1.7`
+and most others do; GLM-5.2, GLM-5.3, Inkling, Nemotron, DeepSeek V4 Flash
+and V4 Pro don't. Before Devin is asked, or when it can't be, the declared
+list says what Devin said on 2026-10-05. A model Devin says nothing of
+takes models.dev's word.
+
 ## Not included
 
 magpie's built-in Devin account does more than this plugin:

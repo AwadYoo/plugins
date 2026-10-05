@@ -224,7 +224,11 @@ function variantFor(families, model, effort) {
 // A variant in keep (one the user picked: swe-2-medium) stays, at the one
 // effort its id is at, and goes to Devin as it is, as magpie's built-in
 // keeps it (devinCollapse).
-function listed(families, keep = []) {
+// Each entry says whether it takes images (image) as images, Devin's word
+// for each variant id, gives it: a variant its own, a family (and its fast
+// run) what all its variants Devin named say; undefined when Devin said
+// nothing of it or its variants disagree.
+function listed(families, keep = [], images = {}) {
   const out = []
   const seen = new Set()
   const add = (m) => {
@@ -235,16 +239,17 @@ function listed(families, keep = []) {
   for (const f of families) {
     const context = f.models.find((m) => m.context)?.context ?? 0
     const output = f.models.find((m) => m.output)?.output ?? 0
-    add({ id: f.uid, name: f.label, context, output, efforts: efforts(f, "") })
+    const image = familyImages(f, images)
+    add({ id: f.uid, name: f.label, context, output, efforts: efforts(f, ""), image })
     for (const t of tiers(f)) {
       const id = f.uid + "-" + t
       if (families.some((g) => named(g, id))) continue
-      add({ id, name: f.label + " " + TIERS.find(([w]) => w === t)[1], context, output, efforts: efforts(f, t) })
+      add({ id, name: f.label + " " + TIERS.find(([w]) => w === t)[1], context, output, efforts: efforts(f, t), image })
     }
     if (f.models.length === 1) continue
     for (const m of f.models) {
       if (m.id === f.uid || tierOf(m.id)[1]) continue
-      add({ id: m.id, name: m.name, context: m.context || context, output: m.output || output, efforts: [] })
+      add({ id: m.id, name: m.name, context: m.context || context, output: m.output || output, efforts: [], image: images[m.id] })
     }
   }
   for (const id of keep) {
@@ -253,16 +258,102 @@ function listed(families, keep = []) {
     const m = f?.models.find((m) => m.id === id)
     const level = tierOf(id)[1]
     if (!m && !level) continue
-    add({ id, name: m?.name || id, context: m?.context ?? 0, output: m?.output ?? 0, efforts: level ? [level] : [] })
+    add({ id, name: m?.name || id, context: m?.context ?? 0, output: m?.output ?? 0, efforts: level ? [level] : [], image: images[id] })
   }
   return out
 }
 
-// seesImages is whether a model takes images, as magpie's built-in tells
-// it for Devin's ids (models.go: m.Images || catalog.SeesImages): Devin's
-// list says nothing of images, so it is models.dev's word for the id — most
-// of the providers listing it taking images — from the catalog magpie's
-// `magpie sync` or OpenCode keeps, and no when neither has it.
+// familyImages is what a family's variants Devin named all say of images.
+function familyImages(f, images) {
+  let said
+  for (const m of f.models) {
+    const v = images[m.id]
+    if (typeof v !== "boolean") continue
+    if (said !== undefined && said !== v) return undefined
+    said = v
+  }
+  return said
+}
+
+// Which of Devin's models take images is what Devin tells its CLI's model
+// picker (GetCliModelConfigs: each ClientModelConfig's supports_images), as
+// magpie's built-in asks it (devin_images.go): `devin models list` says
+// nothing of images and models.dev doesn't know Devin's own ids, so swe-2
+// was said to take none and agents dropped its images (面条 on magpie's
+// Discord). NO_IMAGES are the ids Devin said take none, as of 2026-10-05;
+// every other id in SNAPSHOT takes them, which is what a list is told
+// before Devin is asked, or when it can't be.
+const NO_IMAGES = new Set([
+  "glm-5-2", "glm-5-2-max", "glm-5-2-1m", "glm-5-2-max-1m", "glm-5-2-none", "glm-5-2-none-1m",
+  "glm-5-3-low", "glm-5-3-high", "glm-5-3-max",
+  "inkling-none", "inkling-low", "inkling-medium", "inkling-high", "inkling-xhigh", "inkling-max",
+  "deepseek-v4-flash-high", "deepseek-v4-flash-max", "deepseek-v4-pro-high", "deepseek-v4-pro-max",
+  "nemotron-3-ultra-none", "nemotron-3-ultra-medium", "nemotron-3-ultra-high",
+])
+const SNAPSHOT_IMAGES = Object.fromEntries(SNAPSHOT.flatMap(([, , , vs]) => vs.map(([id]) => [id, !NO_IMAGES.has(id)])))
+
+const MODEL_CONFIGS_RPC = "/exa.api_server_pb.ApiServerService/GetCliModelConfigs"
+
+// parseModelConfigs reads GetCliModelConfigsResponse: its
+// client_model_configs (1), each with its model_uid (22) and
+// supports_images (5), a bool proto3 leaves out when false.
+function parseModelConfigs(b) {
+  const out = {}
+  for (const f of fields(b)) {
+    if (f.num !== 1 || f.wire !== 2) continue
+    let uid = ""
+    let images = false
+    for (const g of fields(f.data)) {
+      if (g.num === 22 && g.wire === 2) uid = dec.decode(g.data)
+      else if (g.num === 5 && g.wire === 0) images = g.n !== 0
+    }
+    if (uid) out[uid] = images
+  }
+  return Object.keys(out).length ? out : null
+}
+
+// Each account's word on images, kept and asked again as its list is.
+const said = new Map()
+
+// imagesFor is what Devin says of each model id's images for key's
+// account, SNAPSHOT_IMAGES under it; with wait false, a first ask isn't
+// waited for.
+async function imagesFor(key, server, wait = true) {
+  let c = said.get(key)
+  if (!c) said.set(key, (c = { images: null, at: 0, failed: 0, asking: null }))
+  const ask = () =>
+    (c.asking ??= (async () => {
+      try {
+        const res = await fetch(server + MODEL_CONFIGS_RPC, {
+          method: "POST",
+          headers: { "Content-Type": "application/proto", "Connect-Protocol-Version": "1" },
+          body: new PB().bytes(1, metadata(key)).done(),
+          signal: AbortSignal.timeout(15_000),
+        })
+        if (!res.ok) throw new Error(`GetCliModelConfigs: ${res.status}`)
+        const images = parseModelConfigs(new Uint8Array(await res.arrayBuffer()))
+        if (!images) throw new Error("GetCliModelConfigs: no models")
+        Object.assign(c, { images, at: Date.now(), failed: 0 })
+      } catch {
+        c.failed = Date.now()
+      } finally {
+        c.asking = null
+      }
+    })())
+  if (!c.images || Date.now() - c.at >= FRESH) {
+    if (Date.now() - c.failed >= RETRY) {
+      const p = ask()
+      if (wait && !c.images) await p
+    }
+  }
+  return { ...SNAPSHOT_IMAGES, ...(c.images ?? {}) }
+}
+
+// seesImages is whether a model Devin said nothing of takes images, as
+// magpie's built-in tells it (models.go: m.Images || catalog.SeesImages):
+// models.dev's word for the id — most of the providers listing it taking
+// images — from the catalog magpie's `magpie sync` or OpenCode keeps, and
+// no when neither has it.
 let seen = null
 function seesImages(id) {
   if (!seen) {
@@ -291,7 +382,7 @@ function seesImages(id) {
 const bare = (id) => String(id).toLowerCase().split("/").pop()
 
 function configModel(m) {
-  const image = seesImages(m.id)
+  const image = m.image ?? seesImages(m.id)
   return {
     id: m.id,
     name: m.name,
@@ -306,7 +397,7 @@ function configModel(m) {
 }
 
 function runtimeModel(m) {
-  const image = seesImages(m.id)
+  const image = m.image ?? seesImages(m.id)
   return {
     id: m.id,
     providerID: ID,
@@ -329,6 +420,20 @@ function runtimeModel(m) {
     release_date: "",
     variants: Object.fromEntries(m.efforts.map((e) => [e, { reasoningEffort: e }])),
   }
+}
+
+// withImages is a list of models with what entries (listed's) say of their
+// images on them; a model they say nothing of is left as it was.
+function withImages(models, entries) {
+  const by = new Map(entries.map((m) => [m.id, m.image]))
+  return Object.fromEntries(
+    Object.entries(models ?? {}).map(([id, m]) => {
+      const image = by.get(id)
+      if (typeof image !== "boolean") return [id, m]
+      const caps = m?.capabilities ?? {}
+      return [id, { ...m, capabilities: { ...caps, attachment: image, input: { ...(caps.input ?? { text: true }), image } } }]
+    }),
+  )
 }
 
 // ---- the devin CLI -----------------------------------------------------------------
@@ -885,6 +990,11 @@ const joinNonEmpty = (...s) => s.filter(Boolean).join("\n\n")
 
 const osName = () => (process.platform === "win32" ? "windows" : process.platform)
 
+// metadata is what each request says of the client: the CLI's own (with
+// its ide and extension names alone Devin lists one model).
+const metadata = (key) =>
+  new PB().str(1, "devin-cli").str(2, CLI_VERSION).str(3, key).str(4, "en").str(5, osName()).str(7, CLI_VERSION).str(12, "chisel").str(28, "chisel")
+
 // build is the GetChatMessage request for a chat completion, to the model
 // uid.
 function build(chat, uid, key) {
@@ -963,8 +1073,7 @@ function build(chat, uid, key) {
     msgs[at].text = joinNonEmpty(instructions, msgs[at].text)
   }
 
-  const meta = new PB().str(1, "devin-cli").str(2, CLI_VERSION).str(3, key).str(4, "en").str(5, osName()).str(7, CLI_VERSION).str(12, "chisel").str(28, "chisel")
-  const out = new PB().bytes(1, meta)
+  const out = new PB().bytes(1, metadata(key))
   for (const m of msgs) out.bytes(3, encodeMsg(m))
   out.varint(7, 5)
   const max = chat.max_completion_tokens || chat.max_tokens || 128000 // the server holds it to the model's own
@@ -1331,21 +1440,24 @@ export async function DevinAuthPlugin() {
         npm: CHAT,
         api: BASE,
         ...was,
-        models: { ...Object.fromEntries(listed(familiesOf(SNAPSHOT)).map((m) => [m.id, configModel(m)])), ...(was.models ?? {}) },
+        models: { ...Object.fromEntries(listed(familiesOf(SNAPSHOT), [], SNAPSHOT_IMAGES).map((m) => [m.id, configModel(m)])), ...(was.models ?? {}) },
       }
     },
-    // the account's list, as the devin CLI gives it
+    // the account's list, as the devin CLI gives it, with what Devin says
+    // of each model's images; with no CLI, the list it was given with that
     provider: {
       id: ID,
       async models(provider, { auth } = {}) {
-        if (auth?.type !== "api" || !auth.key || !cliPath()) return provider.models
+        if (auth?.type !== "api" || !auth.key) return provider.models
         const { key, server } = await live(auth)
+        const images = await imagesFor(key, server)
+        if (!cliPath()) return withImages(provider.models, listed(familiesOf(SNAPSHOT), Object.keys(provider?.models ?? {}), images))
         const families = await familiesFor(key, server)
-        return Object.fromEntries(listed(families, Object.keys(provider?.models ?? {})).map((m) => [m.id, runtimeModel(m)]))
+        return Object.fromEntries(listed(families, Object.keys(provider?.models ?? {}), images).map((m) => [m.id, runtimeModel(m)]))
       },
     },
   }
 }
 
 // for tests
-export const _internal = { seesImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames }
+export const _internal = { seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames }
