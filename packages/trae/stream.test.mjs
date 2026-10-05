@@ -174,3 +174,47 @@ test("a model with a Max context is listed a second time, as its Max, which asks
   b = f.seen.at(-1).json
   expect([b.model_name, b.user_message_context]).toEqual(["deepseek-v4.1-flash__dev", undefined])
 })
+
+// ARNO on magpie's Discord: 0.1.14 listed no deepseek-v4.1-flash-max. Trae CN
+// lists the model in several functions (yetone/magpie#681), and they needn't
+// agree: chat_v3's entry names the __max model, while the SOLO entry the model
+// is asked through names only __dev and gives the windows. Its Max is found
+// across them, and asked through the function that names the __max model.
+const SPLIT = { function_configs: [
+  { function: "chat_v3", config_info_list: [
+    { config_name: "deepseek-v4.1-flash", usage: "chat_completion", display_config: { display_name: "DeepSeek-V4-Flash 正式版" }, model_detail_list: [{ model_name: "deepseek-v4.1-flash__dev" }, { model_name: "deepseek-v4.1-flash__max", max_tokens: 128000 }] },
+    { config_name: "DeepSeek-V4-Flash-Official", usage: "chat_completion", display_config: { display_name: "DeepSeek-V4-Flash 正式版" }, model_detail_list: [{ model_name: "DeepSeek-V4-Flash-Official__dev" }] },
+  ] },
+  { function: "solo_work_lite", config_info_list: [
+    { config_name: "deepseek-v4.1-flash", usage: "chat_completion", display_config: { display_name: "DeepSeek-V4.1-Flash" }, context_window_tokens: { dev: 200000, max: 1000000 }, model_detail_list: [{ model_name: "deepseek-v4.1-flash__dev", max_tokens: 64000 }] },
+  ] },
+] }
+
+test("a Max the lists split between them is listed, and asked where its __max model is named", async () => {
+  f = fakeTrae()
+  f.route("POST /api/ide/v1/batch_get_detail_param", () => json(SPLIT))
+  f.route("POST /api/agent/v3/llm_utils_chat", () => sse([["output", { response: "ok" }], ["done", {}]]))
+  const hooks = await TraeCNAuthPlugin({ client: {} })
+  const p = { models: { ..._internal.MODELS } }
+  const live = await hooks.provider.models(p, { auth: signedIn() })
+  expect(Object.keys(live)).toEqual(["deepseek-v4.1-flash", "deepseek-v4.1-flash-max", "DeepSeek-V4-Flash-Official"])
+  expect(live["deepseek-v4.1-flash"].limit).toEqual({ context: 200000, output: 64000 })
+  expect(live["deepseek-v4.1-flash-max"].limit).toEqual({ context: 1000000, output: 128000 })
+  expect(live["deepseek-v4.1-flash-max"].name).toBe("DeepSeek-V4.1-Flash (Max)")
+  const opts = await hooks.auth.loader(async () => signedIn())
+  const send = (body) => opts.fetch(opts.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify({ messages: [{ role: "user", content: "hi" }], ...body }) })
+  await send({ model: "deepseek-v4.1-flash-max" })
+  let b = f.seen.at(-1).json
+  expect([b.function, b.config_name, b.model_name, b.max_tokens, b.user_message_context.model_info.prompt_max_tokens]).toEqual(["chat_v3", "deepseek-v4.1-flash", "deepseek-v4.1-flash__max", 128000, 872000])
+  await send({ model: "deepseek-v4.1-flash" })
+  b = f.seen.at(-1).json
+  expect([b.function, b.model_name, b.user_message_context]).toEqual(["solo_work_lite", "deepseek-v4.1-flash__dev", undefined])
+})
+
+test("a __max model with no bigger window in any list is no Max", async () => {
+  f = fakeTrae()
+  f.route("POST /api/ide/v1/batch_get_detail_param", () => json({ function_configs: [SPLIT.function_configs[0]] }))
+  const hooks = await TraeCNAuthPlugin({ client: {} })
+  const live = await hooks.provider.models({ models: { ..._internal.MODELS } }, { auth: signedIn() })
+  expect(Object.keys(live)).toEqual(["deepseek-v4.1-flash", "DeepSeek-V4-Flash-Official"])
+})

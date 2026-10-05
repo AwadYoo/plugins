@@ -80,10 +80,12 @@ TRAE agent list models `chat_v3` doesn't (deepseek-v4.1-flash is the TRAE
 agent's, `solo_agent`). Left out are the IDE's helpers (`usage` other than
 `chat_completion`: summary, fast_apply…), configs switched off and the
 custom-model slots. Context is the list's `context_window_tokens.dev`,
-output the `__dev` model's `max_tokens`. A config with a `__max` model and
+output the `__dev` model's `max_tokens`. A model with a `__max` model and
 a bigger `context_window_tokens.max` is listed again as its Max,
 `<id>-max` ("… (Max)"), with that window and the `__max` model's
-`max_tokens`; it asks the config's `__max` model, with `max_tokens` set
+`max_tokens`; the two can come from different functions' lists (chat_v3
+can name the `__max` model, a SOLO list the windows). It asks the
+`__max` model through the function that names it, with `max_tokens` set
 and `user_message_context.model_info.prompt_max_tokens` the window less
 it, as Max mode does.
 

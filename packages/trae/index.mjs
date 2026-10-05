@@ -1133,14 +1133,21 @@ function chatModel(m) {
 // devModel is the model an entry serves requests with: its __dev one
 const devModel = (m) => (Array.isArray(m?.model_detail_list) ? m.model_detail_list : []).find((d) => /__dev$/.test(String(d?.model_name ?? "")))
 
-// maxModel is a config's Max mode: its __max model and the window
-// context_window_tokens.max gives it, when that is bigger than dev's; a
-// config without one has no Max
-const maxModel = (m) => {
-  const d = (Array.isArray(m?.model_detail_list) ? m.model_detail_list : []).find((d) => /__max$/.test(String(d?.model_name ?? "")))
-  const window = Number(m?.context_window_tokens?.max) || 0
-  const dev = Number(m?.context_window_tokens?.dev) || 0
-  return d && window > dev ? { name: String(d.model_name), most: Number(d.max_tokens) || 0, window } : null
+// maxModel is a model's Max mode, from the entries its lists give it (the
+// one it is asked through first): the first __max model one names, and the
+// window context_window_tokens.max gives it, when that is bigger than dev's.
+// The lists needn't agree: chat_v3 can name the __max model while the SOLO
+// list the model is asked through names only __dev, and the window can be
+// another entry's again. A model with no __max, or no bigger window, has no
+// Max.
+const maxModel = (...ms) => {
+  const details = (m) => (Array.isArray(m?.model_detail_list) ? m.model_detail_list : [])
+  const at = ms.find((m) => details(m).some((d) => /__max$/.test(String(d?.model_name ?? ""))))
+  if (!at) return null
+  const d = details(at).find((d) => /__max$/.test(String(d?.model_name ?? "")))
+  const first = (k) => [at, ...ms].map((m) => Number(m?.context_window_tokens?.[k]) || 0).find((n) => n > 0) || 0
+  const window = first("max")
+  return window > first("dev") ? { name: String(d.model_name), most: Number(d.max_tokens) || 0, window, entry: at } : null
 }
 
 // MAX is the suffix of a model's Max: deepseek-v4.1-flash-max is
@@ -1186,6 +1193,8 @@ export const TraeCNAuthPlugin = async ({ client }) => {
   // model it names there
   const listedBy = new Map()
   const modelNames = new Map()
+  // the Max each model the list last read has (null: none)
+  const maxes = new Map()
 
   const save = async (auth) => {
     try {
@@ -1402,10 +1411,18 @@ export const TraeCNAuthPlugin = async ({ client }) => {
       const dev = devModel(m)
       if (dev) modelNames.set(id, { fn, name: dev.model_name, most: Number(dev.max_tokens) || 0 })
       else modelNames.delete(id)
-      const max = maxModel(m)
-      if (max && !out.has(id + MAX)) {
-        listedBy.set(id + MAX, fn)
-        modelNames.set(id + MAX, { fn, name: max.name, most: max.most, max: { base: id, window: max.window } })
+      if (out.has(id + MAX)) continue
+      // its Max is asked through the function whose entry names the __max model
+      const entries = [{ m, fn }, ...FUNCTIONS.flatMap((f) => (lists[f] ?? []).filter((o) => o !== m && chatModel(o) && String(o.config_name) === id).map((o) => ({ m: o, fn: f })))]
+      const max = maxModel(...entries.map((e) => e.m))
+      maxes.set(id, max)
+      if (max) {
+        const by = entries.find((e) => e.m === max.entry).fn
+        listedBy.set(id + MAX, by)
+        modelNames.set(id + MAX, { fn: by, name: max.name, most: max.most, max: { base: id, window: max.window } })
+      } else {
+        listedBy.delete(id + MAX)
+        modelNames.delete(id + MAX)
       }
     }
     return [...out.values()].map((x) => x.m)
@@ -1445,7 +1462,7 @@ export const TraeCNAuthPlugin = async ({ client }) => {
           return Object.fromEntries(ms.flatMap((m) => {
             const id = String(m.config_name)
             const own = modelOf(provider, m)
-            const max = maxModel(m)
+            const max = maxes.get(id)
             if (!max || ids.has(id + MAX)) return [[id, own]]
             // its Max, a model of its own: the window and output Max mode gives
             const was = provider.models?.[id + MAX] ?? {}
