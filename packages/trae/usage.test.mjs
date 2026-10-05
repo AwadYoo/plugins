@@ -99,7 +99,9 @@ test("the lists are asked in one batch, as TRAE SOLO CN asks them, and DeepSeek 
   expect(r.headers.get("x-ide-version-code")).toBe("20260917")
   expect(r.headers.get("x-app-version-code")).toBe("20260917")
   // the IDE's helpers, custom-model slots, configs switched off and other functions' models aren't models to pick
-  expect(Object.keys(live)).toEqual(["glm-5.2", "deepseek-v4.1-flash"])
+  // and DeepSeek's Max a model of its own (glm-5.2 names no __max model)
+  expect(Object.keys(live)).toEqual(["glm-5.2", "deepseek-v4.1-flash", "deepseek-v4.1-flash-max"])
+  expect(live["deepseek-v4.1-flash-max"].limit).toEqual({ context: 1000000, output: 128000 })
   const m = live["deepseek-v4.1-flash"]
   expect(m.name).toBe("DeepSeek-V4.1-Flash")
   expect(m.limit).toEqual({ context: 200000, output: 64000 })

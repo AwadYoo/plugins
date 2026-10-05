@@ -449,21 +449,28 @@ const nativeTools = (tools) =>
 // chatBody is the request for llm_utils_chat; modelName is the model the
 // function's list names for the config (its __dev one), when it named one,
 // and most the max_tokens it gives that model (0: none given), which a
-// request asking more is held to
-function chatBody(req, fn, modelName, most = 0) {
+// request asking more is held to. A Max model (max: {base, window}) asks
+// the config base by its __max model, max_tokens always set, and gives
+// the prompt the room the window has beside it, as the IDE's Max mode does.
+function chatBody(req, fn, modelName, most = 0, max = null) {
   const session = randomUUID()
+  const config = max?.base ?? req.model
   const body = {
     messages: traeMessages(req),
     function: fn,
-    config_name: req.model,
-    model: req.model,
+    config_name: config,
+    model: config,
     ...(modelName ? { model_name: modelName } : {}),
     stream: true, // Trae answers in SSE either way
     request_id: session,
     session_id: session,
   }
-  const max = req.max_completion_tokens ?? req.max_tokens
-  if (Number.isFinite(max) && max > 0) body.max_tokens = most > 0 ? Math.min(Math.floor(max), most) : Math.floor(max)
+  const asked = req.max_completion_tokens ?? req.max_tokens
+  if (Number.isFinite(asked) && asked > 0) body.max_tokens = most > 0 ? Math.min(Math.floor(asked), most) : Math.floor(asked)
+  if (max?.window) {
+    if (!body.max_tokens && most > 0) body.max_tokens = most
+    body.user_message_context = { model_info: { prompt_max_tokens: max.window - (body.max_tokens || 0) } }
+  }
   if (typeof req.temperature === "number") body.temperature = req.temperature
   if (Array.isArray(req.tools) && req.tools.length && req.tool_choice !== "none") {
     body.tools = nativeTools(req.tools)
@@ -543,14 +550,21 @@ const callId = () => "call_" + randomBytes(12).toString("hex") + (callSeq++).toS
 // once whole even when DeepSeek closes it with its own tags in place of
 // </tool_call>, or DeepSeek's (<｜DSML｜invoke name="…">, magpie#823); the
 // tags left around a call are dropped.
+//
+// GLM writes a call as its own template has it, <tool_call>name
+// <arg_key>k</arg_key><arg_value>v</arg_value></tool_call>, which is read
+// too; and a {"reasoning_content": …} object in the text is the model's
+// reasoning, not its answer (歧路亡羊 on magpie's Discord).
 class TextTools {
-  constructor() {
+  constructor(tools = []) {
     this.buf = ""
     this.after = false
+    this.tools = tools
   }
   push(s, end = false) {
     this.buf += s
     let text = ""
+    let reasoning = ""
     const calls = []
     for (;;) {
       if (this.after) {
@@ -566,6 +580,27 @@ class TextTools {
       }
       const i = this.buf.indexOf(OPEN)
       const d = this.buf.search(DSML_AT)
+      const r = this.buf.search(REASON_AT)
+      if (r >= 0 && (i < 0 || r < i) && (d < 0 || r < d)) {
+        const o = objectEnd(this.buf, r)
+        if (o === -1 && !end) {
+          // not whole yet: held, the text before it sent
+          text += this.buf.slice(0, r)
+          this.buf = this.buf.slice(r)
+          break
+        }
+        const v = o > 0 ? looseJSON(this.buf.slice(r, o)) : null
+        if (v && typeof v.reasoning_content === "string") {
+          text += this.buf.slice(0, r)
+          reasoning += v.reasoning_content
+          this.buf = this.buf.slice(o)
+          continue
+        }
+        // not one after all: text, and what follows read on
+        text += this.buf.slice(0, r + 1)
+        this.buf = this.buf.slice(r + 1)
+        continue
+      }
       if (i < 0 && d < 0) break
       if (d >= 0 && (i < 0 || d < i)) {
         text += this.buf.slice(0, d)
@@ -620,28 +655,79 @@ class TextTools {
         this.after = true
         continue
       }
-      const j = this.buf.indexOf(CLOSE, i + OPEN.length)
-      if (j < 0) break
+      let j = this.buf.indexOf(CLOSE, i + OPEN.length)
+      if (j < 0) {
+        // GLM's call, cut short at the end, is still the call
+        if (!end || !glmCall(this.buf.slice(i + OPEN.length), this.tools)) break
+        j = this.buf.length
+      }
       text += this.buf.slice(0, i)
       const raw = this.buf.slice(i + OPEN.length, j).trim()
       this.buf = this.buf.slice(j + CLOSE.length)
-      const w = looseJSON(raw) ?? {}
-      if (w.name) calls.push({ name: String(w.name), arguments: callArgs(w) })
-      else text += OPEN + raw + CLOSE
+      const w = looseJSON(raw) ?? glmCall(raw, this.tools) ?? {}
+      if (w.name) {
+        calls.push({ name: String(w.name), arguments: callArgs(w) })
+        this.after = true
+      } else text += OPEN + raw + CLOSE
     }
     if (end) {
       text += this.buf
       this.buf = ""
     } else {
       // keep back an opened block, or what may be the start of one
-      const at = [this.buf.indexOf(OPEN), this.buf.search(DSML_AT)].filter((x) => x >= 0)
+      const at = [this.buf.indexOf(OPEN), this.buf.search(DSML_AT), this.buf.search(REASON_AT)].filter((x) => x >= 0)
       let keep = at.length ? this.buf.length - Math.min(...at) : 0
       if (!keep) for (let k = Math.min(MARK_MAX - 1, this.buf.length); k > 0; k--) if (MARKS.some((m) => m.startsWith(this.buf.slice(-k)))) { keep = k; break }
       text += this.buf.slice(0, this.buf.length - keep)
       this.buf = this.buf.slice(this.buf.length - keep)
     }
-    return { text, calls }
+    return { text, calls, reasoning }
   }
+}
+
+// GLM's call template: the tool's name, then each argument as
+// <arg_key>k</arg_key><arg_value>v</arg_value>
+const GLM_ARG = /<arg_key>\s*([\s\S]*?)\s*<\/arg_key>\s*<arg_value>([\s\S]*?)<\/arg_value>/g
+
+// glmCall is a call GLM wrote in its template ({name, arguments}), null
+// when s isn't one. A value is its text where the tool's schema says
+// string (or the text isn't JSON), else its JSON, as GLM's template writes
+// a value that isn't a string. A name alone is a call only to a tool the
+// request has.
+function glmCall(s, tools = []) {
+  s = String(s ?? "").replace(/<\/tool_call>\s*$/, "")
+  const k = s.indexOf("<arg_key>")
+  const name = (k < 0 ? s : s.slice(0, k)).trim()
+  if (!/^[\w.:-]{1,128}$/.test(name)) return null
+  if (k < 0 && !tools.some((t) => (t.function ?? t)?.name === name)) return null
+  const props = (tools.find((t) => (t.function ?? t)?.name === name)?.function ?? {}).parameters?.properties ?? {}
+  const args = {}
+  for (const m of s.matchAll(GLM_ARG)) {
+    const raw = m[2]
+    if (props[m[1]]?.type === "string") {
+      args[m[1]] = raw
+      continue
+    }
+    try {
+      args[m[1]] = JSON.parse(raw.trim())
+    } catch {
+      args[m[1]] = raw
+    }
+  }
+  if (k >= 0 && !Object.keys(args).length) return null
+  return { name, arguments: args }
+}
+
+// toolNamed is the request's own name for a tool a model named otherwise
+// (Read for read, list-files for list_files); name itself when the request
+// has none like it. A tool it has none of goes on as named: the agent tells
+// the model there's no such tool, which it can act on, where a call
+// dropped here would end the turn with nothing.
+function toolNamed(name, tools) {
+  const names = tools.map((t) => (t.function ?? t)?.name).filter(Boolean)
+  if (!names.length || names.includes(name)) return name
+  const norm = (n) => String(n).toLowerCase().replace(/[^a-z0-9]/g, "")
+  return names.find((n) => norm(n) === norm(name)) ?? name
 }
 
 // DeepSeek's tags, with its full-width bar or a plain one
@@ -656,7 +742,9 @@ const DSML_PARAM = new RegExp(String.raw`<\s*[|｜][\s|｜]*DSML[\s|｜]*paramet
 // next call's
 const LEFTOVER = new RegExp(String.raw`^(?:\s+|<\/tool_calls?>|<tool_calls>|` + DSML + String.raw`(?![\s|｜]*invoke\b)[^<>]*>)+`)
 // what text may be the start of, so held back
-const MARKS = [OPEN, CLOSE, "<｜DSML｜", "<|DSML|", "</｜DSML｜", "</|DSML|"]
+const MARKS = [OPEN, CLOSE, "<｜DSML｜", "<|DSML|", "</｜DSML｜", "</|DSML|", '{"reasoning_content"']
+// reasoning a model wrote into its text as JSON
+const REASON_AT = /\{\s*"reasoning_content"\s*:/
 const MARK_MAX = Math.max(...MARKS.map((m) => m.length))
 
 // dsmlArgs is the arguments of a DSML invoke as JSON: a parameter marked
@@ -793,8 +881,15 @@ class NativeCalls {
     if (next.startsWith(prev) || done(prev)) o.arguments = next // the arguments so far
     else o.arguments = prev + next // a piece
   }
-  take() {
+  take(tools = []) {
     return this.calls.filter((c) => c.name).map(({ id, name, arguments: a }) => {
+      // a name that holds the whole call, as JSON or in GLM's template:
+      // that call, its arguments the name's when it gave none of its own
+      const w = name.trimStart().startsWith("{") ? looseJSON(name) : name.includes("<arg_key>") ? glmCall(name, tools) : null
+      if (w?.name) {
+        name = String(w.name)
+        if (!a || a.trim() === "{}") a = callArgs(w)
+      }
       const v = a && !done(a) ? looseJSON(a) : null
       return { id: id || callId(), name, arguments: v ? JSON.stringify(v) : a || "{}" }
     })
@@ -812,11 +907,48 @@ function done(a) {
   }
 }
 
+// the events that carry the answer: output and message, and the names
+// Trae has put a reply's text under otherwise (delta, or none at all);
+// any other is queueing, metadata or timing
+const ANSWER = new Set(["", "output", "message", "delta", "content", "text", "answer", "chunk", "output_delta", "message_delta"])
+
+// finishOf is OpenAI's finish_reason for the one Trae's last event gives,
+// "" for none it says or one it has no word for
+function finishOf(d) {
+  const f = String(d?.finish_reason ?? d?.stop_reason ?? d?.finishReason ?? "").toLowerCase()
+  if (["length", "max_tokens", "max_output_tokens", "max_length"].includes(f)) return "length"
+  if (f === "content_filter" || f === "sensitive") return "content_filter"
+  return ""
+}
+
+// Thoughts is the reasoning sent on so far: a piece Trae sends again (the
+// same one twice in a row, or the reasoning so far, again or with more
+// after it) sends only what is new
+class Thoughts {
+  constructor() {
+    this.all = ""
+    this.last = ""
+  }
+  add(r) {
+    const last = this.last
+    this.last = r
+    if (r === last && r.length >= 8) return ""
+    if (this.all.length >= 16 && r.length >= 16 && this.all.endsWith(r)) return ""
+    if (this.all.length >= 16 && r.startsWith(this.all)) r = r.slice(this.all.length)
+    this.all += r
+    return r
+  }
+}
+
 // parts turns Trae's events into what the answer is made of: text,
-// reasoning, tool calls, the token counts, the finish, or an error.
-async function* parts(events) {
-  const tt = new TextTools()
+// reasoning, tool calls, the token counts, the finish, or an error. tools
+// are the request's, a call to one named otherwise going on under its name.
+async function* parts(events, tools = []) {
+  const tt = new TextTools(tools)
   const nc = new NativeCalls()
+  const th = new Thoughts()
+  const call = (c) => ({ call: { ...c, name: toolNamed(c.name, tools) } })
+  let finish = ""
   for await (const { event, data } of events) {
     const name = eventName(event)
     const d = data && typeof data === "object" ? data : {}
@@ -834,27 +966,38 @@ async function* parts(events) {
     if (name === "done" || name === "response_done" || name === "stream_done") {
       const u = tokensOf(d.usage)
       if (u) yield { usage: u }
+      finish = finishOf(d) || finish
       break
     }
-    if (name && name !== "output" && name !== "message") continue // queueing, metadata, timing
-    const reasoning = d.reasoning_content ?? d.reasoning ?? ""
-    if (typeof reasoning === "string" && reasoning) yield { reasoning }
-    let text = typeof d.response === "string" ? d.response : typeof d.content === "string" ? d.content : ""
+    if (!ANSWER.has(name)) continue
+    const delta = d.delta && typeof d.delta === "object" ? d.delta : {}
+    const reasoning = d.reasoning_content ?? d.reasoning ?? delta.reasoning_content ?? ""
+    if (typeof reasoning === "string" && reasoning) {
+      const r = th.add(reasoning)
+      if (r) yield { reasoning: r }
+    }
+    let text = typeof d.response === "string" ? d.response : typeof d.content === "string" ? d.content : typeof delta.content === "string" ? delta.content : typeof d.delta === "string" ? d.delta : ""
     // the IDE's own progress notes, not the model's
     if (/^(Building prompt:|Completed building prompt)/.test(text)) text = ""
     if (text) {
       const r = tt.push(text)
+      const t = r.reasoning && th.add(r.reasoning)
+      if (t) yield { reasoning: t }
       if (r.text) yield { text: r.text }
-      for (const c of r.calls) yield { call: { ...c, id: callId() } }
+      for (const c of r.calls) yield call({ ...c, id: callId() })
     }
     for (const tc of Array.isArray(d.tool_calls) ? d.tool_calls : []) nc.push(tc)
     const u = tokensOf(d.usage)
     if (u) yield { usage: u }
+    finish = finishOf(d) || finish
   }
   const r = tt.push("", true)
+  const t = r.reasoning && th.add(r.reasoning)
+  if (t) yield { reasoning: t }
   if (r.text) yield { text: r.text }
-  for (const c of r.calls) yield { call: { ...c, id: callId() } }
-  for (const c of nc.take()) yield { call: c }
+  for (const c of r.calls) yield call({ ...c, id: callId() })
+  for (const c of nc.take(tools)) yield call(c)
+  if (finish) yield { finish }
 }
 
 // first reads events up to the first that is the answer's, so an answer
@@ -899,45 +1042,71 @@ async function openai(req, it) {
     let reasoning = ""
     const calls = []
     let usage = null
+    let finish = ""
     for await (const p of it) {
       if (p.error) return failure(502, p.code, p.error)
       if (p.text) text += p.text
       if (p.reasoning) reasoning += p.reasoning
       if (p.call) calls.push(p.call)
       if (p.usage) usage = p.usage
+      if (p.finish) finish = p.finish
     }
     const message = { role: "assistant", content: text || (calls.length ? null : "") }
     if (reasoning) message.reasoning_content = reasoning
     if (calls.length) message.tool_calls = calls.map((c) => ({ id: c.id, type: "function", function: { name: c.name, arguments: c.arguments } }))
-    const body = { id, object: "chat.completion", created, model, choices: [{ index: 0, message, finish_reason: calls.length ? "tool_calls" : "stop" }] }
+    const body = { id, object: "chat.completion", created, model, choices: [{ index: 0, message, finish_reason: calls.length ? "tool_calls" : finish || "stop" }] }
     if (usage) body.usage = usage
     return new Response(JSON.stringify(body), { status: 200, headers: { "content-type": "application/json" } })
   }
   const enc = new TextEncoder()
   const chunk = (delta, finish = null, extra = {}) => enc.encode(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [{ index: 0, delta, finish_reason: finish }], ...extra })}\n\n`)
+  // a reply that failed (an error event, or Trae's stream breaking off)
+  // ends with the error and [DONE], not a finish that says it stopped; the
+  // stream is closed whatever happens, and an agent that goes away stops
+  // the reading of Trae's
+  const error = (message, code = null) => enc.encode(`data: ${JSON.stringify({ error: { message: `Trae CN: ${message}`, type: "api_error", code } })}\n\n`)
+  let gone = false
   const stream = new ReadableStream({
     async start(ctl) {
       let calls = 0
       let usage = null
-      ctl.enqueue(chunk({ role: "assistant", content: "" }))
+      let finish = ""
+      let failed = false
+      const put = (b) => {
+        if (!gone) ctl.enqueue(b)
+      }
       try {
+        put(chunk({ role: "assistant", content: "" }))
         for await (const p of it) {
+          if (gone) break
           if (p.error) {
-            ctl.enqueue(enc.encode(`data: ${JSON.stringify({ error: { message: `Trae CN: ${p.error}`, type: "api_error", code: p.code ?? null } })}\n\n`))
+            put(error(p.error, p.code ?? null))
+            failed = true
             break
           }
-          if (p.text) ctl.enqueue(chunk({ content: p.text }))
-          if (p.reasoning) ctl.enqueue(chunk({ reasoning_content: p.reasoning }))
-          if (p.call) ctl.enqueue(chunk({ tool_calls: [{ index: calls++, id: p.call.id, type: "function", function: { name: p.call.name, arguments: p.call.arguments } }] }))
+          if (p.text) put(chunk({ content: p.text }))
+          if (p.reasoning) put(chunk({ reasoning_content: p.reasoning }))
+          if (p.call) put(chunk({ tool_calls: [{ index: calls++, id: p.call.id, type: "function", function: { name: p.call.name, arguments: p.call.arguments } }] }))
           if (p.usage) usage = p.usage
+          if (p.finish) finish = p.finish
         }
-        ctl.enqueue(chunk({}, calls ? "tool_calls" : "stop"))
-        if (usage) ctl.enqueue(enc.encode(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [], usage })}\n\n`))
-        ctl.enqueue(enc.encode("data: [DONE]\n\n"))
+        if (!failed) {
+          put(chunk({}, calls ? "tool_calls" : finish || "stop"))
+          if (usage) put(enc.encode(`data: ${JSON.stringify({ id, object: "chat.completion.chunk", created, model, choices: [], usage })}\n\n`))
+        }
       } catch (e) {
-        ctl.enqueue(enc.encode(`data: ${JSON.stringify({ error: { message: `Trae CN: ${e?.message ?? e}`, type: "api_error", code: null } })}\n\n`))
+        try {
+          put(error(e?.message ?? e))
+        } catch {}
       }
-      ctl.close()
+      try {
+        put(enc.encode("data: [DONE]\n\n"))
+        if (!gone) ctl.close()
+      } catch {}
+    },
+    cancel() {
+      gone = true
+      it.return?.()
     },
   })
   return new Response(stream, { status: 200, headers: { "content-type": "text/event-stream", "cache-control": "no-cache" } })
@@ -963,6 +1132,20 @@ function chatModel(m) {
 
 // devModel is the model an entry serves requests with: its __dev one
 const devModel = (m) => (Array.isArray(m?.model_detail_list) ? m.model_detail_list : []).find((d) => /__dev$/.test(String(d?.model_name ?? "")))
+
+// maxModel is a config's Max mode: its __max model and the window
+// context_window_tokens.max gives it, when that is bigger than dev's; a
+// config without one has no Max
+const maxModel = (m) => {
+  const d = (Array.isArray(m?.model_detail_list) ? m.model_detail_list : []).find((d) => /__max$/.test(String(d?.model_name ?? "")))
+  const window = Number(m?.context_window_tokens?.max) || 0
+  const dev = Number(m?.context_window_tokens?.dev) || 0
+  return d && window > dev ? { name: String(d.model_name), most: Number(d.max_tokens) || 0, window } : null
+}
+
+// MAX is the suffix of a model's Max: deepseek-v4.1-flash-max is
+// deepseek-v4.1-flash in Max mode
+const MAX = "-max"
 
 // ---- usage ------------------------------------------------------------------------
 
@@ -1219,6 +1402,11 @@ export const TraeCNAuthPlugin = async ({ client }) => {
       const dev = devModel(m)
       if (dev) modelNames.set(id, { fn, name: dev.model_name, most: Number(dev.max_tokens) || 0 })
       else modelNames.delete(id)
+      const max = maxModel(m)
+      if (max && !out.has(id + MAX)) {
+        listedBy.set(id + MAX, fn)
+        modelNames.set(id + MAX, { fn, name: max.name, most: max.most, max: { base: id, window: max.window } })
+      }
     }
     return [...out.values()].map((x) => x.m)
   }
@@ -1253,7 +1441,16 @@ export const TraeCNAuthPlugin = async ({ client }) => {
         try {
           const ms = await liveModels(await fresh(async () => auth))
           if (!ms.length) return provider.models
-          return Object.fromEntries(ms.map((m) => [String(m.config_name), modelOf(provider, m)]))
+          const ids = new Set(ms.map((m) => String(m.config_name)))
+          return Object.fromEntries(ms.flatMap((m) => {
+            const id = String(m.config_name)
+            const own = modelOf(provider, m)
+            const max = maxModel(m)
+            if (!max || ids.has(id + MAX)) return [[id, own]]
+            // its Max, a model of its own: the window and output Max mode gives
+            const was = provider.models?.[id + MAX] ?? {}
+            return [[id, own], [id + MAX, { ...own, ...was, id: id + MAX, name: own.name + " (Max)", limit: { context: max.window, output: max.most || own.limit.output }, api: { ...own.api, id: id + MAX } }]]
+          }))
         } catch (e) {
           if (e instanceof Expired) throw e
           return provider.models
@@ -1296,12 +1493,19 @@ export const TraeCNAuthPlugin = async ({ client }) => {
             // served this account last, then the rest
             const fns = [...new Set([listedBy.get(String(req.model)), fnOf.get(who), ...FUNCTIONS].filter(Boolean))]
             let last
-            const named = modelNames.get(String(req.model))
-            for (const fn of fns) {
+            let named = modelNames.get(String(req.model))
+            if (!named && String(req.model).endsWith(MAX)) {
+              // a Max asked before the list was read here: read it
+              await liveModels(a).catch(() => {})
+              named = modelNames.get(String(req.model))
+              if (named) fns.unshift(named.fn)
+            }
+            const max = named?.max ?? null
+            for (const fn of [...new Set(fns)]) {
               const res = await fetch(apiOf(a) + "/api/agent/v3/llm_utils_chat", {
                 method: "POST",
                 headers: ideHeaders(a, { Accept: "text/event-stream", "X-Request-ID": randomUUID() }),
-                body: JSON.stringify(chatBody(req, fn, named?.fn === fn ? named.name : "", named?.fn === fn ? named.most : 0)),
+                body: JSON.stringify(chatBody(req, fn, named?.fn === fn || max ? named.name : "", named?.fn === fn || max ? named.most : 0, max)),
                 signal: init.signal ?? r0?.signal,
               })
               if (!res.ok) {
@@ -1319,7 +1523,7 @@ export const TraeCNAuthPlugin = async ({ client }) => {
                 if (wrongFunction(e.code)) continue
                 break
               }
-              const it = parts(sse(res.body))[Symbol.asyncIterator]()
+              const it = parts(sse(res.body), Array.isArray(req.tools) ? req.tools : [])[Symbol.asyncIterator]()
               const { held, done } = await first(it)
               const err = held.find((p) => p.error)
               if (err) {
@@ -1343,4 +1547,4 @@ export const TraeCNAuthPlugin = async ({ client }) => {
 }
 
 // for tests
-export const _internal = { HOSTS, MODELS, TextTools, NativeCalls, looseJSON, traeMessages, chatBody, credits, whenOf, newDevice }
+export const _internal = { HOSTS, MODELS, TextTools, NativeCalls, looseJSON, glmCall, toolNamed, traeMessages, chatBody, credits, whenOf, newDevice }

@@ -44,17 +44,31 @@ agent's `POST https://trae-api-cn.mchost.guru/api/agent/v3/llm_utils_chat`:
   `x-app-id`, the device headers and `x-uid`.
 - **Answer:** Trae always answers in its own SSE events:
   - `output` gives `response`/`content` and `reasoning_content`/`reasoning`.
+    Text under `message`, `delta` or an event with no name is the answer's
+    too.
   - `token_usage`, `done` and `error` mark usage, the end and failures.
+    `done`'s `finish_reason` `length`/`max_tokens` is OpenAI's `length`.
   - Queue events are ignored.
+  - A `{"reasoning_content": …}` object written into the text is reasoning,
+    and reasoning Trae sends again is sent once.
 
-  The plugin turns these into an OpenAI stream or a single body.
+  The plugin turns these into an OpenAI stream or a single body. A reply
+  that fails (an `error` event, or Trae's stream breaking off) ends with the
+  error and `[DONE]`, with no finish.
 - **Tools:**
   - Trae's chat has no turn for a tool call or its result, so the tools are
     named twice:
     - natively in `tools`, with `parameters` as a JSON string;
     - in a system prompt that asks for each call as a
       `<tool_call>{"name", "arguments"}</tool_call>` block.
-  - Calls from either source become OpenAI `tool_calls`.
+  - GLM also writes its own template, `<tool_call>name<arg_key>k</arg_key>
+    <arg_value>v</arg_value></tool_call>` (a string kept as written, other
+    types read as JSON), and sometimes a whole call into a native call's
+    name; both are read as the call.
+  - Calls from either source become OpenAI `tool_calls`. A name matching a
+    requested tool but for case or punctuation (`Read`) goes on as the
+    request's (`read`); any other goes on as written, so the agent can say
+    the tool doesn't exist.
   - Earlier calls and their results go back in as text.
   - Images aren't sent.
 
@@ -65,8 +79,19 @@ time, when the batch gives none). The lists are put together: SOLO and the
 TRAE agent list models `chat_v3` doesn't (deepseek-v4.1-flash is the TRAE
 agent's, `solo_agent`). Left out are the IDE's helpers (`usage` other than
 `chat_completion`: summary, fast_apply…), configs switched off and the
-custom-model slots. Context is the list's `context_window_tokens.dev`
-(`max` is Max mode's), output the `__dev` model's `max_tokens`. When no
+custom-model slots. Context is the list's `context_window_tokens.dev`,
+output the `__dev` model's `max_tokens`. A config with a `__max` model and
+a bigger `context_window_tokens.max` is listed again as its Max,
+`<id>-max` ("… (Max)"), with that window and the `__max` model's
+`max_tokens`; it asks the config's `__max` model, with `max_tokens` set
+and `user_message_context.model_info.prompt_max_tokens` the window less
+it, as Max mode does.
+
+Reasoning: the models reason, but Trae's request takes no effort or
+thinking level, so the plugin lists no variants and a level an agent
+picks does nothing.
+
+When no
 list can be read, the plugin uses the models Trae CN's `chat_v3` is
 known to serve: GLM-5.2, GLM-5, Kimi K2.6, Qwen 3.7 Plus, DeepSeek V4 Pro
 and DeepSeek V4 Flash.
