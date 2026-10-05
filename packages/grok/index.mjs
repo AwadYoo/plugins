@@ -29,6 +29,12 @@ const TOOLS = new Set(["function", "web_search", "x_search", "image_generation",
 const ANSI = /\x1b\[[0-9;?]*[A-Za-z]/g
 const LINK = /https:\/\/\S+/
 
+// linkIn is the page a line of `grok login` gives to open, "" for none: a
+// line saying it failed names the endpoint it couldn't reach (`Error: error
+// sending request for url (https://auth.x.ai/oauth2/device/code): …`),
+// which is no page to open.
+const linkIn = (line) => (/\berror\b/i.test(line) ? "" : (line.match(LINK)?.[0] ?? ""))
+
 // ---- the CLI ------------------------------------------------------------------
 
 // cliHome is where the CLI keeps its own sign-in and settings.
@@ -300,26 +306,30 @@ function login(exe, home, own) {
       const line = buf.slice(0, i).replace(/\r$/, "").replace(ANSI, "").trim()
       buf = buf.slice(i + 1)
       if (line) tail.push(line)
-      const u = line.match(LINK)?.[0]
+      const u = linkIn(line)
       if (u) found(u)
     }
   }
   child.stdout.on("data", onData)
   child.stderr.on("data", onData)
   const done = new Promise((resolve) => {
-    child.on("error", (e) => resolve({ ok: false, why: e.message }))
+    child.on("error", (e) => {
+      tail.push(e.message)
+      found("")
+      resolve({ ok: false, why: e.message })
+    })
     child.on("close", (code) => {
       const rest = buf.replace(ANSI, "").trim()
       if (rest) {
         tail.push(rest)
-        const u = rest.match(LINK)?.[0]
+        const u = linkIn(rest)
         if (u) found(u)
       }
       found("")
       resolve({ ok: code === 0, why: tail.at(-1) ?? "grok login didn't finish" })
     })
   })
-  return { child, link, done }
+  return { child, link, done, tail }
 }
 
 function newHome() {
@@ -336,12 +346,15 @@ async function signIn() {
   if (!exe) throw new Error(`install Grok Build first: ${INSTALL}`)
   const own = !!credential(cliHome())
   const home = own ? newHome() : cliHome()
-  const { child, link, done } = login(exe, home, own)
+  const { child, link, done, tail } = login(exe, home, own)
   const url = await Promise.race([link, new Promise((r) => setTimeout(() => r(""), LINK_WAIT))])
   if (!url) {
     child.kill()
     if (own) rmSync(home, { recursive: true, force: true })
-    throw new Error("grok login gave no link to open")
+    // what it said last is why: where x.ai is out of reach without a
+    // proxy, it says it couldn't reach it (𝕏 on Discord)
+    const why = tail.at(-1)
+    throw new Error(why ? `grok login gave no link to open: ${why}` : "grok login gave no link to open and said nothing: can this machine reach auth.x.ai? Set a proxy in magpie's Settings if it needs one")
   }
   return {
     url,
