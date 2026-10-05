@@ -1083,6 +1083,7 @@ class NativeCalls {
     const next = c.arguments
     if (!next || prev.startsWith(next)) return // nothing new
     if (next.startsWith(prev) || done(prev)) o.arguments = next // the arguments so far
+    else if (resent(prev, next)) o.arguments = next // the whole call again, written apart (plugins#24)
     else o.arguments = prev + next // a piece
   }
   take(tools = []) {
@@ -1098,6 +1099,19 @@ class NativeCalls {
       return { id: id || callId(), name, arguments: v ? JSON.stringify(v) : a || "{}" }
     })
   }
+}
+
+// resent says next is the call's whole arguments sent again after a
+// partial snapshot, not a piece of them: Trae resends a snapshot whose
+// punctuation isn't the first one's (− for -, ′ for '), so it doesn't
+// start with it. A whole object under the same first key as prev's, which
+// prev and it joined don't make whole; a piece that is a value of its own
+// (12, "ls", {}) doesn't open with prev's first key.
+function resent(prev, next) {
+  const key = (s) => s.match(/^\s*\{\s*"((?:[^"\\]|\\.)*)"/)?.[1]
+  if (!next.trimStart().startsWith("{") || !done(next) || done(prev + next)) return false
+  const k = key(prev)
+  return k !== undefined && k === key(next)
 }
 
 // done says arguments are a whole JSON value already
