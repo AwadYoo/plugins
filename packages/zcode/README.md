@@ -92,6 +92,18 @@ behind an error, so a gift hiccup must not black out a working Coding
 Plan. A gift that goes out of date while requests use it simply stops
 showing.
 
+**Gift plans ZCode holds but has not granted.** ZCode hands out one-off
+trust-build / gift plans (a day's ZCode Trust Build, say) that are not
+on the account until the ZCode app claims them. The plugin reads the
+app's own list of them (`GET /api/v1/zcode-plan/billing/preview`) with
+the card and names them there — "1 to claim · claim it in the ZCode app"
+— set aside, so the line stops nothing and routing, usage caps and the
+menu bar pass it over. The plugin never claims one: the claim needs the
+Aliyun captcha attestation only the app's renderer can make. A preview
+that fails, or lists nothing, adds no line at all, and a card that is an
+error keeps its error. Claim the plan in the ZCode app (open it once);
+the next read shows it as an ordinary gift bucket.
+
 ## Models
 
 The models are the ones ZCode offers for the account's plan. They come

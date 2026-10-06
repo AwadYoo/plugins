@@ -531,6 +531,30 @@ async function giftOf(s) {
   return out
 }
 
+// claimHint is the card's line for gift plans ZCode is holding for the
+// account but has not put on it: GET /billing/preview lists them, and
+// only the ZCode app claims one — its claim takes the Aliyun captcha
+// attestation the app's own renderer makes, so the plugin reads the list
+// and asks the user to claim it there. A window, set aside (it is no
+// allowance: using it up stops nothing), so the card shows it and
+// routing, caps and the menu bar pass it over. null when there is
+// nothing to claim, the preview failing or listing none among it: a
+// failed read is no line at all, never a card or a refusal of its own.
+async function claimHint(s) {
+  if (!s.jwt || jwtExpired(s.jwt)) return null
+  let d
+  try {
+    d = await call("GET", `${ZCODE}/api/v1/zcode-plan/billing/preview?app_version=${APP_VERSION}&platform=${platform()}`, { auth: "Bearer " + s.jwt, device: s.device })
+  } catch {
+    return null
+  }
+  const plans = (Array.isArray(d?.plans) ? d.plans : []).filter((p) => typeof p?.plan_id === "string" && p.plan_id.trim())
+  if (!plans.length) return null
+  const n = plans.length
+  const name = first(...plans.map((p) => (typeof p?.name === "string" ? p.name : "")), "ZCode gift plan")
+  return { name, used: 0, aside: true, display: `${n} to claim · claim ${n === 1 ? "it" : "them"} in the ZCode app` }
+}
+
 // startUsage is a gift-only account's card: its buckets, or the words
 // for having none to show. The card's header already names the plan, so
 // the windows keep their own names.
@@ -1523,9 +1547,16 @@ export async function ZCodeAuthPlugin({ client }) {
             return saved(await teamUsage(s, key))
           }
           const { start, gift } = await plansOf(s)
-          if (start) return saved(await startUsage(s))
-          if (gift) return saved(await dualUsage(s))
-          return saved(await codingUsage(s))
+          const card = saved(start ? await startUsage(s) : gift ? await dualUsage(s) : await codingUsage(s))
+          // a gift plan ZCode holds for the account but has not put on it:
+          // named on the card, claimed in the ZCode app (its claim needs
+          // the app's captcha attestation, see claimHint). A card that is
+          // an error keeps its error and asks nothing
+          if (!card.error) {
+            const hint = await claimHint(s)
+            if (hint) card.windows = [...(card.windows ?? []), hint]
+          }
+          return card
         } catch (e) {
           return saved({ error: e?.message ?? String(e) })
         }
@@ -1555,4 +1586,4 @@ export async function ZCodeAuthPlugin({ client }) {
 }
 
 // for tests
-export const _internal = { entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, dress, PROMPT }
+export const _internal = { entry, limitWindows, termOf, startUsage, routes, blocked, plansOf, giftOf, dualUsage, claimHint, spentUp, giftServes, modelOf, teamKeys, ownSignIn, stateOf, dress, PROMPT }
