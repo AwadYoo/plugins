@@ -98,6 +98,17 @@ Each package is a folder under `packages/<name>/`:
     (Responses) or `@ai-sdk/anthropic` (Messages).
   - A list the account decides goes in the `provider: { id, models(provider, { auth }) }`
     hook.
+  - A daily check-in (签到) the vendor rewards goes in the `auth` hook as
+    `checkin(getAuth, provider)`. magpie calls it once a day for each
+    signed-in account while the user has it on (Settings → Usage →
+    Plugins), and shows what came of it on the account's Usage card. It
+    returns `{ outcome, credit?, streak?, message? }`, `outcome` being
+    `claimed` (checked in now), `done` (already today), `ineligible`,
+    `inactive` (no check-in event now), `captcha` or `failed`; a throw is
+    `failed` with its message, and only `failed` is tried again that day.
+    Never solve a captcha: return `captcha` and the user checks in in the
+    vendor's app. Needs magpie with the hook (after v0.1.1083);
+    [the contract](https://github.com/yetone/magpie/blob/main/docs/subsystems/provider-plugins.md#a-plugins-daily-check-in).
 - **`README.md`**: what the package signs in to, how, where the sign-in is
   kept, and the models.
 
