@@ -2,7 +2,11 @@
 // signed in on account.xiaomi.com's long-poll page (a QR code for the
 // Xiaomi phone app, or the password), whose passToken signs it on at the
 // MiMo server, which answers with session cookies. Model requests are
-// chat completions at the server's /route, carrying those cookies.
+// chat completions at the server's /route, carrying those cookies. An
+// account with no app membership but a Token Plan at the open platform
+// (the server answers membership_required) is asked at the Token Plan's
+// endpoint instead, with the plan's tp- key, which the same passToken
+// reads from the platform.
 import { randomBytes } from "node:crypto"
 import { STATUS_CODES } from "node:http"
 
@@ -26,6 +30,10 @@ const MODELS = {
   "mimo-pro": { name: "MiMo Pro", ...MODEL },
   "mimo-flash": { name: "MiMo Flash", ...MODEL },
 }
+
+// the Token Plan's names for the app's models; any other passes as it is
+const TP_MODELS = { "mimo-pro": "mimo-v2.6-pro", "mimo-flash": "mimo-v2.6-flash" }
+const TP_LIFE = 60 * 60 * 1000 // this long, an account the app refused is asked at its Token Plan
 
 const baseOf = (region) => HOSTS[String(region ?? "").trim().toUpperCase()] ?? ""
 const deviceId = () => "pc_" + randomBytes(16).toString("hex")
@@ -536,8 +544,9 @@ export const MimoAuthPlugin = async ({ client }) => {
     }
     const c = self?.current
     const out = { plan: "Free" }
-    const tp = await tokenPlan(getAuth)
-    if (c && typeof c === "object") {
+    const app = c && typeof c === "object"
+    const tp = await tokenPlan(getAuth, app)
+    if (app) {
       const text = (v) => (typeof v === "string" ? v.trim() : "")
       out.plan = text(c.title) || TIERS[c.planTier] || text(c.planCode) || "MiMo"
       const until = serverTime(c.endTime)
@@ -579,7 +588,7 @@ export const MimoAuthPlugin = async ({ client }) => {
   // read (the app's card goes on without it). Its credits are spent by
   // its tp- key, not by this account's requests, so they are an aside.
   const platform = new Map() // userId -> the platform's session cookies
-  const tokenPlan = async (getAuth) => {
+  const tokenPlan = async (getAuth, app) => {
     const a = fromAuth(await getAuth())
     if (!a) return null
     const who = String(a.creds.userId)
@@ -600,11 +609,13 @@ export const MimoAuthPlugin = async ({ client }) => {
         const it = items.find((x) => x?.name === "month_total_token") ?? items.find((x) => x?.name === "plan_total_token")
         if (Number.isFinite(it?.used) && Number(it?.limit) > 0) {
           out.window = {
-            name: "Token Plan · API key",
+            name: app ? "Token Plan · API key" : "Token Plan",
             used: Math.max(0, Math.min(100, (100 * it.used) / it.limit)),
             display: `${credits(it.used)} / ${credits(it.limit)} credits`,
-            aside: true,
           }
+          // with an app plan, the account's requests go to the app: the
+          // Token Plan's credits are its key's, an aside
+          if (app) out.window.aside = true
           if (out.until) out.window.resetsAt = out.until
         }
       } catch {}
@@ -614,6 +625,41 @@ export const MimoAuthPlugin = async ({ client }) => {
       return null
     }
   }
+
+  // planKey is the account's Token Plan as {key, base, at}: its tp- key
+  // and OpenAI base URL, or null when it has no live plan or no key (the
+  // platform's page makes one; magpie doesn't make it for them)
+  const planKeys = new Map() // userId -> {key, base, at}
+  const planKey = async (a) => {
+    const who = String(a.creds.userId)
+    const had = planKeys.get(who)
+    if (had && Date.now() - had.at < TP_LIFE) return had
+    planKeys.delete(who)
+    try {
+      let c = platform.get(who)
+      const read = async (path) => {
+        const r = await platformPage(a.creds, path, c)
+        c = r.cookies
+        platform.set(who, c)
+        return r.data
+      }
+      const p = await read("/tokenPlan/detail")
+      if (!p?.planName || p.expired !== false) return null
+      const k = await read("/tokenPlan/apiKey")
+      const base = typeof k?.openaiBaseUrl === "string" && /^https:\/\/[^/]+\.xiaomimimo\.com\//.test(k.openaiBaseUrl) ? k.openaiBaseUrl.replace(/\/+$/, "") : ""
+      if (!base) return null
+      const key = await read("/tokenPlan/apiKey/raw")
+      if (typeof key !== "string" || !key.startsWith("tp-")) return null
+      const got = { key, base, at: Date.now() }
+      planKeys.set(who, got)
+      return got
+    } catch {
+      platform.delete(who)
+      return null
+    }
+  }
+  // onPlan is the accounts the app refused (membership_required), and when
+  const onPlan = new Map()
 
   return {
     config: async (config) => {
@@ -667,6 +713,35 @@ export const MimoAuthPlugin = async ({ client }) => {
               const message = `${who}: the Xiaomi MiMo sign-in has expired — sign in again`
               return said(new Response(JSON.stringify({ error: { message, type: "api_error", code: null } }), { status: 502, headers: { "content-type": "application/json" } }), "expired")
             }
+            const who = String(s.creds.userId)
+            const method = init.method ?? req?.method ?? "POST"
+            // the account's Token Plan, at its own endpoint with its key:
+            // what the app's /route was asked for, as the plan names it
+            const toPlan = async () => {
+              const tp = await planKey(s)
+              if (!tp) return null
+              let b = body
+              if (typeof b === "string") {
+                try {
+                  const j = JSON.parse(b)
+                  if (TP_MODELS[j?.model]) b = JSON.stringify({ ...j, model: TP_MODELS[j.model] })
+                } catch {}
+              }
+              const rest = new URL(url).pathname.replace(/^.*?\/route(?=\/|$)/, "")
+              const h = new Headers(init.headers ?? req?.headers)
+              for (const k of ["cookie", "x-mimo-source", "x-client-version", "user-agent"]) h.delete(k)
+              h.set("Authorization", "Bearer " + tp.key)
+              const res = await fetch(tp.base + rest, { ...init, method, headers: h, body: b })
+              // the key was reset at the platform: read it again next time
+              if (res.status === 401) planKeys.delete(who)
+              return said(res, s.renewed ? "renewed" : "kept")
+            }
+            const since = onPlan.get(who)
+            if (since && Date.now() - since < TP_LIFE) {
+              const res = await toPlan()
+              if (res) return res
+              onPlan.delete(who)
+            }
             const headers = new Headers(init.headers ?? req?.headers)
             headers.delete("authorization")
             headers.set("Cookie", cookieHeader(s.cookies))
@@ -676,7 +751,25 @@ export const MimoAuthPlugin = async ({ client }) => {
             // the server's answer goes through as it is, a 401 too, as the
             // built-in's did: it took the lapse off only when it signed on
             // again, whatever the server then answered
-            const res = await fetch(url, { ...init, method: init.method ?? req?.method ?? "POST", headers, body })
+            const res = await fetch(url, { ...init, method, headers, body })
+            if (res.status === 403) {
+              const text = await res.text()
+              let code
+              try {
+                code = JSON.parse(text)?.error?.code
+              } catch {}
+              if (code === "membership_required") {
+                const tp = await toPlan()
+                if (tp) {
+                  onPlan.set(who, Date.now())
+                  return tp
+                }
+              }
+              const h = new Headers(res.headers)
+              h.delete("content-encoding")
+              h.delete("content-length")
+              return said(new Response(text, { status: res.status, statusText: res.statusText, headers: h }), s.renewed ? "renewed" : "kept")
+            }
             return said(res, s.renewed ? "renewed" : "kept")
           },
         }

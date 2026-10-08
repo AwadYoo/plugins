@@ -120,7 +120,7 @@ const TP_USAGE = '{"code":0,"message":"","data":{"monthUsage":{"percent":0.0017,
 const TP_WINDOW = { name: "Token Plan · API key", used: (100 * 6809408) / 4100000000, display: "6.81M / 4.1B credits", aside: true, resetsAt: "2026-11-06T23:59:59.000Z" }
 
 function platformOf(detail = DETAIL) {
-  const p = { signOns: 0, cookies: [] }
+  const p = { signOns: 0, cookies: [], key: "tp-one" }
   p.serve = (u, h) => {
     if (u.host === "account.xiaomi.com") {
       p.signOns++
@@ -139,16 +139,20 @@ function platformOf(detail = DETAIL) {
     if (!c.includes("api-platform_serviceToken=pst")) return json({ code: 401, loginUrl: LOGIN }, 401)
     if (u.pathname === "/api/v1/tokenPlan/detail") return new Response(detail, { headers: { "Content-Type": "application/json" } })
     if (u.pathname === "/api/v1/tokenPlan/usage") return new Response(TP_USAGE, { headers: { "Content-Type": "application/json" } })
+    if (u.pathname === "/api/v1/tokenPlan/apiKey") return json({ code: 0, data: { id: 1, redactedApiKey: "tp-c****", openaiBaseUrl: "https://token-plan-cn.xiaomimimo.com/v1", anthropicBaseUrl: "https://token-plan-cn.xiaomimimo.com/anthropic" } })
+    if (u.pathname === "/api/v1/tokenPlan/apiKey/raw") return json({ code: 0, data: p.key })
     return json({ code: 404 }, 404)
   }
   return p
 }
 
-test("no app plan but a Token Plan at the open platform: the card is the Token Plan's, its credits an aside", async () => {
+test("no app plan but a Token Plan at the open platform: the card is the Token Plan's, its credits the allowance", async () => {
   const tp = platformOf()
   const noPlan = (path) => (path === "/api/user/usage" ? json({ code: 0, data: { percent: 0.0, resetDate: null, resetAt: null } }) : json({ code: 0, data: { groupCode: null, current: null, subscriptions: [] } }))
   const p = await plugin(account(), noPlan, tp.serve)
-  const want = { plan: "Token Plan Lite", until: "2026-11-06T23:59:59.000Z", renew: "auto", windows: [TP_WINDOW], signIn: "kept" }
+  // the account's requests go to the Token Plan (the app refuses them), so its credits are no aside
+  const { aside, ...own } = TP_WINDOW
+  const want = { plan: "Token Plan Lite", until: "2026-11-06T23:59:59.000Z", renew: "auto", windows: [{ ...own, name: "Token Plan" }], signIn: "kept" }
   expect(await p.usage()).toEqual(want)
   // the platform's session is kept: the next read doesn't sign on again
   expect(await p.usage()).toEqual(want)
@@ -300,4 +304,65 @@ test("the allowance's page refused after the plan's read marks the account", asy
     return json(SELF)
   })
   expect(await p.usage()).toEqual({ plan: "MiMo 高阶", until: "2026-10-31T16:00:00.000Z", renew: "auto", error: "42: the Xiaomi MiMo sign-in has expired — sign in again", signIn: "expired" })
+})
+
+// an account with no app membership but a Token Plan, as the reporter's
+// (Lite, 2026-10-09): the app's /route answers every model 403
+// membership_required, and the plan's endpoint takes its tp- key
+const REFUSED = '{"error":{"message":"未开通会员或会员已到期，请订阅后使用","type":"permission_error","code":"membership_required","biz_code":30012}}'
+
+async function planFetch(platform, plan) {
+  const asked = []
+  globalThis.fetch = async (url, init = {}) => {
+    const u = new URL(String(url))
+    const h = new Headers(init.headers)
+    if (u.host === "platform.xiaomimimo.com" || u.host === "account.xiaomi.com") return platform.serve(u, h)
+    asked.push({ host: u.host, path: u.pathname, auth: h.get("Authorization"), cookie: h.get("Cookie"), model: JSON.parse(init.body).model })
+    if (u.host === "token-plan-cn.xiaomimimo.com") return plan(h)
+    return new Response(REFUSED, { status: 403, headers: { "Content-Type": "application/json;charset=UTF-8" } })
+  }
+  const hooks = await MimoAuthPlugin({ client: { auth: { set: async () => {} } } })
+  const auth = account()
+  const l = await hooks.auth.loader(async () => auth)
+  const ask = (model) => l.fetch(l.baseURL + "/chat/completions", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ model, messages: [] }) })
+  return { ask, asked }
+}
+
+test("the app refusing an account with no membership: the request goes to its Token Plan with its key, as the plan names the model", async () => {
+  const tp = platformOf()
+  const { ask, asked } = await planFetch(tp, (h) => json({ choices: [] }))
+  let res = await ask("mimo-pro")
+  expect(res.status).toBe(200)
+  expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
+  expect(asked).toEqual([
+    { host: "mimo-server-sgp.xiaomimimo.com", path: "/api/route/chat/completions", auth: null, cookie: "serviceToken=st-1; userId=42", model: "mimo-pro" },
+    { host: "token-plan-cn.xiaomimimo.com", path: "/v1/chat/completions", auth: "Bearer tp-one", cookie: null, model: "mimo-v2.6-pro" },
+  ])
+  // from then on straight to the plan, the key not read again
+  asked.length = 0
+  res = await ask("mimo-flash")
+  expect(res.status).toBe(200)
+  expect(asked.map((a) => `${a.host} ${a.model}`)).toEqual(["token-plan-cn.xiaomimimo.com mimo-v2.6-flash"])
+  expect(tp.signOns).toBe(1)
+})
+
+test("a key reset at the platform is read again after the plan turns the old one away", async () => {
+  const tp = platformOf()
+  const { ask, asked } = await planFetch(tp, (h) => (h.get("Authorization") === "Bearer " + tp.key ? json({ choices: [] }) : json({ error: { message: "Invalid API Key" } }, 401)))
+  expect((await ask("mimo-pro")).status).toBe(200)
+  tp.key = "tp-two"
+  expect((await ask("mimo-pro")).status).toBe(401)
+  expect((await ask("mimo-pro")).status).toBe(200)
+  expect(asked.filter((a) => a.host.startsWith("token-plan")).map((a) => a.auth)).toEqual(["Bearer tp-one", "Bearer tp-one", "Bearer tp-two"])
+})
+
+test("no Token Plan, or one with no key: the app's refusal goes through as it is", async () => {
+  for (const tp of [platformOf('{"code":0,"message":"","data":null}'), Object.assign(platformOf(), { key: null })]) {
+    const { ask, asked } = await planFetch(tp, () => json({ choices: [] }))
+    const res = await ask("mimo-pro")
+    expect(res.status).toBe(403)
+    expect(await res.text()).toBe(REFUSED)
+    expect(res.headers.get("X-Magpie-Sign-In")).toBe("kept")
+    expect(asked.every((a) => a.host.startsWith("mimo-server"))).toBe(true)
+  }
 })

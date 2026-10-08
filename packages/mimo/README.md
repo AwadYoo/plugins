@@ -41,16 +41,34 @@ as magpie's built-in MiMo account did; reading usage renews the session once
 when the server turns it away. If the passToken no longer works, sign in
 again.
 
+### An account with a Token Plan and no app membership
+
+The app's server answers such an account's requests, every model, with
+403 `membership_required` ("未开通会员或会员已到期，请订阅后使用"). The
+plugin then asks the account's Token Plan instead. The passToken signs on
+at the open platform (platform.xiaomimimo.com, sid `api-platform`), which
+gives the plan's `tp-` key (`/tokenPlan/apiKey/raw`) and its endpoint
+(`openaiBaseUrl` of `/tokenPlan/apiKey`, e.g.
+`https://token-plan-cn.xiaomimimo.com/v1`). The request goes there with
+`Authorization: Bearer <tp- key>` and no cookies, with `mimo-pro` asked as
+`mimo-v2.6-pro` and `mimo-flash` as `mimo-v2.6-flash`. For an hour after,
+the account's requests go straight to the plan; then the app is asked
+first again, in case a membership was bought. A key reset at the platform
+(the plan's 401) is read again on the next request. An account with no
+Token Plan, or a plan with no key yet (the platform's Token Plan page
+makes one), gets the app's 403 as it is.
+
 ## Usage
 
 magpie's Usage card shows the MiMo app's plan and its week's allowance.
 A Token Plan bought at the open platform (platform.xiaomimimo.com) is a
-plan of its own: its credits are spent by its `tp-` API key at
-`token-plan-<region>.xiaomimimo.com`, not by this account's requests. The
-same passToken signs on at the platform (sid `api-platform`), so the card
-shows the Token Plan too, as its credits beside the week's allowance, and
-as the card's plan when the account has no app plan. To spend the Token
-Plan, add magpie's "Xiaomi MiMo" provider with its `tp-` key.
+plan of its own, spent by its `tp-` API key at
+`token-plan-<region>.xiaomimimo.com`. The same passToken signs on at the
+platform (sid `api-platform`), so the card shows the Token Plan too. With
+an app plan, its credits are an aside beside the week's allowance: this
+account's requests go to the app. With no app plan, the Token Plan is the
+card's plan and its credits are the account's allowance, since its
+requests go to the plan (above).
 
 ## Where the sign-in is kept
 
