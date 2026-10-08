@@ -91,6 +91,25 @@ test("the provider's list, efforts as variants, no model of its own for fast or 
   expect(Object.keys(list).some((id) => /-fast$|-(low|medium|high)$/.test(id))).toBe(false)
 })
 
+test("fast is said on the models Cursor has a fast variant of, at that size, and only those (yetone/magpie#1360)", async () => {
+  const fastOf = async (usableIDs) => {
+    fakeAPI(PICKER, usableIDs)
+    const hooks = await CursorAuthPlugin()
+    const jwt = ["e30", Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 7200 + ++n })).toString("base64url"), "s"].join(".")
+    const list = await hooks.provider.models({ models: {} }, { auth: { type: "oauth", access: jwt, refresh: "", expires: 0 } })
+    return Object.keys(list).filter((id) => list[id].fast === true).sort()
+  }
+  // Opus 5.5 is fast at 300k only; Grok 4.7 at both sizes; Composer 2.5
+  // has no sizes; Haiku 5.5, Grok 4.6, Max Only and Auto have no fast
+  expect(await fastOf()).toEqual(["claude-opus-5-5@300k", "composer-2.5", "grok-4.7@256k", "grok-4.7@500k"])
+  // an account not served Opus 5.5's fast variants: not offered fast
+  // (Grok 4.7, which the usable list says nothing of, is kept whole)
+  expect(await fastOf(["claude-opus-5-5-medium", "claude-opus-5-5-high", "composer-2.5", "composer-2.5-fast"])).toEqual(["composer-2.5", "grok-4.7@256k", "grok-4.7@500k"])
+  // none served fast but Grok 4.7's 500k one, which has no id of its own
+  // for the usable list to leave out
+  expect(await fastOf(["claude-opus-5-5-medium", "composer-2.5", "grok-4.7-high"])).toEqual(["grok-4.7@500k"])
+})
+
 test("a request goes as the variant its size, effort and fast pick, in that variant's mode", async () => {
   fakeAPI()
   const raw = await usable(tok())

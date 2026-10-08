@@ -542,16 +542,25 @@ function modelsOf(picker, ids) {
         const id = m.name + "@" + c
         if (used.has(id)) continue
         used.add(id)
-        out.push({ ...base, id, name: base.title + " @ " + c, context: tokensOf(c) || DEFAULT_CONTEXT, size: c })
+        out.push({ ...base, id, name: base.title + " @ " + c, context: tokensOf(c) || DEFAULT_CONTEXT, size: c, offersFast: fastAt(variants, c) })
       }
     } else if (!used.has(m.name)) {
       used.add(m.name)
       const limit = needsMax(m, def) ? m.contextTokenLimitForMaxMode || m.contextTokenLimit : m.contextTokenLimit
-      out.push({ ...base, id: m.name === "default" ? "auto" : m.name, name: base.title, context: limit > 0 ? limit : DEFAULT_CONTEXT, size: "" })
+      out.push({ ...base, id: m.name === "default" ? "auto" : m.name, name: base.title, context: limit > 0 ? limit : DEFAULT_CONTEXT, size: "", offersFast: fastAt(variants, "") })
     }
   }
   return out
 }
+
+// fastAt is whether Cursor has a fast variant the account is served at
+// the context size (any, for a model without sizes): what magpie offers
+// fast for, which 0.1.x said with a -fast model of its own.
+const fastAt = (variants, size) =>
+  variants.some((v) => {
+    const have = valuesOf(v)
+    return have.fast === "true" && (!size || have.context === undefined || have.context === size)
+  })
 
 // nearest is the variant of vs most like the parameters wanted, one at
 // their context size before any other.
@@ -734,6 +743,9 @@ function runtimeModel(m) {
     },
     release_date: "",
     variants: Object.fromEntries(efforts.map((e) => [e, { reasoningEffort: e }])),
+    // a request's service_tier priority (or fast) runs it as Cursor's fast
+    // variant: magpie offers Fast for the models that have one
+    ...(m.offersFast ? { fast: true } : {}),
   }
 }
 

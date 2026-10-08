@@ -87,7 +87,9 @@ minutes), the way pi-cursor-sdk lists Cursor's catalog:
   sent as the model's effort parameter. `none` turns a Claude's thinking off.
 - Fast is not a model of its own either: a `service_tier` of `priority`
   or `fast` sends `fast=true`, anything else `fast=false` (it costs more,
-  so only when asked).
+  so only when asked). A model listed at a size Cursor has a fast variant
+  of (served to the account) says `fast: true`, which magpie offers its
+  Fast switch for (yetone/magpie#1360).
 - A request goes as the picker's variant those parameters pick, in Max Mode
   when that variant is Max Mode's (a 1M size, say), as the CLI turns it on.
   A size with no variant goes in Max Mode when it is over Cursor's limit
