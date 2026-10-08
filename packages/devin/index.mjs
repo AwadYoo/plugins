@@ -957,6 +957,26 @@ const NO_RESULT = "Tool use was interrupted and did not produce a result."
 const textOf = (c) =>
   typeof c === "string" ? c : Array.isArray(c) ? c.filter((p) => p?.type === "text").map((p) => p.text ?? "").join("") : ""
 
+// joinSplitCalls joins an assistant message onto the assistant message
+// before it when that one made tool calls: Anthropic takes consecutive
+// assistant messages as one turn, and an agent can send a turn's parallel
+// calls split over two of them, answered together after (yetone/magpie#1275).
+// Answered at the second message, the first calls would be marked
+// interrupted and their real results dropped. msgs is left as it is.
+function joinSplitCalls(msgs) {
+  const out = []
+  for (const m of msgs) {
+    const prev = out.at(-1)
+    if (m?.role === "assistant" && prev?.role === "assistant" && prev.tool_calls?.length) {
+      const content = [textOf(prev.content), textOf(m.content)].filter(Boolean).join("\n\n")
+      out[out.length - 1] = { ...prev, content, tool_calls: [...prev.tool_calls, ...(m.tool_calls ?? [])] }
+      continue
+    }
+    out.push(m)
+  }
+  return out
+}
+
 // effortOf is the effort a request names, as magpie reads it.
 function effortOf(s) {
   const e = String(s ?? "").trim().toLowerCase()
@@ -1087,7 +1107,7 @@ function build(chat, uid, key) {
     pending = []
   }
   const system = []
-  for (const m of chat.messages ?? []) {
+  for (const m of joinSplitCalls(chat.messages ?? [])) {
     if (m.role === "system" || m.role === "developer") {
       system.push(textOf(m.content))
       continue
