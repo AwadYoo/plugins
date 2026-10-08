@@ -286,20 +286,43 @@ function clientOpening(text) {
   return typeof text === "string" ? text.replace(PI_OPENING, (_, at) => at + PI_COMPAT) : text
 }
 
+// pi turns a compaction, and a branch it came back from, into a user
+// message of one text: a fixed sentence, then the summary in <summary> tags
+// (pi-coding-agent 1.0.4 and 1.1.0, dist/core/messages.js:
+// COMPACTION_SUMMARY_PREFIX and BRANCH_SUMMARY_PREFIX). Factory refuses the
+// compaction sentence whole (yetone/magpie#1316): after a compaction every
+// turn was 403, and the reporter's replays passed with the sentence removed,
+// reworded or only half of it. The branch sentence is pi's other fixed
+// summary opening and is reworded the same way. Only a text that is pi's
+// whole summary, sentence first and </summary> last, changes; the summary
+// itself goes on as it is.
+const PI_SUMMARIES = [
+  ["The conversation history before this point was compacted into the following summary:\n\n<summary>\n", "Earlier conversation context is summarized below:\n\n<summary>\n"],
+  ["The following is a summary of a branch that this conversation came back from:\n\n<summary>\n", "Summary of an earlier conversation branch:\n\n<summary>\n"],
+]
+function piSummary(text) {
+  if (typeof text !== "string" || !text.endsWith("</summary>")) return text
+  for (const [from, to] of PI_SUMMARIES) if (text.startsWith(from)) return to + text.slice(from.length)
+  return text
+}
+
 // promptOpenings adapts clientOpening in the system and developer messages
-// of msgs (chat completions' messages, Responses' input), their string
-// content or text parts: false when nothing changed.
+// of msgs (chat completions' messages, Responses' input), and piSummary in
+// their user messages, their string content or text parts: false when
+// nothing changed.
 function promptOpenings(msgs) {
   let changed = false
   for (const m of Array.isArray(msgs) ? msgs : []) {
-    if (!m || typeof m !== "object" || (m.role !== "system" && m.role !== "developer")) continue
+    if (!m || typeof m !== "object") continue
+    const adapt = m.role === "system" || m.role === "developer" ? clientOpening : m.role === "user" ? piSummary : null
+    if (!adapt) continue
     if (typeof m.content === "string") {
-      const adapted = clientOpening(m.content)
+      const adapted = adapt(m.content)
       if (adapted !== m.content) (m.content = adapted), (changed = true)
     } else if (Array.isArray(m.content)) {
       for (const p of m.content) {
         if (!p || typeof p !== "object" || typeof p.text !== "string") continue
-        const adapted = clientOpening(p.text)
+        const adapted = adapt(p.text)
         if (adapted !== p.text) (p.text = adapted), (changed = true)
       }
     }
@@ -789,6 +812,8 @@ function compactContext(text, quoteChangedFiles = true) {
     const quoted = quotedToolText(context, "Conversation context encoded as a JSON string. Decode the JSON string to recover the exact original context before continuing:\n")
     return header + (quoted === context ? context : "\n\n" + quoted)
   }
+  const summary = piSummary(text)
+  if (summary !== text) return summary
   const read = text.match(COMPACT_READ)
   if (read) {
     try {
