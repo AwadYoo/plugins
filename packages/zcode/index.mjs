@@ -1421,12 +1421,22 @@ export async function ZCodeAuthPlugin({ client }) {
         if (fell) ms = start ? START_MODELS : MODELS
         const url = s.base + "/v1"
         const out = Object.fromEntries(ms.map((m) => [m.id, model(m, url)]))
-        const details = [...ms, ...modelsOf(cfg, planID(START_BASE)), ...START_MODELS]
+        const details = [...ms, ...modelsOf(cfg, planID(START_BASE)), ...modelsOf(cfg, planID(ZAI_BASE)), ...MODELS]
+        const about = (raw) => details.find((m) => m.id.toLowerCase() === raw.toLowerCase()) ?? { efforts: [] }
+        const has = new Set(Object.keys(out).map((id) => id.toLowerCase()))
         for (const raw of giftNames(gift)) {
+          // a gift-only account's models are its gift's, by their own
+          // names, as ZCode lists them (its Start Plan's GLM-5.3, which the
+          // plan's config leaves out): every request of it goes to the gift
+          // anyway, and the card counts them by that name too (#1261)
+          if (start && !has.has(raw.toLowerCase())) {
+            const plain = about(raw).id ?? raw
+            has.add(raw.toLowerCase())
+            out[plain] = model({ ...about(raw), id: plain }, url)
+          }
           const id = giftID(raw)
           if (out[id]) continue
-          const m = details.find((m) => m.id.toLowerCase() === raw.toLowerCase()) ?? { efforts: [] }
-          out[id] = model({ ...m, id }, url)
+          out[id] = model({ ...about(raw), id }, url)
         }
         if (fell) out[Symbol.for("magpie.fellBack")] = true
         return out

@@ -120,7 +120,10 @@ minutes. When the config can't be read, the plugin falls back to this list:
 | GLM-5.2 | 1M | 128K | none, high, max |
 | GLM-5-Turbo | 200K | 64K | none, high |
 
-The Start Plan has all of these except GLM-5.3.
+The Start Plan's config has all of these except GLM-5.3. An account
+with no GLM Coding Plan also lists every model its gift plans serve under
+the model's own name, as ZCode does (the Start Plan's GLM-5.3 bucket makes
+GLM-5.3 a model), since all of its requests go to the gift anyway.
 
 A gift plan's models appear again as `<model>-Trial` entries, so a
 request can spend the gift's quota on purpose. A trial entry is listed
