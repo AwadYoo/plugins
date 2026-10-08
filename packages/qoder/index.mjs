@@ -1037,23 +1037,45 @@ const CAMPAIGN_MACHINE_TTL = 60 * 60 * 1000 // Qoder's desktop client renews its
 // campaignRuntime uses Qoder's own native device identity helper, installed
 // by its desktop client or cached by its CLI. A made-up token (including the
 // chat envelope's machine id and type 5) doesn't reveal international claims.
-async function campaignRuntime({ home = homedir(), platform = process.platform, arch = process.arch, env = process.env } = {}) {
+//
+// Where each one keeps it (Qoder desktop 0.4.3's packages, qodercli 1.1.66):
+//   - desktop: <install>/resources/umid/runtime-info(.exe): Qoder.app on
+//     macOS, %LOCALAPPDATA%\Programs\Qoder (the user installer) on Windows,
+//     /opt/Qoder (the .deb and the .rpm) on Linux;
+//   - CLI: <config>/.bin, where <config> is QODER_CONFIG_DIR, else
+//     QODER_CLI_HOME (or the home folder) joined with QODER_CONFIG_DIR_NAME
+//     (or .qoder): a file runtime-info-<platform>-<arch>-<hash> on macOS and
+//     Linux, a folder umid-win32-<arch>-<hash> holding runtime-info.exe on
+//     Windows.
+async function campaignRuntime({ home = homedir(), platform = process.platform, arch = process.arch, env = process.env, opt = "/opt" } = {}) {
   if (env.QODER_RUNTIME_INFO) return resolve(env.QODER_RUNTIME_INFO)
   const name = platform === "win32" ? "runtime-info.exe" : "runtime-info"
+  const isFile = async (path) => (await stat(path).catch(() => null))?.isFile() ?? false
   const paths = []
   if (platform === "win32") {
     const local = env.LOCALAPPDATA || join(home, "AppData", "Local")
     paths.push(join(local, "Programs", "Qoder", "resources", "umid", name))
   } else if (platform === "darwin") {
     for (const dir of ["/Applications", join(home, "Applications")]) paths.push(join(dir, "Qoder.app", "Contents", "Resources", "umid", name))
+  } else if (platform === "linux") {
+    paths.push(join(opt, "Qoder", "resources", "umid", name))
   }
-  for (const path of paths) if ((await stat(path).catch(() => null))?.isFile()) return path
-  const cache = join(home, ".qoder", ".bin")
-  const dirs = (await readdir(cache, { withFileTypes: true }).catch(() => []))
-    .filter((d) => d.isDirectory() && d.name.startsWith(`umid-${platform}-${arch}-`))
-  const cached = await Promise.all(dirs.map(async (d) => ({ path: join(cache, d.name, name), time: (await stat(join(cache, d.name))).mtimeMs })))
-  for (const { path } of cached.sort((a, b) => b.time - a.time)) if ((await stat(path).catch(() => null))?.isFile()) return path
-  throw new Error("Qoder check-in: device identity runtime not found; install Qoder desktop or run Qoder CLI, or set QODER_RUNTIME_INFO to its runtime-info executable")
+  for (const path of paths) if (await isFile(path)) return path
+  const config = env.QODER_CONFIG_DIR || join(env.QODER_CLI_HOME || env.GEMINI_CLI_HOME || home, env.QODER_CONFIG_DIR_NAME || ".qoder")
+  const cache = join(config, ".bin")
+  const entries = await readdir(cache, { withFileTypes: true }).catch(() => [])
+  const found = []
+  for (const d of entries) {
+    let path
+    if (platform === "win32") {
+      if (d.isDirectory() && d.name.startsWith(`umid-win32-${arch}-`)) path = join(cache, d.name, name)
+    } else if (d.isFile() && d.name.startsWith(`runtime-info-${platform}-${arch}-`) && !d.name.endsWith(".tmp")) {
+      path = join(cache, d.name)
+    }
+    if (path && (await isFile(path))) found.push({ path, time: (await stat(path)).mtimeMs })
+  }
+  if (found.length) return found.sort((a, b) => b.time - a.time)[0].path
+  throw new Error("Qoder check-in: device identity runtime not found; install Qoder desktop or sign in to Qoder CLI once, or set QODER_RUNTIME_INFO to its runtime-info executable")
 }
 
 // Read the SDK identity as Qoder does: environment 3 is international; on

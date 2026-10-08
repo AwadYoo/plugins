@@ -129,31 +129,73 @@ test("Windows finds the Qoder desktop's installed runtime", async () => {
   expect(await _internal.campaignRuntime({ home: sandbox, platform: "win32", arch: "x64", env: { LOCALAPPDATA: sandbox } })).toBe(file)
 })
 
-for (const [platform, arch] of [["win32", "x64"], ["darwin", "arm64"], ["linux", "x64"]]) {
-  test(`${platform}/${arch}: finds the newest matching CLI runtime`, async () => {
-    const cache = join(sandbox, ".qoder", ".bin")
-    const name = platform === "win32" ? "runtime-info.exe" : "runtime-info"
-    const old = join(cache, `umid-${platform}-${arch}-ffff`)
-    const newest = join(cache, `umid-${platform}-${arch}-aaaa`)
-    const other = join(cache, `umid-${platform}-other-ffff`)
-    for (const dir of [old, newest, other]) {
+// Keep desktop discovery inside the fixture, even on a Mac with Qoder installed.
+async function inSandbox(run) {
+  const inspect = spyOn(fsPromises, "stat").mockImplementation((path, ...args) => {
+    if (!String(path).startsWith(sandbox + sep)) return Promise.reject(new Error("outside fixture"))
+    return realStat(path, ...args)
+  })
+  try {
+    return await run()
+  } finally {
+    inspect.mockRestore()
+  }
+}
+
+// cliCache lays out Qoder CLI's .bin as qodercli 1.1.66 writes it
+// (extractBinary): a folder umid-win32-<arch>-<hash> holding runtime-info.exe
+// and sgsdk.dll on Windows; a file runtime-info-<platform>-<arch>-<hash>
+// elsewhere, beside its .tmp while it is being written. It returns the
+// newest matching runtime.
+function cliCache(config, platform, arch) {
+  const cache = join(config, ".bin")
+  mkdirSync(cache, { recursive: true })
+  const make = (hash, a, time) => {
+    let file
+    if (platform === "win32") {
+      const dir = join(cache, `umid-win32-${a}-${hash}`)
       mkdirSync(dir, { recursive: true })
-      writeFileSync(join(dir, name), "fixture")
+      writeFileSync(join(dir, "sgsdk.dll"), "fixture")
+      file = join(dir, "runtime-info.exe")
+    } else {
+      file = join(cache, `runtime-info-${platform}-${a}-${hash}`)
     }
-    utimesSync(old, new Date(1000), new Date(1000))
-    utimesSync(newest, new Date(2000), new Date(2000))
-    // Keep desktop discovery inside this fixture, even on a Mac with Qoder installed.
-    const inspect = spyOn(fsPromises, "stat").mockImplementation((path, ...args) => {
-      if (!String(path).startsWith(sandbox + sep)) return Promise.reject(new Error("outside fixture"))
-      return realStat(path, ...args)
-    })
-    try {
-      expect(await _internal.campaignRuntime({ home: sandbox, platform, arch, env: {} })).toBe(join(newest, name))
-    } finally {
-      inspect.mockRestore()
-    }
+    writeFileSync(file, "fixture")
+    utimesSync(file, new Date(time), new Date(time))
+    return file
+  }
+  make("ffffffffffffffff", arch, 1000)
+  make("eeeeeeeeeeeeeeee", "other", 3000)
+  const newest = make("aaaaaaaaaaaaaaaa", arch, 2000)
+  if (platform !== "win32") writeFileSync(join(cache, `runtime-info-${platform}-${arch}-bbbbbbbbbbbbbbbb.0a1b2c3d.tmp`), "partial")
+  return newest
+}
+
+for (const [platform, arch] of [["win32", "x64"], ["darwin", "arm64"], ["darwin", "x64"], ["linux", "x64"], ["linux", "arm64"]]) {
+  test(`${platform}/${arch}: finds the newest runtime Qoder CLI cached`, async () => {
+    const newest = cliCache(join(sandbox, ".qoder"), platform, arch)
+    expect(await inSandbox(() => _internal.campaignRuntime({ home: sandbox, platform, arch, env: {}, opt: join(sandbox, "opt") }))).toBe(newest)
   })
 }
+
+test("finds the runtime under Qoder CLI's own config folder", async () => {
+  const dir = cliCache(join(sandbox, "custom"), "linux", "x64")
+  const named = cliCache(join(sandbox, "clihome", ".qoder-work"), "linux", "x64")
+  const run = (env) => inSandbox(() => _internal.campaignRuntime({ home: join(sandbox, "nobody"), platform: "linux", arch: "x64", env, opt: join(sandbox, "opt") }))
+  expect(await run({ QODER_CONFIG_DIR: join(sandbox, "custom") })).toBe(dir)
+  expect(await run({ QODER_CLI_HOME: join(sandbox, "clihome"), QODER_CONFIG_DIR_NAME: ".qoder-work" })).toBe(named)
+})
+
+test("Linux finds the Qoder desktop's /opt/Qoder runtime", async () => {
+  const file = join(sandbox, "opt", "Qoder", "resources", "umid", "runtime-info")
+  mkdirSync(dirname(file), { recursive: true })
+  writeFileSync(file, "fixture")
+  expect(await inSandbox(() => _internal.campaignRuntime({ home: sandbox, platform: "linux", arch: "x64", env: {}, opt: join(sandbox, "opt") }))).toBe(file)
+})
+
+test("no runtime anywhere says how to get one", async () => {
+  await expect(inSandbox(() => _internal.campaignRuntime({ home: sandbox, platform: "linux", arch: "x64", env: {}, opt: join(sandbox, "opt") }))).rejects.toThrow("device identity runtime not found")
+})
 
 test("unavailable native identity fails the request and can be retried", async () => {
   nativeError = new Error("fixture helper unavailable")

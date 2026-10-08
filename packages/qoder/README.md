@@ -200,9 +200,14 @@ in-flight read and caching it in memory for an hour. The same identity
 goes on the list, the claim and a device-token retry; it is not saved in
 the account's credentials.
 
-- Install Qoder desktop or run Qoder CLI to make its native runtime
-  available. The plugin finds the desktop's standard Windows/macOS
-  location or the CLI's matching `~/.qoder/.bin/umid-*` cache.
+- Install Qoder desktop, or sign in to Qoder CLI once, to make its native
+  runtime available. The plugin finds the desktop's `resources/umid`
+  (`Qoder.app` on macOS, `%LOCALAPPDATA%\Programs\Qoder` on Windows,
+  `/opt/Qoder` on Linux) or the runtime the CLI caches in `~/.qoder/.bin`
+  (`runtime-info-<platform>-<arch>-*` on macOS and Linux,
+  `umid-win32-x64-*\runtime-info.exe` on Windows; `QODER_CONFIG_DIR`,
+  `QODER_CLI_HOME` and `QODER_CONFIG_DIR_NAME` move it as they move the
+  CLI's folder).
 - For another installation location, set `QODER_RUNTIME_INFO` to the
   absolute path of Qoder's installed `runtime-info` executable
   (`runtime-info.exe` on Windows), with its accompanying SDK files.
