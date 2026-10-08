@@ -5,6 +5,7 @@
 // chat completion chunks. Ported from magpie's built-in Devin account
 // (internal/provider/devin*.go, internal/gateway/devin.go).
 
+import { Buffer } from "node:buffer"
 import { createHash, randomBytes, randomUUID } from "node:crypto"
 import { createServer, STATUS_CODES } from "node:http"
 import { gunzipSync } from "node:zlib"
@@ -1097,6 +1098,20 @@ const osName = () => (process.platform === "win32" ? "windows" : process.platfor
 const metadata = (key) =>
   new PB().str(1, "devin-cli").str(2, CLI_VERSION).str(3, key).str(4, "en").str(5, osName()).str(7, CLI_VERSION).str(12, "chisel").str(28, "chisel")
 
+// Devin names a call after its tool and turn (Bash:0#a65b6a5e…), and
+// Claude Code takes a tool_use id only of [A-Za-z0-9_-]: it drops a call
+// whose id has the ':' or '#', and the turn fails "could not be parsed"
+// (yetone/magpie#1304). Such an id goes out as "dv_" and its base64url, and
+// comes back to Devin as it was, so its result still answers its call. An
+// id that is already safe goes out as it came, unless it begins "dv_".
+const SAFE_ID = /^[A-Za-z0-9_-]+$/
+const outID = (id) => (SAFE_ID.test(id) && !id.startsWith("dv_") ? id : "dv_" + Buffer.from(id).toString("base64url"))
+const inID = (id) => {
+  if (typeof id !== "string" || !id.startsWith("dv_") || !SAFE_ID.test(id)) return id
+  const raw = Buffer.from(id.slice(3), "base64url").toString()
+  return raw && outID(raw) === id ? raw : id
+}
+
 // build is the GetChatMessage request for a chat completion, to the model
 // uid.
 function build(chat, uid, key) {
@@ -1113,7 +1128,7 @@ function build(chat, uid, key) {
       continue
     }
     if (m.role === "assistant") {
-      const calls = (m.tool_calls ?? []).map((c) => ({ id: c.id, name: c.function?.name, args: argsOf(c.function?.arguments) }))
+      const calls = (m.tool_calls ?? []).map((c) => ({ id: inID(c.id), name: c.function?.name, args: argsOf(c.function?.arguments) }))
       const text = typeof m.content === "string" ? m.content : Array.isArray(m.content) ? m.content.filter((p) => p?.type === "text" && p.text).map((p) => p.text).join("\n\n") : ""
       if (!text && !calls.length) continue // a turn that only thought, or failed
       answer()
@@ -1125,7 +1140,7 @@ function build(chat, uid, key) {
     }
     if (m.role === "tool") {
       // only a call just made is answered, and only once
-      const i = pending.findIndex((c) => c.id === m.tool_call_id)
+      const i = pending.findIndex((c) => c.id === inID(m.tool_call_id))
       if (i >= 0) {
         let out = textOf(m.content) || "(no output)"
         msgs.push({ role: TOOL, callID: pending[i].id, text: out })
@@ -1286,7 +1301,7 @@ async function* events(it) {
         }
         if (name) {
           tools++
-          yield { tool: { index: tools, id: id || "call_" + randomBytes(12).toString("hex"), name } }
+          yield { tool: { index: tools, id: id ? outID(id) : "call_" + randomBytes(12).toString("hex"), name } }
         }
         if (args && tools >= 0) yield { args: { index: tools, text: args } }
       } else if (x.num === 5 && x.wire === 0) stop = x.n
@@ -1566,4 +1581,4 @@ export async function DevinAuthPlugin() {
 }
 
 // for tests
-export const _internal = { objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames }
+export const _internal = { outID, inID, objectRoot, seesImages, imagesFor, forgetSaid: () => said.clear(), parseModelConfigs, SNAPSHOT_IMAGES, withImages, forgetImages: () => (seen = null), effortOf, runtimeModel, configModel, live, build, failure, complete, parseFamilies, listed, variantFor, familiesOf, SNAPSHOT, parseStatus, readsHome, tierName, whoByKey, success, familiesFor, readCredentials, credentials, fields, frame, PB, events, frames }
