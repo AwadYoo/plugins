@@ -74,6 +74,17 @@ Each chat carries WorkBuddy's headers:
 A chat that doesn't open with a system message is given WorkBuddy's
 default one, as the app does.
 
+A chat's tools are given shapes WorkBuddy's models take. Without them
+WorkBuddy AI answers 400 "Invalid request parameters" (11133), DeepSeek's
+models to each shape below and Kimi's, GPT's, Gemini's and GLM's to some:
+- a tool's parameters with no `type`, empty, or a union (`anyOf`, `oneOf`,
+  `allOf`) at the root are an object, the union's fields merged;
+- a `pattern`'s `\0` is `\u0000`, which matches the same;
+- a tuple's `items` (a list) is one schema any of them fits;
+- a tool's name with a character other than letters, digits, `_` and `-`
+  (`.`, `:`, `/`, a space, CJK) is sent with `_` there, and the model's
+  calls come back under the tool's own name.
+
 ## Models
 
 When you are signed in, the models are the ones WorkBuddy's product config
