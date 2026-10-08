@@ -151,6 +151,37 @@ Neither magpie's built-in Qoder CN nor this plugin has been checked against
 every kind of qoder.cn account. If a sign-in or a chat fails, please open
 an issue with the error.
 
+### Enterprise VPC
+
+A Qoder CN enterprise on its own VPC instance signs in with **Sign in with
+Qoder CN Enterprise (VPC)** (since 0.2.8). It asks for the instance: its
+name (`acme`) or one of its addresses (`acme.vpc.qoder.com.cn`,
+`https://acme.vpc.qoder.com.cn`). Only https and hosts under
+`vpc.qoder.com.cn` are taken.
+
+The account then uses the instance's own hosts, as Qoder CN's CLI
+(`@qodercn-ai/qoderclicn` 1.1.64) does once a VPC instance is set. The
+paths, client id and protocol are the public ones:
+
+| | Public Qoder CN | VPC instance `acme` |
+|---|---|---|
+| Sign-in page | qoder.cn | acme.vpc.qoder.com.cn |
+| Accounts: poll, tokens, user info, usage | openapi.qoder.com.cn | acme-openapi.vpc.qoder.com.cn |
+| Models and chat | gateway.qoder.com.cn | acme-gateway.vpc.qoder.com.cn |
+
+- The instance is kept with the account, so its refreshes, models, usage
+  and check-in go to the instance too. An account kept with an instance
+  that isn't one is asked to sign in again; it is never sent to the public
+  hosts.
+- The account is named `<email> (<instance>)`, so it is listed apart from
+  the same person's public account.
+- An enterprise's usage shows as the Enterprise plan.
+- **Sign in with Qoder CN** is unchanged and still the first way. An
+  account signed in without an instance works as before.
+
+The hosts and reply shapes come from a real VPC account's report
+(yetone/magpie#312). This plugin has not been tried with a VPC account.
+
 ## Daily check-in
 
 Qoder gives credits for a daily claim (the Qoder client's campaign
