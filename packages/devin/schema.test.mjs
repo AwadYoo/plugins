@@ -106,3 +106,18 @@ test("objectRoot keeps the root's own required beside anyOf's branches", () => {
   expect(out.required).toEqual(["id"])
   expect(Object.keys(out.properties).sort()).toEqual(["a", "b", "id"])
 })
+
+// Codex desktop's automation_update (testdata: what ChatGPT.app 26.930's
+// zod builds) has create and update branches that are unions themselves;
+// they were dropped, leaving only view's fields with id required, so the
+// model could never create an automation (magpie#1271).
+test("a branch that is itself a union is folded, not dropped", () => {
+  const { readFileSync } = require("node:fs")
+  const schema = JSON.parse(readFileSync(new URL("./testdata/codex_automation_update_schema.json", import.meta.url), "utf8"))
+  const ps = _internal.objectRoot(schema)
+  expect(ps.type).toBe("object")
+  expect(ps.anyOf).toBeUndefined()
+  for (const k of ["mode", "id", "name", "prompt", "rrule", "status", "kind"]) expect(Object.keys(ps.properties)).toContain(k)
+  expect(ps.required).toEqual(["mode"])
+  for (const v of ["view", "delete"]) expect(JSON.stringify(ps.properties.mode)).toContain(v)
+})
