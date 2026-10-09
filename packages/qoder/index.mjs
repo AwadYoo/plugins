@@ -1314,6 +1314,9 @@ const makePlugin = (site) => async ({ client }) => {
   }
   // each account's listing, the model configs a request carries
   const listings = new Map()
+  // A public and a VPC account can name the same uid but have different
+  // catalogs. Keep each deployment's listing apart.
+  const listingKey = (cred) => `${cred.vpc ?? ""}\0${cred.uid}`
   // the accounts fresh renewed: the built-in took the lapse mark off on a
   // renewed job token (qoderPersist), whatever the request then met
   const renewals = new WeakSet()
@@ -1322,7 +1325,7 @@ const makePlugin = (site) => async ({ client }) => {
   // says "renewed" for it
   const unsaid = new Set()
   const renewed = (cred) => {
-    const was = unsaid.delete(cred.uid)
+    const was = unsaid.delete(listingKey(cred))
     return renewals.has(cred) || was
   }
 
@@ -1343,10 +1346,11 @@ const makePlugin = (site) => async ({ client }) => {
     })
 
   const models = async (cred, again = false) => {
-    let l = listings.get(cred.uid)
+    const key = listingKey(cred)
+    let l = listings.get(key)
     if (!l || again) {
       l = modelInfos(await fetchListing(siteOf(site, cred), cred))
-      listings.set(cred.uid, l)
+      listings.set(key, l)
     }
     return l
   }
@@ -1559,7 +1563,7 @@ const makePlugin = (site) => async ({ client }) => {
           if (e?.expired) throw Object.assign(new Error(e.message), { signIn: "expired" })
           return provider.models
         }
-        if (renewals.has(cred)) unsaid.add(cred.uid)
+        if (renewals.has(cred)) unsaid.add(listingKey(cred))
         try {
           const ms = await models(cred, true)
           if (!ms.length) return provider.models

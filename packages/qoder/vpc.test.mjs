@@ -233,6 +233,54 @@ test("a VPC account's chat and list go to its gateway host, not the public one",
   noPublic()
 })
 
+test("public and VPC accounts with the same uid keep separate model listings", async () => {
+  toServer()
+  const publicGateway = "gateway.qoder.com.cn"
+  route = (at) => {
+    if (at === publicGateway + "/algo/api/v2/model/list") return json({ chat: [{ ...MODEL, display_name: "Public Performance" }] })
+    if (at === GATEWAY + "/algo/api/v2/model/list") return json({ chat: [{ ...MODEL, display_name: "VPC Performance" }] })
+    if (at === publicGateway + "/algo/api/v2/service/pro/sse/agent_chat_generation" || at === GATEWAY + "/algo/api/v2/service/pro/sse/agent_chat_generation")
+      return sse({ choices: [{ index: 0, delta: { content: "OK" }, finish_reason: "stop" }] })
+    return new Response("", { status: 404 })
+  }
+  const publicAccount = store(signedIn({ vpc: undefined, accountId: "alice@corp.example" }))
+  const enterpriseAccount = store(signedIn())
+  const hooks = await QoderCNAuthPlugin({ client: publicAccount.client })
+  const publicLoader = await hooks.auth.loader(publicAccount.get)
+  const enterpriseLoader = await hooks.auth.loader(enterpriseAccount.get)
+  expect((await publicLoader.fetch(publicLoader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(chat) })).status).toBe(200)
+  expect((await enterpriseLoader.fetch(enterpriseLoader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(chat) })).status).toBe(200)
+  expect(seen.map((x) => x.host + x.path)).toEqual([
+    publicGateway + "/algo/api/v2/model/list",
+    publicGateway + "/algo/api/v2/service/pro/sse/agent_chat_generation",
+    GATEWAY + "/algo/api/v2/model/list",
+    GATEWAY + "/algo/api/v2/service/pro/sse/agent_chat_generation",
+  ])
+})
+
+test("public and VPC accounts with the same uid keep separate renewal marks", async () => {
+  toServer()
+  const publicOpenapi = "openapi.qoder.com.cn"
+  const publicGateway = "gateway.qoder.com.cn"
+  route = (at) => {
+    if (at === publicOpenapi + "/api/v1/deviceToken/refresh")
+      return json({ device_token: "dt-public-2", refresh_token: "drt-public-2", expires_at: new Date(Date.now() + 7_200_000).toISOString() })
+    if (at === publicGateway + "/algo/api/v2/model/list" || at === GATEWAY + "/algo/api/v2/model/list") return json({ chat: [MODEL] })
+    if (at === publicGateway + "/algo/api/v2/service/pro/sse/agent_chat_generation" || at === GATEWAY + "/algo/api/v2/service/pro/sse/agent_chat_generation")
+      return sse({ choices: [{ index: 0, delta: { content: "OK" }, finish_reason: "stop" }] })
+    return new Response("", { status: 404 })
+  }
+  const publicAccount = store(signedIn({ vpc: undefined, accountId: "alice@corp.example", expires: Date.now() + 60_000 }))
+  const enterpriseAccount = store(signedIn())
+  const hooks = await QoderCNAuthPlugin({ client: publicAccount.client })
+  await hooks.provider.models({ models: {} }, { auth: publicAccount.auth() })
+  const enterpriseLoader = await hooks.auth.loader(enterpriseAccount.get)
+  const enterpriseResponse = await enterpriseLoader.fetch(enterpriseLoader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(chat) })
+  expect(enterpriseResponse.headers.get("X-Magpie-Sign-In")).toBe("kept")
+  const publicLoader = await hooks.auth.loader(publicAccount.get)
+  const publicResponse = await publicLoader.fetch(publicLoader.baseURL + "/chat/completions", { method: "POST", body: JSON.stringify(chat) })
+  expect(publicResponse.headers.get("X-Magpie-Sign-In")).toBe("renewed")
+})
 test("a VPC device token is renewed on its openapi host with the reporter's refresh shape", async () => {
   toServer()
   route = (at, { body }) => {
